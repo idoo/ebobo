@@ -1,0 +1,10 @@
+[package]
+name = "ebobo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic NES emulator core for rollback netplay"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+bincode = "1.3"

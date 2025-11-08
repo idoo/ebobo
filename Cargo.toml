@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/ebobo-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# The emulator core is hot even in tests (test ROMs run millions of cycles).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.ebobo-core]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

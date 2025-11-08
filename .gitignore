@@ -1,0 +1,12 @@
+/target
+/target-*
+/dist
+Cargo.lock
+*.nes
+# Test ROMs: fetched by scripts/fetch-test-roms.sh, not kept in git.
+crates/ebobo-core/tests/roms/
+*.sav
+.DS_Store
+node_modules/
+.wrangler/
+__pycache__/
