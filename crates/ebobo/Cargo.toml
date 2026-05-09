@@ -1,0 +1,16 @@
+[package]
+name = "ebobo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NES emulator with online play for friends (Mac + Steam Deck)"
+
+[dependencies]
+ebobo-core = { path = "../ebobo-core" }
+ebobo-net = { path = "../ebobo-net" }
+sdl2 = { version = "0.38", features = ["bundled", "static-link", "unsafe_textures"] }
+fontdue = "0.9"
+directories = "6"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"

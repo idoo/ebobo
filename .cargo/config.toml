@@ -1,0 +1,5 @@
+[env]
+# SDL2's bundled CMakeLists predates CMake 4, which refuses cmake_minimum_required < 3.5.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+# Without this, macOS builds target the host OS version and refuse to start on older Macs.
+MACOSX_DEPLOYMENT_TARGET = "11.0"
