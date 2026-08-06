@@ -1,0 +1,9 @@
+{
+  "name": "ebobo-signal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "npx wrangler@latest deploy",
+    "smoke": "node test/smoke.mjs"
+  }
+}
