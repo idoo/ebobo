@@ -1,7 +1,6 @@
 /target
 /target-*
 /dist
-Cargo.lock
 *.nes
 # Test ROMs: fetched by scripts/fetch-test-roms.sh, not kept in git.
 crates/ebobo-core/tests/roms/
