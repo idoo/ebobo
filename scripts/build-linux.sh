@@ -24,6 +24,8 @@ cp dist/linux/ebobo "$stage/ebobo"
 cp packaging/linux/install-steamdeck.sh "$stage/install.sh"
 cp packaging/icon/ebobo.png "$stage/ebobo.png" 2>/dev/null || true
 cp README.md "$stage/README.md" 2>/dev/null || true
+mkdir -p "$stage/steam"
+cp packaging/steam/*.png "$stage/steam/"
 chmod +x "$stage/ebobo" "$stage/install.sh"
 # bsdtar on macOS would embed com.apple.provenance xattrs that GNU tar warns about.
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C dist -czf dist/ebobo-steamdeck.tar.gz ebobo-steamdeck
