@@ -8,7 +8,7 @@ use ebobo_net::{
 };
 
 use crate::canvas::{Canvas, Color, Font};
-use crate::config::{is_steam_deck, Config, SpriteLimit};
+use crate::config::{is_steam_deck, Config, ScreenMode, SpriteLimit};
 use crate::i18n::{Lang, S};
 use crate::input::{InputFrame, Nav, PadEvent, PadInfo, PadKind};
 use crate::library::RomEntry;
@@ -756,6 +756,16 @@ impl Ui {
             Item::value(self.t(S::Nick), trunc(&cfg.nickname, 11), false),
             Item::value(self.t(S::Fullscreen), onoff(cfg.fullscreen), true),
             Item::value(self.t(S::Scale), format!("{}x", cfg.scale), true),
+            Item::value(
+                self.t(S::ScreenMode),
+                self.t(match cfg.screen {
+                    ScreenMode::Stretch => S::ScreenStretch,
+                    ScreenMode::Fit => S::ScreenFit,
+                    ScreenMode::Pixel => S::ScreenPixel,
+                })
+                .to_string(),
+                true,
+            ),
             Item::value(self.t(S::Volume), format!("{}%", (cfg.volume * 100.0).round() as u32), true),
             Item::value(self.t(S::InputDelay), delay, true),
             Item::value(self.t(S::Language), if self.lang == Lang::Ru { "Русский" } else { "English" }.to_string(), true),
@@ -799,7 +809,7 @@ impl Ui {
             self.pop();
             return None;
         }
-        let confirm = self.menu_step(Screen::Settings, 7, nav);
+        let confirm = self.menu_step(Screen::Settings, 8, nav);
         let row = self.sel[Screen::Settings.slot()];
         let delta: i32 = if nav.right || confirm.is_some() { 1 } else if nav.left { -1 } else { 0 };
         let cfg = &mut *ctx.config;
@@ -809,12 +819,12 @@ impl Ui {
                 self.open_field(Field::Nick, nick);
                 None
             }
-            6 if confirm.is_some() => {
+            7 if confirm.is_some() => {
                 self.sel[Screen::Advanced.slot()] = 0;
                 self.push(Screen::Advanced);
                 None
             }
-            0 | 6 => None,
+            0 | 7 => None,
             _ if delta == 0 => None,
             1 => {
                 cfg.fullscreen = !cfg.fullscreen;
@@ -827,13 +837,19 @@ impl Ui {
                 changed.then_some(UiAction::ConfigChanged)
             }
             3 => {
+                const ORDER: [ScreenMode; 3] = [ScreenMode::Stretch, ScreenMode::Fit, ScreenMode::Pixel];
+                let i = ORDER.iter().position(|m| *m == cfg.screen).unwrap_or(0) as i32;
+                cfg.screen = ORDER[(i + delta).rem_euclid(3) as usize];
+                Some(UiAction::ConfigChanged)
+            }
+            4 => {
                 let steps = ((cfg.volume * 10.0).round() as i32 + delta).clamp(0, 10);
                 let volume = steps as f32 / 10.0;
                 let changed = volume != cfg.volume;
                 cfg.volume = volume;
                 changed.then_some(UiAction::ConfigChanged)
             }
-            4 => {
+            5 => {
                 let i = DELAYS.iter().position(|d| *d == cfg.input_delay).unwrap_or(0) as i32;
                 let next = DELAYS[(i + delta).rem_euclid(DELAYS.len() as i32) as usize];
                 cfg.input_delay = next;
@@ -1390,7 +1406,7 @@ impl Ui {
                 Some(Screen::Picker(_)) => vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back), (Glyph::LeftRight, S::Page)],
                 Some(Screen::Code) => vec![(Glyph::Confirm, S::Join), (Glyph::Back, S::Back)],
                 Some(Screen::Field(_)) => vec![(Glyph::Confirm, S::Ok), (Glyph::Back, S::Back)],
-                Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 6 => {
+                Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 7 => {
                     vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)]
                 }
                 Some(Screen::Advanced) if self.sel[Screen::Advanced.slot()] == 2 => {
@@ -1639,7 +1655,7 @@ mod tests {
                 ui.update(&nav(|n| n.down = true), &mut c, DT);
             }
             ui.update(&nav(|n| n.confirm = true), &mut c, DT);
-            for _ in 0..3 {
+            for _ in 0..4 {
                 ui.update(&nav(|n| n.down = true), &mut c, DT);
             }
             assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
@@ -1652,7 +1668,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 5;
+        ui.sel[Screen::Settings.slot()] = 6;
         let mut c = ctx(&mut cfg, &[], None);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(ui.lang, Lang::En);
@@ -1782,11 +1798,11 @@ mod tests {
     fn ui_settings_top_level_fits() {
         let cfg = Config::default();
         let ui = Ui::new(Lang::Ru);
-        assert!(ui.settings_items(&cfg).len() <= 7);
+        assert!(ui.settings_items(&cfg).len() <= 8);
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 6;
+        ui.sel[Screen::Settings.slot()] = 7;
         let mut c = ctx(&mut cfg, &[], None);
         ui.update(&nav(|n| n.confirm = true), &mut c, DT);
         assert_eq!(ui.stack.last(), Some(&Screen::Advanced));

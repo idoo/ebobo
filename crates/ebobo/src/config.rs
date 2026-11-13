@@ -18,6 +18,8 @@ pub struct Config {
     pub fullscreen: bool,
     /// Window scale in windowed mode (1-6).
     pub scale: u32,
+    /// How the picture fills the window or screen.
+    pub screen: ScreenMode,
     /// GGRS input delay when hosting; `None` = auto from ping.
     pub input_delay: Option<u8>,
     /// Never try direct UDP, always relay through the server.
@@ -62,6 +64,19 @@ impl SpriteLimit {
     }
 }
 
+/// "Screen" setting: how the 256x240 picture is scaled to the window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenMode {
+    /// Fills the whole window, aspect ignored (no bars).
+    #[default]
+    Stretch,
+    /// NES aspect kept, as large as fits (bars on one axis).
+    Fit,
+    /// Integer scale when it fits, letterboxed.
+    Pixel,
+}
+
 impl Default for Config {
     fn default() -> Config {
         Config {
@@ -70,6 +85,7 @@ impl Default for Config {
             rom_dirs: Vec::new(),
             fullscreen: is_steam_deck(),
             scale: 3,
+            screen: ScreenMode::Stretch,
             input_delay: None,
             force_relay: false,
             direct_port: ebobo_net::DEFAULT_DIRECT_PORT,
@@ -158,4 +174,19 @@ fn default_nickname() -> String {
     let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
     let name: String = user.chars().filter(|c| c.is_alphanumeric()).take(16).collect();
     if name.is_empty() || name == "deck" { "Player".to_string() } else { name }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_mode_defaults_and_round_trips() {
+        let old: Config = toml::from_str("fullscreen = true\nscale = 2\n").unwrap();
+        assert_eq!(old.screen, ScreenMode::Stretch);
+        let fit: Config = toml::from_str("screen = \"fit\"\n").unwrap();
+        assert_eq!(fit.screen, ScreenMode::Fit);
+        let text = toml::to_string_pretty(&Config { screen: ScreenMode::Pixel, ..Config::default() }).unwrap();
+        assert!(text.contains("screen = \"pixel\""));
+    }
 }

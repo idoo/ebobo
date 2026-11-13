@@ -71,7 +71,7 @@ pub fn merge_changes(saved: &mut Config, before: &Config, after: &Config) {
             }
         )*};
     }
-    take!(nickname, server, rom_dirs, fullscreen, scale, input_delay, force_relay, direct_port, last_join_addr, lang, volume, ff_toggle, sprite_limit);
+    take!(nickname, server, rom_dirs, fullscreen, scale, screen, input_delay, force_relay, direct_port, last_join_addr, lang, volume, ff_toggle, sprite_limit);
 }
 
 /// Fast-forward state after one tick. Hold mode: on while the button is held. Toggle mode:

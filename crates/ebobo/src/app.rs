@@ -228,7 +228,7 @@ impl App {
         // Input sets the controller hints; it must open the game-controller subsystem first.
         let input = Input::new(&sdl)?;
         let pump = sdl.event_pump()?;
-        let video = Video::new(&sdl, config.fullscreen, config.scale)?;
+        let video = Video::new(&sdl, config.fullscreen, config.scale, config.screen)?;
         let lang = Lang::resolve(config.lang.as_deref());
         let mut ui = Ui::new(lang);
         let audio = match Audio::new(&sdl) {
@@ -646,6 +646,7 @@ impl App {
         if self.config.scale != self.config_before.scale {
             self.video.set_scale(self.config.scale);
         }
+        self.video.set_screen_mode(self.config.screen);
         if let Some(audio) = &mut self.audio {
             audio.set_volume(self.config.volume);
         }
