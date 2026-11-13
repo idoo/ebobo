@@ -23,7 +23,9 @@ git -c credential.helper='!gh auth git-credential' push -q origin main "$tag"
 
 src="$(mktemp -d)"
 trap 'rm -rf "$src"' EXIT
-git archive "$tag" | tar -x -C "$src"
+# -m: extracted files get the current time. `git archive` stamps them with the commit time,
+# and cargo skips rebuilding sources that look older than its cached artifacts.
+git archive "$tag" | tar -x -m -C "$src"
 # Reuse the warm build cache outside the snapshot (evaluated here, before the cd).
 cache="${CARGO_TARGET_DIR:-$PWD/target-pkg}"
 (cd "$src" && CARGO_TARGET_DIR="$cache" scripts/package-mac.sh)
