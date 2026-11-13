@@ -39,6 +39,16 @@ cargo run --release -p ebobo
 scripts/fetch-test-roms.sh && cargo test
 ```
 
-The room server is a Cloudflare Worker in `worker/`.
+## Your own server
 
-MIT license.
+Rooms go through a small Cloudflare Worker in `worker/`. ebobo uses mine by default. To run your own (the free Cloudflare plan is enough), install Node.js and run:
+
+```sh
+scripts/deploy-server.sh
+```
+
+It signs you in to Cloudflare, deploys and prints the server URL. Everyone who plays together enters that URL in Settings > Advanced > Server, or starts ebobo with `--server <url>`.
+
+## License
+
+MIT.
