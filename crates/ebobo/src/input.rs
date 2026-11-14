@@ -1,7 +1,8 @@
 //! Keyboard and gamepads → NES pads, menu navigation and hotkeys. Owner: platform slice.
 
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use ebobo_core::pad;
 use sdl2::controller::{Axis, Button, GameController};
@@ -78,7 +79,7 @@ pub struct InputFrame {
     pub menu_hold: f32,
     /// F11, Alt+Enter, Cmd+Ctrl+F.
     pub fullscreen: bool,
-    /// F5 / F7 quick save and load (solo only).
+    /// F5 / F7: quick save and load in solo, save / load for everyone in netplay.
     pub save_state: bool,
     pub load_state: bool,
     /// Rewind held: Backspace (only while no text field has focus) or Left Trigger / L2.
@@ -439,12 +440,147 @@ impl Seats {
     }
 }
 
+/// Controller family from what SDL reports: the controller name and SDL's controller type.
+/// A Deck's own controls, and on a Deck every Steam virtual gamepad, are `SteamDeck`. This is
+/// the answer when Steam publishes nothing about the real controller behind a virtual pad;
+/// `pad_identity` overrides it with the slot of `SteamVirtualGamepadInfo` when there is one.
 fn kind_from(name: &str, ty: Option<PadKind>, on_deck: bool) -> PadKind {
     let steam_virtual = name.contains("Steam Virtual") || name.contains("Steam Controller");
     if name.contains("Steam Deck") || (on_deck && steam_virtual) {
         return PadKind::SteamDeck;
     }
     ty.unwrap_or(PadKind::Generic)
+}
+
+/// Steam Input's virtual Xbox pad, which hides the real controller from SDL.
+fn is_steam_virtual(name: &str) -> bool {
+    name.contains("Steam Virtual")
+}
+
+/// One `[slot N]` section of the file named by `SteamVirtualGamepadInfo`: the real controller
+/// behind Steam's virtual gamepad N.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SteamSlot {
+    name: String,
+    vid: u16,
+    pid: u16,
+    /// `type=`: `xbox360`, `ps4`, `switchpro`, `steam`, ...
+    ty: String,
+}
+
+/// `0x054c` or `1356`.
+fn parse_id(s: &str) -> Option<u16> {
+    let s = s.trim();
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u16::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
+    }
+}
+
+/// Parses Steam's virtual gamepad info: `[slot N]` sections of `key=value` lines. Unknown
+/// keys, blank lines, lines before the first section and anything malformed are ignored.
+fn parse_steam_info(text: &str) -> Vec<(u32, SteamSlot)> {
+    let mut slots: Vec<(u32, SteamSlot)> = Vec::new();
+    let mut open = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(head) = line.strip_prefix('[') {
+            let n = head
+                .strip_suffix(']')
+                .and_then(|h| h.trim().strip_prefix("slot"))
+                .and_then(|n| n.trim().parse::<u32>().ok());
+            open = n.is_some();
+            if let Some(n) = n {
+                slots.push((n, SteamSlot::default()));
+            }
+            continue;
+        }
+        if !open {
+            continue;
+        }
+        let (Some((key, value)), Some((_, slot))) = (line.split_once('='), slots.last_mut()) else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "name" => slot.name = value.to_owned(),
+            "VID" => slot.vid = parse_id(value).unwrap_or(slot.vid),
+            "PID" => slot.pid = parse_id(value).unwrap_or(slot.pid),
+            "type" => slot.ty = value.to_owned(),
+            _ => {}
+        }
+    }
+    slots
+}
+
+/// Controller family of a Steam slot: its `type`, else its vendor id.
+fn steam_slot_kind(ty: &str, vid: u16) -> PadKind {
+    match ty {
+        "ps3" | "ps4" | "ps5" => return PadKind::PlayStation,
+        "xbox360" | "xboxone" => return PadKind::Xbox,
+        "switchpro" => return PadKind::Nintendo,
+        "steam" => return PadKind::SteamDeck,
+        t if t.starts_with("joycon") => return PadKind::Nintendo,
+        _ => {}
+    }
+    match vid {
+        0x054c => PadKind::PlayStation,
+        0x045e => PadKind::Xbox,
+        0x057e => PadKind::Nintendo,
+        0x28de => PadKind::SteamDeck,
+        _ => PadKind::Generic,
+    }
+}
+
+/// Steam's slot number of a virtual pad, from its kernel device name
+/// `Microsoft X-Box 360 pad N` (`kernel_device_name`).
+fn steam_slot_from_joystick_name(name: &str) -> Option<u32> {
+    let rest = &name[name.rfind("pad ")? + 4..];
+    let digits = rest.trim_start();
+    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    digits[..end].parse().ok()
+}
+
+/// The kernel's name of the input device behind SDL joystick `index`, from sysfs. SDL's own
+/// joystick name will not do: it calls every Steam virtual pad `Steam Virtual Gamepad`.
+#[cfg(target_os = "linux")]
+fn kernel_device_name(index: u32) -> Option<String> {
+    let path = unsafe { sdl2::sys::SDL_JoystickPathForIndex(index as i32) };
+    if path.is_null() {
+        return None;
+    }
+    // `/dev/input/event11`: the node name is the same under `/sys/class/input`.
+    let path = unsafe { std::ffi::CStr::from_ptr(path) }.to_str().ok()?;
+    let node = std::path::Path::new(path).file_name()?;
+    let name = std::fs::read_to_string(std::path::Path::new("/sys/class/input").join(node).join("device/name")).ok()?;
+    Some(name.trim().to_owned())
+}
+
+/// Steam's virtual pads carry their slot only in the Linux kernel name.
+#[cfg(not(target_os = "linux"))]
+fn kernel_device_name(_index: u32) -> Option<String> {
+    None
+}
+
+/// Name and kind of the real controller in `slot`; `None` when Steam does not list the slot
+/// or gives it no name.
+fn steam_identity(slots: &[(u32, SteamSlot)], slot: u32) -> Option<(String, PadKind)> {
+    let (_, s) = slots.iter().find(|(n, s)| *n == slot && !s.name.is_empty())?;
+    Some((s.name.clone(), steam_slot_kind(&s.ty, s.vid)))
+}
+
+/// Name and kind shown for a pad: those of the real controller behind a Steam virtual gamepad
+/// when Steam lists it (`steam`), else SDL's name and `kind_from`.
+fn pad_identity(
+    name: &str,
+    ty: Option<PadKind>,
+    on_deck: bool,
+    steam: Option<(String, PadKind)>,
+) -> (String, PadKind) {
+    match steam {
+        Some(real) if is_steam_virtual(name) => real,
+        _ => (name.to_owned(), kind_from(name, ty, on_deck)),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -458,6 +594,8 @@ struct Pad {
     shot: bool,
     /// GUID + name: tells a reconnecting pad from a new one.
     key: String,
+    /// Steam's slot number when this is a Steam virtual gamepad.
+    steam_slot: Option<u32>,
 }
 
 impl Pad {
@@ -507,6 +645,20 @@ fn sdl_kind(ctrl: &GameController) -> Option<PadKind> {
     }
 }
 
+/// USB vendor and product id of the SDL device (0 when unknown).
+fn sdl_ids(ctrl: &GameController) -> (u16, u16) {
+    let raw = unsafe { sdl2::sys::SDL_GameControllerFromInstanceID(ctrl.instance_id() as i32) };
+    if raw.is_null() {
+        return (0, 0);
+    }
+    unsafe {
+        (
+            sdl2::sys::SDL_GameControllerGetVendor(raw),
+            sdl2::sys::SDL_GameControllerGetProduct(raw),
+        )
+    }
+}
+
 /// Light bar / player LEDs of a pad: its seat colour and number, or dim white and no number
 /// without a seat.
 fn show_seat(ctrl: &mut GameController, slot: Option<usize>) {
@@ -526,6 +678,14 @@ fn show_seat(ctrl: &mut GameController, slot: Option<usize>) {
 /// none. `reset_seats` empties the seats when a game starts; a pad that reconnects during the
 /// game gets its seat back at once. The light bar / player LEDs show the seat (1 blue, 2 red,
 /// 3 green, 4 pink; dim white without one). Hotkeys and menu navigation work on every pad.
+///
+/// In Steam's Game Mode every controller arrives as a "Steam Virtual Gamepad". When Steam
+/// names the real controllers in the file of the `SteamVirtualGamepadInfo` environment
+/// variable, a virtual pad shows the name and kind of the controller in its slot. The file is
+/// re-read when a pad connects and, at most once a second, when its modification time
+/// changed; open pads then change name and kind in place and keep their seats. Without the
+/// variable the file system is never touched and virtual pads keep SDL's name.
+/// Every connect prints one `ebobo: gamepad ...` line to stdout.
 pub struct Input {
     gc: GameControllerSubsystem,
     joy: JoystickSubsystem,
@@ -543,6 +703,12 @@ pub struct Input {
     events: Vec<PadEvent>,
     /// The finger being tracked (`touch_id`, `finger_id`); other fingers are ignored.
     finger: Option<(i64, i64)>,
+    /// Path from `SteamVirtualGamepadInfo`; `None` = variable not set.
+    steam_info: Option<PathBuf>,
+    /// Modification time of that file when it was last read (`None` = unreadable).
+    steam_mtime: Option<SystemTime>,
+    /// Time since the modification time was last checked.
+    steam_checked: Duration,
 }
 
 impl Input {
@@ -584,6 +750,11 @@ impl Input {
             repeat: Default::default(),
             events: Vec::new(),
             finger: None,
+            steam_info: std::env::var_os("SteamVirtualGamepadInfo")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
+            steam_mtime: None,
+            steam_checked: Duration::ZERO,
         };
         let n = input.joy.num_joysticks().unwrap_or(0);
         for i in 0..n {
@@ -612,18 +783,71 @@ impl Input {
             .unwrap_or_default();
         let key = format!("{guid}|{name}");
         let slot = self.seats.rejoin(id, &key);
-        let kind = kind_from(&name, sdl_kind(&ctrl), crate::config::is_steam_deck());
+        let (name, kind) =
+            pad_identity(&name, sdl_kind(&ctrl), crate::config::is_steam_deck(), None);
+        let steam_slot = (is_steam_virtual(&name))
+            .then(|| kernel_device_name(index))
+            .flatten()
+            .and_then(|n| steam_slot_from_joystick_name(&n));
+        let (vid, pid) = sdl_ids(&ctrl);
         let mut ctrl = ctrl;
         show_seat(&mut ctrl, slot);
-        let info = PadInfo { name, kind, slot };
-        self.events.push(PadEvent::Connected(info.clone()));
         self.pads.push(Pad {
             ctrl,
-            info,
+            info: PadInfo { name, kind, slot },
             key,
+            steam_slot,
             hold: Hold::default(),
             shot: false,
         });
+        // A new controller also moves the others between Steam's slots.
+        self.refresh_steam_pads();
+        let info = self.pads[self.pads.len() - 1].info.clone();
+        let slot_text = steam_slot.map_or("-".to_owned(), |n| n.to_string());
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
+            "ebobo: gamepad \"{}\" kind={:?} steam_slot={slot_text} vid={vid:04x} pid={pid:04x}",
+            info.name, info.kind
+        );
+        let _ = out.flush();
+        self.events.push(PadEvent::Connected(info));
+    }
+
+    /// Re-reads Steam's virtual gamepad info and gives every open virtual pad the name and
+    /// kind of the real controller in its slot. A pad whose slot is not listed stays as it is.
+    fn refresh_steam_pads(&mut self) {
+        let Some(path) = &self.steam_info else { return };
+        self.steam_checked = Duration::ZERO;
+        self.steam_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let slots = parse_steam_info(&text);
+        for p in &mut self.pads {
+            let Some((name, kind)) = p.steam_slot.and_then(|n| steam_identity(&slots, n)) else {
+                continue;
+            };
+            p.info.name = name;
+            p.info.kind = kind;
+            if let Some((shown, hint_kind)) = &mut self.hint {
+                if *shown == p.ctrl.instance_id() {
+                    *hint_kind = kind;
+                }
+            }
+        }
+    }
+
+    /// At most once a second: re-reads Steam's info when the file's modification time changed.
+    fn watch_steam_info(&mut self, dt: Duration) {
+        let Some(path) = &self.steam_info else { return };
+        self.steam_checked += dt;
+        if self.steam_checked < Duration::from_secs(1) {
+            return;
+        }
+        self.steam_checked = Duration::ZERO;
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if mtime != self.steam_mtime {
+            self.refresh_steam_pads();
+        }
     }
 
     fn close(&mut self, id: u32) {
@@ -787,6 +1011,8 @@ impl Input {
             ks.is_scancode_pressed(Scancode::Left),
             ks.is_scancode_pressed(Scancode::Right),
         ];
+
+        self.watch_steam_info(dt);
 
         for p in &mut self.pads {
             let b = p.buttons();
@@ -1127,5 +1353,108 @@ mod tests {
         assert_eq!(kind_from("Steam Virtual Gamepad", Some(PadKind::Xbox), true), PadKind::SteamDeck);
         assert_eq!(kind_from("Steam Virtual Gamepad", Some(PadKind::Xbox), false), PadKind::Xbox);
         assert_eq!(kind_from("Foo", None, false), PadKind::Generic);
+    }
+
+    const DECK_INFO: &str = "[slot 0]\nname=Steam Deck Controller\nVID=0x28de\nPID=0x1205\nhandle=0x00000ff244308c2b\ntype=steam\n";
+
+    #[test]
+    fn input_steam_info_owner_sample() {
+        let slots = parse_steam_info(DECK_INFO);
+        assert_eq!(
+            slots,
+            [(0, SteamSlot { name: "Steam Deck Controller".into(), vid: 0x28de, pid: 0x1205, ty: "steam".into() })]
+        );
+        assert_eq!(steam_identity(&slots, 0), Some(("Steam Deck Controller".into(), PadKind::SteamDeck)));
+    }
+
+    #[test]
+    fn input_steam_info_two_slots_with_ps4() {
+        let text = format!(
+            "{DECK_INFO}\r\n[slot 1]\r\nname=PS4 Controller\r\nVID=0x054c\r\nPID=0x09cc\r\nhandle=0x1\r\ntype=ps4\r\n"
+        );
+        let slots = parse_steam_info(&text);
+        assert_eq!(slots.len(), 2);
+        assert_eq!(
+            slots[1],
+            (1, SteamSlot { name: "PS4 Controller".into(), vid: 0x054c, pid: 0x09cc, ty: "ps4".into() })
+        );
+        assert_eq!(steam_identity(&slots, 1), Some(("PS4 Controller".into(), PadKind::PlayStation)));
+        assert_eq!(steam_identity(&slots, 0), Some(("Steam Deck Controller".into(), PadKind::SteamDeck)));
+        // The virtual pad in slot 1 shows the PS4; a real pad is never renamed.
+        assert_eq!(
+            pad_identity("Steam Virtual Gamepad", Some(PadKind::Xbox), true, steam_identity(&slots, 1)),
+            ("PS4 Controller".to_owned(), PadKind::PlayStation)
+        );
+        assert_eq!(
+            pad_identity("Xbox One Controller", Some(PadKind::Xbox), true, steam_identity(&slots, 1)),
+            ("Xbox One Controller".to_owned(), PadKind::Xbox)
+        );
+    }
+
+    #[test]
+    fn input_steam_info_garbage_and_missing_slot() {
+        let text = "name=before any section\nrubbish\n\n[slot x]\nname=bad section\n[other]\nname=nope\n\
+                    [slot 2]\n = \nno equals here\ncolour=red\nVID=zz\nPID=2508\nname = Pro Controller \ntype=switchpro\n[slot 3]\nVID=0x045e\n";
+        let slots = parse_steam_info(text);
+        assert_eq!(
+            slots,
+            [
+                (2, SteamSlot { name: "Pro Controller".into(), vid: 0, pid: 2508, ty: "switchpro".into() }),
+                (3, SteamSlot { vid: 0x045e, ..Default::default() }),
+            ]
+        );
+        assert_eq!(steam_identity(&slots, 2), Some(("Pro Controller".into(), PadKind::Nintendo)));
+        // Not listed, and listed without a name: nothing to show.
+        assert_eq!(steam_identity(&slots, 0), None);
+        assert_eq!(steam_identity(&slots, 3), None);
+        assert_eq!(parse_steam_info(""), []);
+        assert_eq!(steam_identity(&parse_steam_info(DECK_INFO), 1), None);
+    }
+
+    #[test]
+    fn input_steam_slot_from_joystick_name() {
+        assert_eq!(steam_slot_from_joystick_name("Microsoft X-Box 360 pad 0"), Some(0));
+        assert_eq!(steam_slot_from_joystick_name("Microsoft X-Box 360 pad 12"), Some(12));
+        assert_eq!(steam_slot_from_joystick_name("X-Box 360 pad 3 (virtual)"), Some(3));
+        assert_eq!(steam_slot_from_joystick_name("Microsoft X-Box 360 pad"), None);
+        assert_eq!(steam_slot_from_joystick_name("Xbox 360 Controller"), None);
+        assert_eq!(steam_slot_from_joystick_name(""), None);
+    }
+
+    #[test]
+    fn input_steam_slot_kind_table() {
+        use PadKind::*;
+        for (ty, vid, kind) in [
+            ("ps3", 0, PlayStation),
+            ("ps4", 0x054c, PlayStation),
+            ("ps5", 0x28de, PlayStation),
+            ("", 0x054c, PlayStation),
+            ("xbox360", 0, Xbox),
+            ("xboxone", 0x045e, Xbox),
+            ("unknown", 0x045e, Xbox),
+            ("switchpro", 0, Nintendo),
+            ("joyconleft", 0, Nintendo),
+            ("joyconright", 0, Nintendo),
+            ("joyconpair", 0, Nintendo),
+            ("", 0x057e, Nintendo),
+            ("steam", 0, SteamDeck),
+            ("", 0x28de, SteamDeck),
+            ("", 0, Generic),
+            ("wheel", 0x046d, Generic),
+        ] {
+            assert_eq!(steam_slot_kind(ty, vid), kind, "{ty} {vid:#06x}");
+        }
+    }
+
+    #[test]
+    fn input_kind_steam_deck_without_steam_info() {
+        for (name, ty, on_deck, kind) in [
+            ("Steam Deck", Some(PadKind::Xbox), false, PadKind::SteamDeck),
+            ("Steam Virtual Gamepad", Some(PadKind::Xbox), true, PadKind::SteamDeck),
+            ("Steam Virtual Gamepad", Some(PadKind::Xbox), false, PadKind::Xbox),
+            ("Foo", None, false, PadKind::Generic),
+        ] {
+            assert_eq!(pad_identity(name, ty, on_deck, None), (name.to_owned(), kind));
+        }
     }
 }
