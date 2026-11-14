@@ -47,7 +47,8 @@ pub(crate) enum MeshEvent {
     PeerJoined { id: PeerId, name: String },
     /// The pair's route is decided.
     RouteUp { id: PeerId, kind: RouteKind },
-    /// A decided pair moved to another route (a dead direct route fell back to the relay).
+    /// A decided pair moved to another route: a dead direct route fell back to the relay, a
+    /// fallen-back pair returned to direct, or a direct peer roamed to a new address.
     RouteChanged { id: PeerId, kind: RouteKind },
     PeerLeft { id: PeerId },
     /// The server lost this peer's WebSocket; it may rejoin within the grace period.
@@ -74,6 +75,22 @@ const GAME_RELAY_AFTER: Duration = Duration::from_secs(3);
 /// A decided direct peer that punches from a new address with its token roams there once
 /// its current address has been silent this long (late pairing punches never flap a route).
 const ROAM_AFTER: Duration = Duration::from_secs(1);
+/// In game: a pair that fell back from a direct route to the relay probes the direct path
+/// this often (PUNCH to the old address, the candidates and where the peer's punches come from).
+const RETURN_PROBE_EVERY: Duration = Duration::from_secs(1);
+/// In game: no probing for this long after a pair's first fallback; every further fallback
+/// of the pair doubles it (`return_wait`)...
+const RETURN_FIRST_WAIT: Duration = Duration::from_secs(5);
+/// ...up to this cap.
+const RETURN_MAX_WAIT: Duration = Duration::from_secs(60);
+/// The lower id returns to direct once it has this many PUNCH_ACKs from one address...
+const RETURN_ACKS: usize = 3;
+/// ...counted at most one per this interval (one per probe round, not one per probed address)...
+const RETURN_ACK_SPACING: Duration = Duration::from_millis(500);
+/// ...all inside this window (three rounds at `RETURN_PROBE_EVERY` plus slack).
+const RETURN_WINDOW: Duration = Duration::from_secs(4);
+/// A direct route in use this long before it fell back resets the pair's backoff.
+const RETURN_STABLE_AFTER: Duration = Duration::from_secs(30);
 /// WebSocket reconnect: backoff steps (the last repeats) and the give-up time after a drop.
 const WS_BACKOFF_MS: [u64; 4] = [500, 1000, 2000, 4000];
 const WS_REJOIN_WINDOW: Duration = Duration::from_secs(60);
@@ -107,6 +124,23 @@ struct PeerState {
     decided: bool,
     /// Last packet seen on the decided direct route (route health).
     last_rx: Option<Instant>,
+    /// When the current direct route was adopted (backoff reset after `RETURN_STABLE_AFTER`).
+    direct_since: Option<Instant>,
+    /// In game: the pair fell back from a direct route to the relay at this time, so it probes
+    /// the direct path and may return. `None` for pairs relayed by decision.
+    fell_back_at: Option<Instant>,
+    /// In-game fallbacks since the direct route last held `RETURN_STABLE_AFTER`; sets the wait.
+    fallbacks: u32,
+    /// The direct address the route had before the fallback.
+    direct_addr: Option<SocketAddr>,
+    /// Return probing: source of the peer's latest token-matched PUNCH (it may have moved)...
+    probe_seen: Option<SocketAddr>,
+    /// ...and of its PUNCH_ACKs, with their arrival times (one per `RETURN_ACK_SPACING`).
+    probe_ack_from: Option<SocketAddr>,
+    probe_acks: Vec<Instant>,
+    /// Just returned to direct: every packet is also mirrored over the relay until the peer is
+    /// heard on the direct route (it switches when our `route` arrives, after the mirrored packets).
+    returning: bool,
 }
 
 impl PeerState {
@@ -122,8 +156,21 @@ impl PeerState {
             last_punch: None,
             decided: false,
             last_rx: None,
+            direct_since: None,
+            fell_back_at: None,
+            fallbacks: 0,
+            direct_addr: None,
+            probe_seen: None,
+            probe_ack_from: None,
+            probe_acks: Vec::new(),
+            returning: false,
         }
     }
+}
+
+/// Probing pause after a pair's `fallbacks`-th in-game fallback: 5, 10, 20, 40, then 60 s.
+fn return_wait(fallbacks: u32) -> Duration {
+    RETURN_FIRST_WAIT.saturating_mul(1 << fallbacks.saturating_sub(1).min(4)).min(RETURN_MAX_WAIT)
 }
 
 enum Mode {
@@ -299,11 +346,15 @@ impl Mesh {
         }
     }
 
-    /// In game, the peer's direct route has been silent ≥ `GAME_MIRROR_AFTER`.
+    /// In game, the peer's direct route has been silent ≥ `GAME_MIRROR_AFTER`, or it was just
+    /// re-adopted from the relay and the peer has not been heard on it yet.
     fn mirroring(&self, peer: PeerId) -> bool {
         self.in_game
             && matches!(self.routes.get(&peer), Some(Route::Udp(_)))
-            && self.peers.get(&peer).and_then(|st| st.last_rx).is_some_and(|t| t.elapsed() >= GAME_MIRROR_AFTER)
+            && self
+                .peers
+                .get(&peer)
+                .is_some_and(|st| st.returning || st.last_rx.is_some_and(|t| t.elapsed() >= GAME_MIRROR_AFTER))
     }
 
     pub(crate) fn me(&self) -> PeerId {
@@ -438,11 +489,17 @@ impl Mesh {
                 let Some(from) = id_of("from") else { return };
                 let Some(st) = self.peers.get_mut(&from) else { return };
                 if st.decided {
-                    // The only later change: a dead direct route falls back to the relay.
-                    if v.get("mode").and_then(Value::as_str) == Some("relay")
-                        && matches!(self.routes.get(&from), Some(Route::Udp(_)))
-                    {
-                        self.switch_to_relay(from);
+                    // Later changes: a dead direct route falls back to the relay, and a pair
+                    // that fell back in game returns to direct on the lower id's word.
+                    let back_to = st.fell_back_at.and(st.probe_ack_from.or(st.probe_seen).or(st.direct_addr));
+                    match (v.get("mode").and_then(Value::as_str), self.routes.get(&from)) {
+                        (Some("relay"), Some(Route::Udp(_))) => self.switch_to_relay(from),
+                        (Some("direct"), Some(Route::Relay)) if from < self.me => {
+                            if let Some(addr) = back_to {
+                                self.switch_to_direct(from, addr);
+                            }
+                        }
+                        _ => {}
                     }
                     return;
                 }
@@ -475,10 +532,48 @@ impl Mesh {
         }
     }
 
+    /// Moves a pair to the relay. In game a pair leaving a direct route counts as a fallback:
+    /// it probes the direct path after `return_wait` and may return (`switch_to_direct`).
     fn switch_to_relay(&mut self, peer: PeerId) {
+        let fell_from = match self.routes.get(&peer) {
+            Some(&Route::Udp(addr)) if self.in_game && !self.force_relay => Some(addr),
+            _ => None,
+        };
+        if let (Some(addr), Some(st)) = (fell_from, self.peers.get_mut(&peer)) {
+            let now = Instant::now();
+            if st.direct_since.is_some_and(|t| now - t >= RETURN_STABLE_AFTER) {
+                st.fallbacks = 0;
+            }
+            st.fallbacks += 1;
+            st.fell_back_at = Some(now);
+            st.direct_addr = Some(addr);
+            st.direct_since = None;
+            st.returning = false;
+            st.probe_seen = None;
+            st.probe_ack_from = None;
+            st.probe_acks.clear();
+        }
         self.transport.set_route(peer, Route::Relay);
         self.routes.insert(peer, Route::Relay);
         self.events.push(MeshEvent::RouteChanged { id: peer, kind: RouteKind::Relay });
+    }
+
+    /// A fallen-back pair goes direct again at `addr`. The health clock starts fresh, and packets
+    /// keep going over the relay too until the peer is heard on `addr` (`returning`).
+    fn switch_to_direct(&mut self, peer: PeerId, addr: SocketAddr) {
+        let Some(st) = self.peers.get_mut(&peer) else { return };
+        let now = Instant::now();
+        st.last_rx = Some(now);
+        st.direct_since = Some(now);
+        st.fell_back_at = None;
+        st.returning = true;
+        st.probe_seen = None;
+        st.probe_ack_from = None;
+        st.probe_acks.clear();
+        st.last_punch = None;
+        self.transport.set_route(peer, Route::Udp(addr));
+        self.routes.insert(peer, Route::Udp(addr));
+        self.events.push(MeshEvent::RouteChanged { id: peer, kind: RouteKind::Direct });
     }
 
     fn peer_joined(&mut self, id: PeerId, name: String) {
@@ -511,8 +606,10 @@ impl Mesh {
 
     fn adopt_route(&mut self, peer: PeerId, route: Route) {
         if let Some(st) = self.peers.get_mut(&peer) {
+            let now = Instant::now();
             st.decided = true;
-            st.last_rx = Some(Instant::now());
+            st.last_rx = Some(now);
+            st.direct_since = matches!(route, Route::Udp(_)).then_some(now);
         }
         self.transport.set_route(peer, route);
         self.routes.insert(peer, route);
@@ -523,7 +620,8 @@ impl Mesh {
         self.events.push(MeshEvent::RouteUp { id: peer, kind });
     }
 
-    /// Punches undecided peers and, as the lower id of a pair, decides the route.
+    /// Punches undecided peers and, as the lower id of a pair, decides the route; in game also
+    /// probes fallen-back pairs and, as the lower id, returns them to direct.
     fn drive_pairs(&mut self, now: Instant) {
         let me = self.me;
         let relay_after = if self.symmetric { RELAY_AFTER_SYMMETRIC } else { RELAY_AFTER };
@@ -531,10 +629,39 @@ impl Mesh {
             if self.in_game { (GAME_MIRROR_AFTER, GAME_RELAY_AFTER) } else { (ROUTE_REPUNCH_AFTER, ROUTE_DEAD_AFTER) };
         let mut decisions: Vec<(PeerId, Route)> = Vec::new();
         let mut dead: Vec<PeerId> = Vec::new();
+        let mut returns: Vec<(PeerId, SocketAddr)> = Vec::new();
         let ids: Vec<PeerId> = self.peers.keys().copied().collect();
         for peer in ids {
             let Some(st) = self.peers.get_mut(&peer) else { continue };
             if st.decided {
+                if self.in_game && matches!(self.routes.get(&peer), Some(Route::Relay)) {
+                    // Return probing, only for pairs that fell back from direct in game.
+                    let Some(fell) = st.fell_back_at else { continue };
+                    if now - fell < return_wait(st.fallbacks) {
+                        continue;
+                    }
+                    st.probe_acks.retain(|&t| now - t <= RETURN_WINDOW);
+                    if me < peer && st.probe_acks.len() >= RETURN_ACKS {
+                        if let Some(addr) = st.probe_ack_from {
+                            returns.push((peer, addr));
+                            continue;
+                        }
+                    }
+                    if st.last_punch.is_none_or(|t| now - t >= RETURN_PROBE_EVERY) {
+                        st.last_punch = Some(now);
+                        let punch = Packet::Punch { token: self.token, from: me.0, to: peer.0 }.to_vec();
+                        let mut targets: Vec<SocketAddr> = Vec::new();
+                        for a in st.direct_addr.into_iter().chain(st.probe_seen).chain(st.probe_ack_from).chain(st.cands.iter().copied()) {
+                            if !targets.contains(&a) {
+                                targets.push(a);
+                            }
+                        }
+                        for a in targets {
+                            self.transport.send_udp(a, &punch);
+                        }
+                    }
+                    continue;
+                }
                 // Route health: a silent direct route is punched again, then given up.
                 let Some(&Route::Udp(addr)) = self.routes.get(&peer) else { continue };
                 let silent = st.last_rx.map_or(Duration::ZERO, |t| now - t);
@@ -591,6 +718,11 @@ impl Mesh {
             self.transport.send_text(json!({"t": "route", "to": peer.0, "mode": "relay"}).to_string());
             self.switch_to_relay(peer);
         }
+        for (peer, addr) in returns {
+            let msg = json!({"t": "route", "to": peer.0, "mode": "direct", "addr": addr.to_string()});
+            self.transport.send_text(msg.to_string());
+            self.switch_to_direct(peer, addr);
+        }
     }
 
     // ---- packets ----
@@ -598,8 +730,13 @@ impl Mesh {
     fn poll_packets(&mut self) {
         while let Some((src, data)) = self.transport.recv_raw() {
             if let Some(p) = self.routed_source(src).filter(|_| matches!(src, Source::Udp(_))) {
+                let probe = matches!(Packet::parse(&data), Some(Packet::Punch { .. } | Packet::PunchAck { .. }));
                 if let Some(st) = self.peers.get_mut(&p) {
                     st.last_rx = Some(Instant::now());
+                    // Only a peer that has switched sends us non-punch packets on the direct route.
+                    if !probe {
+                        st.returning = false;
+                    }
                 }
             }
             match Packet::parse(&data) {
@@ -627,7 +764,8 @@ impl Mesh {
 
     /// A decided direct peer punching (or acking) with its token from a new address moved
     /// (NAT rebinding, Wi-Fi → LTE): its route follows once the old address is silent
-    /// (`ROAM_AFTER`). A relay-routed pair stays on the relay.
+    /// (`ROAM_AFTER`). A relay-routed pair does not roam; a fallen-back one may return to direct
+    /// through probing (`drive_pairs`, `switch_to_direct`).
     fn roam(&mut self, peer: PeerId, addr: SocketAddr) {
         let Some(&Route::Udp(old)) = self.routes.get(&peer) else { return };
         let Some(st) = self.peers.get_mut(&peer) else { return };
@@ -661,11 +799,15 @@ impl Mesh {
             }
             Mode::JoinDirect { .. } | Mode::Fixed => {}
             Mode::Room { .. } => {
+                let probing = self.in_game && matches!(self.routes.get(&from), Some(Route::Relay));
                 let Some(st) = self.peers.get_mut(&from) else { return };
                 if st.token != Some(token) {
                     return;
                 }
                 st.seen_from.get_or_insert(addr);
+                if probing && st.fell_back_at.is_some() {
+                    st.probe_seen = Some(addr);
+                }
                 self.roam(from, addr);
                 let ack = Packet::PunchAck { token: self.token, from: self.me.0, to: from.0 }.to_vec();
                 self.transport.send_udp(addr, &ack);
@@ -690,11 +832,22 @@ impl Mesh {
                 self.events.push(MeshEvent::RouteUp { id: from, kind: RouteKind::Direct });
             }
             Mode::Room { .. } => {
+                let probing = self.in_game && matches!(self.routes.get(&from), Some(Route::Relay));
                 let Some(st) = self.peers.get_mut(&from) else { return };
                 if st.token != Some(token) {
                     return;
                 }
                 st.confirmed.get_or_insert(addr);
+                let now = Instant::now();
+                if probing && st.fell_back_at.is_some_and(|t| now - t >= return_wait(st.fallbacks)) {
+                    if st.probe_ack_from != Some(addr) {
+                        st.probe_ack_from = Some(addr);
+                        st.probe_acks.clear();
+                    }
+                    if st.probe_acks.last().is_none_or(|&t| now - t >= RETURN_ACK_SPACING) {
+                        st.probe_acks.push(now);
+                    }
+                }
                 self.roam(from, addr);
             }
         }
@@ -1379,6 +1532,41 @@ mod tests {
         nodes.into_iter().for_each(|n| n.mesh.close());
     }
 
+    /// A pair that fell back to the relay in game returns to direct once the direct path works
+    /// again (probing starts `RETURN_FIRST_WAIT` after the fallback); traffic keeps flowing.
+    #[test]
+    #[ignore]
+    fn mesh_live_fallen_back_pair_returns_to_direct() {
+        let mut nodes = live_room(1, false);
+        assert!(nodes.iter().all(|n| n.routes.values().all(|k| *k == RouteKind::Direct)));
+        let ids: Vec<PeerId> = nodes.iter().map(|n| n.me.unwrap()).collect();
+        let dead = Route::Udp(SocketAddr::from(([127, 0, 0, 1], 9)));
+        let mut saved = Vec::new();
+        for (i, n) in nodes.iter_mut().enumerate() {
+            let peer = ids[1 - i];
+            n.mesh.in_game = true;
+            n.mesh.transport.set_route(peer, dead);
+            n.mesh.routes.insert(peer, dead);
+            let st = n.mesh.peers.get_mut(&peer).unwrap();
+            saved.push(std::mem::take(&mut st.cands));
+        }
+        pump_until(&mut nodes, 15, "relay fallback", |ns| {
+            ns.iter().all(|n| n.routes.values().all(|k| *k == RouteKind::Relay))
+        });
+        // The path works again: the peers' candidates lead to their live sockets.
+        for (i, n) in nodes.iter_mut().enumerate() {
+            n.mesh.peers.get_mut(&ids[1 - i]).unwrap().cands = saved[i].clone();
+        }
+        pump_until(&mut nodes, 30, "return to direct", |ns| {
+            ns.iter().all(|n| n.routes.values().all(|k| *k == RouteKind::Direct))
+        });
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(n.mesh.transport.route_kind(ids[1 - i]), Some(RouteKind::Direct));
+        }
+        exchange_until(&mut nodes, 10);
+        nodes.into_iter().for_each(|n| n.mesh.close());
+    }
+
     // ---- in-game link ----
 
     fn ggrs_msg() -> ggrs::Message {
@@ -1495,6 +1683,41 @@ mod tests {
             }
             (bins, texts)
         }
+
+        /// Pretends the pair fell back to the relay `ms` ago.
+        fn fell_back_for(&mut self, peer: PeerId, ms: u64) {
+            self.link.mesh.peers.get_mut(&peer).unwrap().fell_back_at = Some(Instant::now() - Duration::from_millis(ms));
+        }
+
+        /// The peer at `b` answers `rounds` probe rounds with token-matched PUNCH_ACKs, one
+        /// `RETURN_ACK_SPACING` apart (counted acks are aged instead of sleeping). Returns the events.
+        fn answer_probes(&mut self, b: &UdpSocket, peer: PeerId, rounds: usize) -> Vec<MeshEvent> {
+            let ack = Packet::PunchAck { token: 0xB0B, from: peer.0, to: self.link.me().0 }.to_vec();
+            let mut events = Vec::new();
+            for _ in 0..rounds {
+                b.send_to(&ack, self.addr).unwrap();
+                thread::sleep(Duration::from_millis(30));
+                events.extend(self.link.mesh.poll());
+                for t in &mut self.link.mesh.peers.get_mut(&peer).unwrap().probe_acks {
+                    *t -= RETURN_ACK_SPACING;
+                }
+            }
+            events
+        }
+    }
+
+    /// Reads `s` until it goes quiet; whether any packet matched `want`.
+    fn recv_kind(s: &UdpSocket, want: impl Fn(&Packet<'_>) -> bool) -> bool {
+        let mut buf = [0u8; 1500];
+        let mut found = false;
+        while let Ok(n) = s.recv(&mut buf) {
+            found |= Packet::parse(&buf[..n]).is_some_and(|p| want(&p));
+        }
+        found
+    }
+
+    fn route_texts(texts: &[String], mode: &str) -> Vec<Value> {
+        texts.iter().filter_map(|t| serde_json::from_str::<Value>(t).ok()).filter(|v| v["t"] == "route" && v["mode"] == mode).collect()
     }
 
     #[test]
@@ -1610,5 +1833,152 @@ mod tests {
         thread::sleep(Duration::from_millis(30));
         a.poll();
         assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Relay));
+    }
+
+    #[test]
+    fn link_fallen_back_pair_returns_to_direct() {
+        let b = local_sock();
+        let b_addr = b.local_addr().unwrap();
+        let mut a = fake_room(PeerId(0), PeerId(1), b_addr, 0xB0B);
+        a.silent_for(PeerId(1), 3100);
+        a.poll();
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Relay));
+        a.drain();
+
+        // After the wait the old direct address is probed with the session token.
+        a.fell_back_for(PeerId(1), 5100);
+        a.poll();
+        assert!(recv_kind(&b, |p| matches!(p, Packet::Punch { token: 0xA11CE, from: 0, to: 1 })), "probed");
+
+        // Steady acks from one address: the lower id announces direct and switches.
+        let events = a.answer_probes(&b, PeerId(1), RETURN_ACKS);
+        assert!(
+            events.iter().any(|e| matches!(e, MeshEvent::RouteChanged { id: PeerId(1), kind: RouteKind::Direct })),
+            "{events:?}"
+        );
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Direct));
+        let (_, texts) = a.drain();
+        let direct = route_texts(&texts, "direct");
+        assert!(direct.iter().any(|v| v["to"] == 1 && v["addr"] == b_addr.to_string()), "{texts:?}");
+
+        // A packet sent mid-switch (peer not heard on direct yet) goes by UDP and the relay.
+        let pkt = Packet::Ggrs(b"x").to_vec();
+        a.link.mesh.send(PeerId(1), &pkt);
+        assert_eq!(a.drain().0, vec![PeerId(1)], "mirrored until the peer switched");
+        assert!(recv_kind(&b, |p| matches!(p, Packet::Ggrs(_))), "sent by UDP");
+
+        // Once the peer is heard on the direct route, packets leave by UDP only.
+        b.send_to(&Packet::Keepalive.to_vec(), a.addr).unwrap();
+        wait_for(|| {
+            a.poll();
+            (!a.link.mesh.peers[&PeerId(1)].returning).then_some(())
+        })
+        .expect("peer heard on the direct route");
+        a.drain();
+        a.link.mesh.send(PeerId(1), &pkt);
+        assert_eq!(a.drain().0, vec![]);
+        assert!(recv_kind(&b, |p| matches!(p, Packet::Ggrs(_))), "sent by UDP");
+    }
+
+    /// The higher id follows the lower id's `route direct` to where the peer's probes come
+    /// from, and a packet around the switch is accepted on either route.
+    #[test]
+    fn link_higher_id_returns_on_route_direct_and_packets_arrive_on_either_route() {
+        let b = local_sock();
+        let mut a = fake_room(PeerId(2), PeerId(1), b.local_addr().unwrap(), 0xB0B);
+        a.text.send(json!({"t": "route", "from": 1, "mode": "relay"}).to_string()).unwrap();
+        a.poll();
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Relay));
+
+        // The peer moved: its token-matched probe from a new socket is answered and remembered.
+        let b_new = local_sock();
+        let b_new_addr = b_new.local_addr().unwrap();
+        b_new.send_to(&Packet::Punch { token: 0xB0B, from: 1, to: 2 }.to_vec(), a.addr).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        a.poll();
+        assert!(recv_kind(&b_new, |p| matches!(p, Packet::PunchAck { token: 0xA11CE, from: 2, to: 1 })));
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Relay), "a probe alone never switches");
+
+        a.text.send(json!({"t": "route", "from": 1, "mode": "direct", "addr": "127.0.0.1:9"}).to_string()).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let events = a.link.mesh.poll();
+        assert!(events.iter().any(|e| matches!(e, MeshEvent::RouteChanged { id: PeerId(1), kind: RouteKind::Direct })));
+        assert_eq!(a.link.mesh.routes[&PeerId(1)], Route::Udp(b_new_addr));
+
+        // The decider's packets mirrored over the relay and its UDP packets both arrive.
+        a._inbound.send((PeerId(1), Packet::Ggrs(b"r").to_vec())).unwrap();
+        b_new.send_to(&Packet::Ggrs(b"u").to_vec(), a.addr).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            for ev in a.link.mesh.poll() {
+                if let MeshEvent::Packet { from, data } = ev {
+                    got.push((from, data));
+                }
+            }
+        }
+        assert!(got.contains(&(PeerId(1), Packet::Ggrs(b"r").to_vec())), "relay copy accepted");
+        assert!(got.contains(&(PeerId(1), Packet::Ggrs(b"u").to_vec())), "UDP copy accepted");
+    }
+
+    /// A pair relayed by decision (relay_only, force_relay, punching never worked) never
+    /// probes and never leaves the relay, whatever arrives.
+    #[test]
+    fn link_relay_by_decision_pair_never_probes_or_returns() {
+        let b = local_sock();
+        let mut a = fake_room(PeerId(0), PeerId(1), b.local_addr().unwrap(), 0xB0B);
+        a.link.mesh.peers.get_mut(&PeerId(1)).unwrap().relay_only = true;
+        a.link.mesh.adopt_route(PeerId(1), Route::Relay);
+        for _ in 0..=RETURN_ACKS {
+            b.send_to(&Packet::Punch { token: 0xB0B, from: 1, to: 0 }.to_vec(), a.addr).unwrap();
+            b.send_to(&Packet::PunchAck { token: 0xB0B, from: 1, to: 0 }.to_vec(), a.addr).unwrap();
+            thread::sleep(Duration::from_millis(30));
+            a.poll();
+        }
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Relay));
+        let st = &a.link.mesh.peers[&PeerId(1)];
+        assert!(st.fell_back_at.is_none() && st.probe_acks.is_empty());
+        assert!(route_texts(&a.drain().1, "direct").is_empty());
+        assert!(!recv_kind(&b, |p| matches!(p, Packet::Punch { .. })), "never probed");
+    }
+
+    #[test]
+    fn link_return_waits_and_backs_off() {
+        let s = Duration::from_secs;
+        assert_eq!([1, 2, 3, 4, 5, 30].map(return_wait), [s(5), s(10), s(20), s(40), s(60), s(60)]);
+        let b = local_sock();
+        let mut a = fake_room(PeerId(0), PeerId(1), b.local_addr().unwrap(), 0xB0B);
+        let p = PeerId(1);
+        a.silent_for(p, 3100);
+        a.poll();
+        assert_eq!(a.link.route_kind(p), Some(RouteKind::Relay));
+
+        // Inside the first wait: no probes, acks are not counted, no return.
+        a.fell_back_for(p, 4000);
+        a.answer_probes(&b, p, RETURN_ACKS + 1);
+        assert_eq!(a.link.route_kind(p), Some(RouteKind::Relay));
+        assert!(a.link.mesh.peers[&p].probe_acks.is_empty());
+        assert!(!recv_kind(&b, |q| matches!(q, Packet::Punch { .. })), "no probe inside the wait");
+        a.fell_back_for(p, 5100);
+        a.answer_probes(&b, p, RETURN_ACKS);
+        assert_eq!(a.link.route_kind(p), Some(RouteKind::Direct));
+
+        // A second fallback soon after waits twice as long.
+        a.silent_for(p, 3100);
+        a.poll();
+        assert_eq!(a.link.route_kind(p), Some(RouteKind::Relay));
+        assert_eq!(a.link.mesh.peers[&p].fallbacks, 2);
+        a.fell_back_for(p, 5100);
+        a.answer_probes(&b, p, RETURN_ACKS + 1);
+        assert_eq!(a.link.route_kind(p), Some(RouteKind::Relay), "second wait is 10 s");
+        a.fell_back_for(p, 10_100);
+        a.answer_probes(&b, p, RETURN_ACKS);
+        assert_eq!(a.link.route_kind(p), Some(RouteKind::Direct));
+
+        // A direct route that held `RETURN_STABLE_AFTER` resets the backoff.
+        a.link.mesh.peers.get_mut(&p).unwrap().direct_since = Some(Instant::now() - RETURN_STABLE_AFTER - s(1));
+        a.silent_for(p, 3100);
+        a.poll();
+        assert_eq!(a.link.mesh.peers[&p].fallbacks, 1);
     }
 }
