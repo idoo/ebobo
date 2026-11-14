@@ -8,10 +8,15 @@ description = "Rollback netplay for ebobo: rooms, NAT hole punching, relay fallb
 [dependencies]
 ebobo-core = { path = "../ebobo-core" }
 bincode = "1.3"
-# 0.13.0 plus upstream fixes not yet on crates.io: a player who leaves with all inputs received
-# no longer panics the others ("must load frame in the past"), and input packets are no longer
-# dropped once the round trip exceeds 2 * max prediction frames (stalls on far links).
-ggrs = { git = "https://github.com/gschup/ggrs", rev = "25bd9983dee3ecb0677be03b9e2e23d2bd6d29cb" }
+# Vendored from https://github.com/gschup/ggrs at 25bd9983dee3ecb0677be03b9e2e23d2bd6d29cb with
+# one change, marked `// ebobo:` in src/: a player leaving with input the others received
+# unevenly no longer panics them in 3-4 player games. As GGPO does, `confirmed_frame()` also
+# waits for what every peer reports to hold, peers send that status even while stalled, and a
+# disconnect moved down to a peer's frame is settled there instead of rolling back every poll.
+# That rev is 0.13.0 plus upstream fixes not yet on crates.io: a player who leaves with all
+# inputs received no longer panics the others ("must load frame in the past"), and input packets
+# are no longer dropped once the round trip exceeds 2 * max prediction frames (stalls on far links).
+ggrs = { path = "../../vendor/ggrs" }
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # tungstenite's rustls feature picks no crypto provider; exactly one enabled is auto-selected.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

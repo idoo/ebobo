@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/ebobo-core", "crates/ebobo-net", "crates/ebobo"]
+exclude = ["vendor/ggrs"]
 
 [workspace.package]
 version = "0.3.3"

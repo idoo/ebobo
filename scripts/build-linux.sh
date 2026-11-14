@@ -7,13 +7,12 @@ cd "$(dirname "$0")/.."
 image=ebobo-linux-build
 docker build --platform linux/amd64 -t "$image" packaging/linux
 
-# Target dir, cargo registry and git checkouts live in named volumes: fast, and Linux artifacts
+# Target dir and cargo registry live in named volumes: fast, and Linux artifacts
 # never mix with the host's target/.
 docker run --rm --platform linux/amd64 \
     -v "$PWD":/src \
     -v ebobo-linux-target:/target \
     -v ebobo-linux-cargo:/usr/local/cargo/registry \
-    -v ebobo-linux-cargo-git:/usr/local/cargo/git \
     -e CARGO_TARGET_DIR=/target \
     "$image" \
     sh -c 'cargo build --release -p ebobo --locked && mkdir -p /src/dist/linux && cp /target/release/ebobo /src/dist/linux/ebobo && strip /src/dist/linux/ebobo'
