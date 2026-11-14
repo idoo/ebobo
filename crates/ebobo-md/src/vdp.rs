@@ -1,4 +1,4 @@
-//! Video chip (315-5313): ports, DMA, interrupts, HV counter, line renderer. Owner: vdp slice.
+//! Video chip (315-5313): state, ports, DMA, interrupts, HV counter. Owner: vdp slice.
 //!
 //! Contract with `system.rs`:
 //! - Time is master clocks since power-on (`u64`), never going backwards. The VDP keeps its
@@ -6,11 +6,14 @@
 //! - The caller brings the chip up to date with [`Vdp::run_to`] before every [`Vdp::read`]
 //!   and [`Vdp::write`], and before it looks at [`Vdp::irq_level`], [`Vdp::z80_irq`] or
 //!   [`Vdp::take_frame_done`].
-//! - A line is drawn from the state the chip has at one fixed point of that line, so a
-//!   register or memory write lands between two lines.
+//! - A row is drawn from the state the chip has at one fixed point of its line, so a
+//!   register or memory write lands between two rows. Drawing is `vdp_render::render_row`
+//!   over a [`crate::vdp_mem::Mem`] view of this chip; a blanked display (register 1 bit 6
+//!   off) is filled with the background colour here.
 //! - Pixels go to a [`Screen`], which is not emulated state. With `None` nothing is drawn,
 //!   and every bit of emulated state (the sprite overflow and collision flags included)
 //!   comes out the same.
+//! - Positions, counter values and DMA durations come from `vdp_timing.rs`.
 
 use serde::{Deserialize, Serialize};
 

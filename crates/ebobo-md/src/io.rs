@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::cart::Region;
+use crate::Region;
 
 /// Controller bits of one pad as `Md::run_frame` takes them.
 pub mod pad {

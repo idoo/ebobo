@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use crate::cart::{self, Region, RomError, RomInfo};
+use crate::Region;
+use crate::cart::{self, RomError, RomInfo};
 
 /// A Mega Drive with a cartridge in it.
 pub struct Md {

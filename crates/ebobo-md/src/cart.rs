@@ -1,4 +1,4 @@
-//! ROM image, header, battery RAM, bank switching. Owner: periph slice.
+//! ROM image, header, battery RAM, bank switching. Owner: cart slice.
 //!
 //! Contract with `system.rs`: [`Cart`] is the immutable part (ROM bytes and what the header
 //! says), shared by every snapshot; [`CartState`] is the emulated state (battery RAM, bank
@@ -8,13 +8,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Console region. `Europe` is the 50 Hz PAL machine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Region {
-    Japan,
-    Americas,
-    Europe,
-}
+use crate::Region;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RomError {
