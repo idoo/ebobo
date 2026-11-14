@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "directories",
  "ebobo-core",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "serde",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo-net"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "ebobo-core",
