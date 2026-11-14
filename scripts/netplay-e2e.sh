@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end online netplay check: a host and N-1 guests (each with an empty
 # ROM folder, so the ROM must be transferred) play against the live room
-# server; PASS when every peer starts the game with the same slots and every
-# `frame N hash H` line printed by two or more peers agrees across all of them.
+# server; PASS when every peer starts the game with the same slots, exits
+# cleanly, and every `frame N hash H` line printed by two or more peers agrees
+# across all of them.
 # Inputs stay idle (the app has no input-script hook); the title/attract
 # screens still advance the state, which is enough for the hash comparison.
 # Usage: scripts/netplay-e2e.sh [--relay] [--players N] [--rom PATH]
@@ -92,12 +93,17 @@ for i in $(seq 1 $((players - 1))); do
   [ "$i" -lt $((players - 1)) ] && sleep 1
 done
 
-for p in "${pids[@]}"; do wait "$p"; done
+# A peer that crashes after its last hash line still agrees on every hash, so
+# the exit codes count too.
+crashed=""
+for k in "${!pids[@]}"; do
+  wait "${pids[$k]}" || crashed="${crashed:+$crashed; }${names[$k]} exited with code $?"
+done
 pids=()
 
 for k in "${!names[@]}"; do echo "--- ${names[$k]}"; cat "${logs[$k]}"; done
 
-fail=""
+fail="$crashed"
 slots=""
 for k in "${!names[@]}"; do
   line=$(grep -m1 '^ebobo: game started' "${logs[$k]}")
