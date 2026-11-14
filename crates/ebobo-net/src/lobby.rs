@@ -112,7 +112,10 @@ pub struct GameStart {
     /// The ROM file both sides run (host's own, or found/received by the guest).
     pub rom: Vec<u8>,
     pub rom_name: String,
+    /// The delay the game starts with.
     pub input_delay: usize,
+    /// The host left "Input delay" on Auto, so every peer adapts its own delay in game.
+    pub delay_auto: bool,
     pub four_score: bool,
     /// Region the host announced (header region of its ROM); every peer must emulate it.
     pub region: ebobo_core::Region,
@@ -223,48 +226,73 @@ struct Pending {
     resent: bool,
 }
 
-struct Ctrl {
-    next_seq: u32,
-    unacked: BTreeMap<u32, Pending>,
-    seen: HashSet<u32>,
-    /// Smoothed control-message RTT in ms (RFC 6298 SRTT).
-    rtt: Option<f64>,
-    /// RTT variation in ms (RFC 6298 RTTVAR), feeds the auto input delay.
-    rttvar: f64,
-    /// RTT samples taken (first transmissions only, Karn's rule).
-    samples: u32,
+/// RFC 6298 smoothed RTT and RTT variation in ms. The lobby feeds it CTRL acks, the session
+/// GGRS pings; both plan the input delay from `delay_rtt`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RttEstimator {
+    /// Smoothed RTT (RFC 6298 SRTT); `None` before the first sample.
+    pub(crate) srtt: Option<f64>,
+    /// RTT variation (RFC 6298 RTTVAR).
+    pub(crate) rttvar: f64,
+    pub(crate) samples: u32,
 }
 
-impl Ctrl {
+impl RttEstimator {
     /// RFC 6298 section 2 update (alpha = 1/8, beta = 1/4) with one RTT sample in ms.
-    fn add_sample(&mut self, sample: f64) {
-        match self.rtt {
+    pub(crate) fn add_sample(&mut self, sample: f64) {
+        match self.srtt {
             Some(srtt) => {
                 self.rttvar = 0.75 * self.rttvar + 0.25 * (srtt - sample).abs();
-                self.rtt = Some(0.875 * srtt + 0.125 * sample);
+                self.srtt = Some(0.875 * srtt + 0.125 * sample);
             }
             None => {
                 self.rttvar = sample / 2.0;
-                self.rtt = Some(sample);
+                self.srtt = Some(sample);
             }
         }
         self.samples += 1;
     }
 
-    /// RTT (ms) the auto input delay plans for: `srtt + 2 * rttvar` once `WARM_SAMPLES`
-    /// samples are in. Before that RFC 6298's cold-start `rttvar = R / 2` would add a whole
-    /// RTT, so it uses `srtt * 1.25` instead.
+    /// True once `WARM_SAMPLES` samples are in and `srtt + 2 * rttvar` is trusted.
+    pub(crate) fn is_warm(&self) -> bool {
+        self.samples >= WARM_SAMPLES
+    }
+
+    /// RTT (ms) the input delay plans for: `srtt + 2 * rttvar` once warm. Before that RFC 6298's
+    /// cold-start `rttvar = R / 2` would add a whole RTT, so it uses `srtt * 1.25` instead.
+    pub(crate) fn delay_rtt(&self) -> Option<f64> {
+        let srtt = self.srtt?;
+        Some(if self.is_warm() { srtt + 2.0 * self.rttvar } else { srtt * 1.25 })
+    }
+
+    /// Retransmit timeout in ms: RFC 6298 `srtt + 4 * rttvar`, 0 before the first sample.
+    fn rto_ms(&self) -> f64 {
+        self.srtt.map_or(0.0, |r| r + 4.0 * self.rttvar)
+    }
+}
+
+struct Ctrl {
+    next_seq: u32,
+    unacked: BTreeMap<u32, Pending>,
+    seen: HashSet<u32>,
+    /// Control-message RTT (first transmissions only, Karn's rule); feeds the auto input delay.
+    rtt: RttEstimator,
+}
+
+impl Ctrl {
+    fn add_sample(&mut self, sample: f64) {
+        self.rtt.add_sample(sample);
+    }
+
     fn delay_rtt(&self) -> Option<f64> {
-        let srtt = self.rtt?;
-        Some(if self.samples >= WARM_SAMPLES { srtt + 2.0 * self.rttvar } else { srtt * 1.25 })
+        self.rtt.delay_rtt()
     }
 
     /// Retransmit timeout: RFC 6298 `srtt + 4 * rttvar`, at least `CTRL_RETRY`, at most 1 s, so
     /// slow links are not retransmitted before their ack can arrive (which Karn's rule would
     /// discard as a sample).
     fn rto(&self) -> Duration {
-        let ms = self.rtt.map_or(0.0, |r| r + 4.0 * self.rttvar);
-        Duration::from_secs_f64(ms / 1000.0).clamp(CTRL_RETRY, Duration::from_secs(1))
+        Duration::from_secs_f64(self.rtt.rto_ms() / 1000.0).clamp(CTRL_RETRY, Duration::from_secs(1))
     }
 }
 
@@ -294,7 +322,7 @@ impl Peer {
         Peer {
             name: String::new(),
             route: None,
-            ctrl: Ctrl { next_seq: 1, unacked: BTreeMap::new(), seen: HashSet::new(), rtt: None, rttvar: 0.0, samples: 0 },
+            ctrl: Ctrl { next_seq: 1, unacked: BTreeMap::new(), seen: HashSet::new(), rtt: RttEstimator::default() },
             rom: RomState::Unknown,
             ready: false,
             links: Vec::new(),
@@ -311,6 +339,7 @@ struct PendingStart {
     deadline: Instant,
     slots: Vec<PeerId>,
     delay: usize,
+    delay_auto: bool,
     four_score: bool,
 }
 
@@ -343,12 +372,22 @@ struct Worker {
     host_list: Option<Vec<ListEntry>>,
 }
 
-/// Auto GGRS input delay from the worst peer's `Ctrl::delay_rtt` (ms): one-way latency plus
-/// jitter in frames, 1..=6. `session_profile_matrix` shows mean rollback falls below one frame
-/// once delay ≈ one-way frames (mobile 60±30 ms: delay 4 → 0.8, 5 → 0.35); far links
-/// (150 ms) still want more, but past 6 frames (100 ms) the input lag itself hurts.
-fn auto_input_delay(worst_rtt_ms: f64, frame_ms: f64) -> usize {
-    ((worst_rtt_ms / 2.0 / frame_ms).ceil() as usize).clamp(1, 6)
+/// One-way latency, in frames, that the input delay hides outright: 3 frames (50 ms at 60 fps)
+/// go unnoticed under the fingers, and a link within them never rolls back.
+const DELAY_COVERS: usize = 3;
+/// One-way latency past `DELAY_COVERS`, in frames, left to prediction and rollback: corrections
+/// of up to 6 frames (100 ms) stay small on screen, and more input lag would hurt more.
+const ROLLBACK_COVERS: usize = 6;
+
+/// Input delay from the worst peer's `RttEstimator::delay_rtt` (ms), 1..=6: the one-way latency
+/// plus jitter in frames, of which the first `DELAY_COVERS` are delay, the next
+/// `ROLLBACK_COVERS` are left to rollback, and the rest are delay again (a far link would
+/// otherwise run out of the prediction window and stall). The split is the usual one for
+/// rollback games (3 frames of delay, 6-8 of rollback). The lobby's start value and the
+/// session's in-game target both use it.
+pub(crate) fn auto_input_delay(worst_rtt_ms: f64, frame_ms: f64) -> usize {
+    let latency = (worst_rtt_ms / 2.0 / frame_ms).ceil() as usize;
+    (latency.min(DELAY_COVERS) + latency.saturating_sub(DELAY_COVERS + ROLLBACK_COVERS)).clamp(1, 6)
 }
 
 fn run(cfg: LobbyConfig, shared: Arc<Mutex<LobbyStatus>>, cmds: Receiver<Cmd>, game_tx: Sender<GameStart>) {
@@ -724,9 +763,10 @@ impl Worker {
                     .map(|a| a.iter().filter_map(Value::as_u64).map(|x| PeerId(x as u8)).collect())
                     .unwrap_or_default();
                 let delay = v["delay"].as_u64().unwrap_or(2) as usize;
+                let delay_auto = v["auto"].as_bool().unwrap_or(false);
                 let four = v["four_score"].as_bool().unwrap_or(slots.len() > 2);
                 let (rom_name, region) = (game.rom_name.clone(), game.region);
-                self.hand_over(slots, delay, four, rom, rom_name, region);
+                self.hand_over(slots, delay, delay_auto, four, rom, rom_name, region);
             }
             _ => {}
         }
@@ -893,7 +933,7 @@ impl Worker {
     }
 
     fn rtt_ms(p: &Peer) -> Option<u32> {
-        p.ctrl.rtt.map(|r| r.round() as u32)
+        p.ctrl.rtt.srtt.map(|r| r.round() as u32)
     }
 
     fn broadcast_players(&mut self) {
@@ -960,11 +1000,12 @@ impl Worker {
             mesh.lock_room();
         }
         let slot_ids: Vec<u8> = slots.iter().map(|p| p.0).collect();
-        let msg = json!({"t": "start", "slots": slot_ids, "delay": delay, "four_score": four_score});
+        let delay_auto = self.input_delay.is_none();
+        let msg = json!({"t": "start", "slots": slot_ids, "delay": delay, "auto": delay_auto, "four_score": four_score});
         let guests: Vec<PeerId> = self.peers.keys().copied().collect();
         let acks = guests.into_iter().map(|g| (g, self.send_ctrl(g, msg.clone()))).collect();
         self.pending_start =
-            Some(PendingStart { acks, deadline: Instant::now() + START_ACK_WAIT, slots, delay, four_score });
+            Some(PendingStart { acks, deadline: Instant::now() + START_ACK_WAIT, slots, delay, delay_auto, four_score });
     }
 
     fn check_start(&mut self, now: Instant) {
@@ -979,7 +1020,7 @@ impl Worker {
         let Some(ps) = self.pending_start.take() else { return };
         let Some(hr) = self.host_rom.as_ref() else { return };
         let (rom, name, region) = (hr.bytes.clone(), hr.name.clone(), hr.region);
-        self.hand_over(ps.slots, ps.delay, ps.four_score, rom, name, region);
+        self.hand_over(ps.slots, ps.delay, ps.delay_auto, ps.four_score, rom, name, region);
     }
 
     fn name_of(&self, id: PeerId) -> String {
@@ -996,6 +1037,7 @@ impl Worker {
         &mut self,
         slots: Vec<PeerId>,
         delay: usize,
+        delay_auto: bool,
         four_score: bool,
         rom: Vec<u8>,
         rom_name: String,
@@ -1011,6 +1053,7 @@ impl Worker {
             rom,
             rom_name,
             input_delay: delay,
+            delay_auto,
             four_score,
             region,
         };

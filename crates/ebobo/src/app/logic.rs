@@ -2,7 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use ebobo_core::Region;
+use ebobo_core::{pad, Region};
+use ebobo_net::{INPUT_TURBO_A, INPUT_TURBO_B};
 
 use crate::config::Config;
 
@@ -16,12 +17,36 @@ pub fn region_hint(name: &str, header: Region) -> Option<Region> {
     ["(E)", "(EUROPE)", "(PAL)"].iter().any(|m| upper.contains(m)).then_some(Region::Pal)
 }
 
-/// Pacing stretch: 2 % per frame we are ahead of the slowest peer (max 10 %).
+/// Pacing stretch, two-sided: +2 % per frame we are ahead of the slowest peer (max +10 %),
+/// -1 % per frame we are behind every peer (max -3 %, small enough not to be heard in the
+/// audio pitch), 0 when level.
 pub fn frame_stretch(frames_ahead: i32) -> f64 {
-    (0.02 * frames_ahead.max(0) as f64).min(0.10)
+    let n = frames_ahead as f64;
+    if frames_ahead > 0 {
+        (0.02 * n).min(0.10)
+    } else {
+        (0.01 * n).max(-0.03)
+    }
 }
 
-/// Frame period at `fps`, stretched by `frame_stretch(frames_ahead)`.
+/// Local netplay input word: low byte = the pads of every seat merged (all local players
+/// drive one netplay pad), plus the turbo buttons as held bits. Turbo never becomes A/B
+/// presses here: every peer expands the held bits from the simulated frame number, so a held
+/// turbo button is a constant word that "repeat the last input" predicts right.
+pub fn net_input(pads: &[u8; 4], turbo: &[u8; 4]) -> u16 {
+    let held = pads.iter().fold(0u8, |acc, p| acc | p);
+    let turbo = turbo.iter().fold(0u8, |acc, t| acc | t);
+    let mut word = held as u16;
+    if turbo & pad::A != 0 {
+        word |= INPUT_TURBO_A;
+    }
+    if turbo & pad::B != 0 {
+        word |= INPUT_TURBO_B;
+    }
+    word
+}
+
+/// Frame period at `fps`, stretched (ahead) or shortened (behind) by `frame_stretch(frames_ahead)`.
 pub fn frame_period(fps: f64, frames_ahead: i32) -> Duration {
     Duration::from_secs_f64((1.0 + frame_stretch(frames_ahead)) / fps)
 }
@@ -137,11 +162,30 @@ mod tests {
     fn app_pacing_stretch() {
         let base = frame_period(60.0, 0);
         assert!((base.as_secs_f64() - 1.0 / 60.0).abs() < 1e-9);
-        assert_eq!(frame_period(60.0, -3), base);
+        assert!((frame_period(60.0, -1).as_secs_f64() - 0.99 / 60.0).abs() < 1e-9);
+        assert!((frame_period(60.0, -3).as_secs_f64() - 0.97 / 60.0).abs() < 1e-9);
+        assert_eq!(frame_period(60.0, -40), frame_period(60.0, -3));
+        assert_eq!(frame_stretch(0), 0.0);
         assert!((frame_period(60.0, 2).as_secs_f64() - 1.04 / 60.0).abs() < 1e-9);
         assert!((frame_period(60.0, 5).as_secs_f64() - 1.10 / 60.0).abs() < 1e-9);
         assert_eq!(frame_period(60.0, 40), frame_period(60.0, 5));
         assert!((frame_period(50.0, 1).as_secs_f64() - 1.02 / 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn app_net_input_sends_turbo_as_held_bits() {
+        assert_eq!(net_input(&[0; 4], &[0; 4]), 0);
+        // Every seat merges into the low byte.
+        assert_eq!(net_input(&[pad::A, pad::LEFT, 0, pad::START], &[0; 4]), (pad::A | pad::LEFT | pad::START) as u16);
+        // Turbo from any seat sets its own bit and never an A/B press.
+        assert_eq!(net_input(&[0; 4], &[pad::A, 0, 0, 0]), INPUT_TURBO_A);
+        assert_eq!(net_input(&[0; 4], &[0, 0, pad::B, 0]), INPUT_TURBO_B);
+        assert_eq!(net_input(&[pad::UP, 0, 0, 0], &[pad::B, pad::A, 0, 0]), pad::UP as u16 | INPUT_TURBO_A | INPUT_TURBO_B);
+        // Plain A next to turbo B stays plain A.
+        assert_eq!(net_input(&[pad::A, 0, 0, 0], &[pad::B, 0, 0, 0]), pad::A as u16 | INPUT_TURBO_B);
+        // Only A/B have turbo, and the word never touches the reset bit.
+        assert_eq!(net_input(&[0xFF; 4], &[0xFF; 4]), 0xFF | INPUT_TURBO_A | INPUT_TURBO_B);
+        assert_eq!(net_input(&[0xFF; 4], &[0xFF; 4]) & ebobo_net::INPUT_RESET, 0);
     }
 
     #[test]

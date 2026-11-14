@@ -8,19 +8,46 @@ use std::time::{Duration, Instant};
 use ebobo_core::Nes;
 use ggrs::{DesyncDetection, GgrsError, GgrsEvent, GgrsRequest, InputStatus, P2PSession, PlayerType, SessionBuilder, SessionState};
 
+use crate::lobby::{auto_input_delay, RttEstimator};
 use crate::mesh::Link;
 use crate::transport::{PeerId, RouteKind};
-use crate::{NetError, INPUT_RESET};
+use crate::{NetError, INPUT_RESET, INPUT_TURBO_A, INPUT_TURBO_B};
 
-/// ggrs configuration: `Input = u16` (pad bits 0-7, `INPUT_RESET` bit 8),
-/// `State = ebobo_core::Snapshot`, `Address = PeerId`.
+/// ggrs configuration: `Input = u16` (pad bits 0-7, `INPUT_RESET` bit 8, `INPUT_TURBO_A` bit 9,
+/// `INPUT_TURBO_B` bit 10), `State = ebobo_core::Snapshot`, `Address = PeerId`.
 pub struct EboboConfig;
 
 impl ggrs::Config for EboboConfig {
     type Input = u16;
-    type InputPredictor = ggrs::PredictRepeatLast;
+    type InputPredictor = PredictHeld;
     type State = ebobo_core::Snapshot;
     type Address = PeerId;
+}
+
+/// Repeats the last input (the GGPO standard) without the one-frame reset bit: a reset is never
+/// held, so predicting it again would always miss. Turbo bits are held bits and repeat.
+pub struct PredictHeld;
+
+impl ggrs::InputPredictor<u16> for PredictHeld {
+    fn predict(previous: u16) -> u16 {
+        previous & !INPUT_RESET
+    }
+}
+
+/// NES pad byte for netplay input word `input` on simulated frame `frame`: the held pad bits,
+/// plus A / B while their turbo bit is set and the turbo phase `(frame / 2) % 2 == 0` is on.
+/// Every peer derives the phase from the GGRS frame, so re-simulated frames match.
+pub(crate) fn expand_turbo(input: u16, frame: i32) -> u8 {
+    let mut pad = input as u8;
+    if (frame / 2) % 2 == 0 {
+        if input & INPUT_TURBO_A != 0 {
+            pad |= ebobo_core::pad::A;
+        }
+        if input & INPUT_TURBO_B != 0 {
+            pad |= ebobo_core::pad::B;
+        }
+    }
+    pad
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +68,7 @@ pub struct PeerStats {
     pub peer: Option<PeerId>,
     pub slot: usize,
     pub route: Option<RouteKind>,
+    /// Smoothed RTT (RFC 6298 SRTT over GGRS pings).
     pub ping_ms: u32,
     pub kbps_sent: u32,
     pub local_frames_behind: i32,
@@ -53,6 +81,8 @@ pub struct NetStats {
     pub peers: Vec<PeerStats>,
     /// Frames re-simulated by the last `advance`.
     pub last_rollback: u32,
+    /// This machine's current input delay in frames.
+    pub input_delay: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,6 +131,70 @@ const MAX_PREDICTION: usize = 10;
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DISCONNECT_NOTIFY: Duration = Duration::from_millis(1500);
 
+/// GGRS refreshes its ping every 200 ms (`QUALITY_REPORT_INTERVAL`); sampling faster would feed
+/// the estimator the same value several times.
+const RTT_SAMPLE_EVERY: Duration = Duration::from_millis(200);
+/// Adaptive input delay bounds, as `auto_input_delay`.
+const DELAY_MIN: usize = 1;
+const DELAY_MAX: usize = 6;
+/// Raise quickly: a target above the delay means the link got slower than the delay plans for.
+const DELAY_RAISE_AFTER: Duration = Duration::from_secs(1);
+/// Lower slowly: a short calm spell on a jittery link must not trade a frame of lag for rollbacks.
+const DELAY_LOWER_AFTER: Duration = Duration::from_secs(10);
+/// Each change shifts the input stream by a frame; space them so one settles before the next.
+const DELAY_MIN_GAP: Duration = Duration::from_secs(1);
+
+/// Adaptive input delay: moves `delay` one frame at a time toward the target computed from the
+/// worst link (`auto_input_delay`). Pure; time comes in as `now`.
+#[derive(Clone, Debug)]
+pub(crate) struct DelayControl {
+    delay: usize,
+    auto: bool,
+    /// Since when the target has been above `delay` without a break.
+    above_since: Option<Instant>,
+    /// Since when the target has been below `delay` without a break.
+    below_since: Option<Instant>,
+    changed: Option<Instant>,
+}
+
+impl DelayControl {
+    /// `auto == false`: the host pinned `delay`, it never moves.
+    pub(crate) fn new(delay: usize, auto: bool) -> DelayControl {
+        DelayControl { delay, auto, above_since: None, below_since: None, changed: None }
+    }
+
+    pub(crate) fn delay(&self) -> usize {
+        self.delay
+    }
+
+    /// Feeds the current target (`None`: no warm peer). Returns the new delay when it changed.
+    pub(crate) fn update(&mut self, target: Option<usize>, now: Instant) -> Option<usize> {
+        let Some(target) = target.filter(|_| self.auto).map(|t| t.clamp(DELAY_MIN, DELAY_MAX)) else {
+            self.above_since = None;
+            self.below_since = None;
+            return None;
+        };
+        let (since, after, step): (Instant, Duration, fn(usize) -> usize) = if target > self.delay {
+            self.below_since = None;
+            (*self.above_since.get_or_insert(now), DELAY_RAISE_AFTER, |d| d + 1)
+        } else if target < self.delay {
+            self.above_since = None;
+            (*self.below_since.get_or_insert(now), DELAY_LOWER_AFTER, |d| d - 1)
+        } else {
+            self.above_since = None;
+            self.below_since = None;
+            return None;
+        };
+        let gap_ok = self.changed.is_none_or(|c| now.saturating_duration_since(c) >= DELAY_MIN_GAP);
+        if now.saturating_duration_since(since) < after || !gap_ok {
+            return None;
+        }
+        self.delay = step(self.delay);
+        self.changed = Some(now);
+        Some(self.delay)
+    }
+}
+
 pub struct NetSession {
     ggrs: P2PSession<EboboConfig>,
     link: Rc<RefCell<Option<Link>>>,
@@ -110,9 +204,21 @@ pub struct NetSession {
     local: usize,
     pending: Vec<NetEvent>,
     last_rollback: u32,
+    /// GGRS frame the next `AdvanceFrame` simulates (turbo phase).
+    sim_frame: i32,
+    /// Smoothed RTT per handle; the local one stays empty.
+    rtt: Vec<RttEstimator>,
+    rtt_sampled: Option<Instant>,
+    /// Handles whose player left; never sampled again.
+    gone: Vec<bool>,
+    frame_ms: f64,
+    delay: DelayControl,
     /// Tests: frame whose saved state hash is recorded in `probe_hash` (last save wins).
     #[cfg(test)]
     probe: (i32, Option<u64>),
+    /// Tests: input delay applied after the next advanced frame, bypassing `DelayControl`.
+    #[cfg(test)]
+    force_delay: Option<usize>,
 }
 
 fn io(e: GgrsError) -> NetError {
@@ -121,15 +227,18 @@ fn io(e: GgrsError) -> NetError {
 
 impl NetSession {
     /// Builds the GGRS P2P session: `slots.len()` players, local handle = index of
-    /// `link.me()` in `slots`, others remote. `fps` = 60 NTSC / 50 PAL.
-    pub fn new(link: Link, slots: &[PeerId], input_delay: usize, fps: usize) -> Result<NetSession, NetError> {
-        NetSession::with_tuning(link, slots, input_delay, fps, MAX_PREDICTION, DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)
+    /// `link.me()` in `slots`, others remote. `fps` = 60 NTSC / 50 PAL. `delay_auto`: the local
+    /// delay adapts to the worst link during the game, starting at `input_delay`.
+    pub fn new(link: Link, slots: &[PeerId], input_delay: usize, delay_auto: bool, fps: usize) -> Result<NetSession, NetError> {
+        NetSession::with_tuning(link, slots, input_delay, delay_auto, fps, MAX_PREDICTION, DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_tuning(
         link: Link,
         slots: &[PeerId],
         input_delay: usize,
+        delay_auto: bool,
         fps: usize,
         max_prediction: usize,
         disconnect_timeout: Duration,
@@ -170,8 +279,16 @@ impl NetSession {
             local,
             pending: Vec::new(),
             last_rollback: 0,
+            sim_frame: 0,
+            rtt: vec![RttEstimator::default(); slots.len()],
+            rtt_sampled: None,
+            gone: vec![false; slots.len()],
+            frame_ms: 1000.0 / fps.max(1) as f64,
+            delay: DelayControl::new(input_delay, delay_auto),
             #[cfg(test)]
             probe: (NO_PROBE, None),
+            #[cfg(test)]
+            force_delay: None,
         })
     }
 
@@ -185,7 +302,7 @@ impl NetSession {
         self.ggrs.current_state() == SessionState::Running
     }
 
-    /// Network I/O; call every loop iteration, also while not advancing.
+    /// Network I/O; cheap, call it every <= 2 ms, also between frames and while not advancing.
     pub fn poll(&mut self) {
         self.ggrs.poll_remote_clients();
         let departed = self.link.borrow_mut().as_mut().map(Link::take_departed).unwrap_or_default();
@@ -193,10 +310,39 @@ impl NetSession {
             if let Some(handle) = self.slots.iter().position(|&p| p == peer) {
                 if handle != self.local {
                     let _ = self.ggrs.disconnect_player(handle);
+                    self.gone[handle] = true;
                     self.pending.push(NetEvent::Disconnected { peer });
                 }
             }
         }
+        self.sample_rtt(Instant::now());
+    }
+
+    /// One RTT sample per remote player still in the game, every `RTT_SAMPLE_EVERY`.
+    fn sample_rtt(&mut self, now: Instant) {
+        if self.rtt_sampled.is_some_and(|t| now.saturating_duration_since(t) < RTT_SAMPLE_EVERY) {
+            return;
+        }
+        self.rtt_sampled = Some(now);
+        for handle in 0..self.slots.len() {
+            if handle == self.local || self.gone[handle] {
+                continue;
+            }
+            // `NotEnoughData` during the first second.
+            if let Ok(n) = self.ggrs.network_stats(handle) {
+                self.rtt[handle].add_sample(n.ping as f64);
+            }
+        }
+    }
+
+    /// In-game delay target: `auto_input_delay` of the worst warm remote link; `None` while no
+    /// link is warm.
+    fn delay_target(&self) -> Option<usize> {
+        let worst = (0..self.slots.len())
+            .filter(|&h| h != self.local && !self.gone[h] && self.rtt[h].is_warm())
+            .filter_map(|h| self.rtt[h].delay_rtt())
+            .reduce(f64::max)?;
+        Some(auto_input_delay(worst, self.frame_ms))
     }
 
     /// Adds the local input and advances one frame, handling GGRS save/load/advance requests on
@@ -208,11 +354,10 @@ impl NetSession {
             return Ok(FrameOutcome::default());
         }
         self.ggrs.add_local_input(self.local, local_input).map_err(io)?;
-        let requests = match self.ggrs.advance_frame() {
-            Ok(r) => r,
-            Err(GgrsError::PredictionThreshold) => return Ok(FrameOutcome::default()),
-            Err(e) => return Err(io(e)),
-        };
+        // GGRS 0.13 P2P never returns `PredictionThreshold`: at the window it returns no
+        // `AdvanceFrame`, which `advances` counts. After a delay decrease GGRS drops the next
+        // submitted inputs internally; `advance_frame` still succeeds.
+        let requests = self.ggrs.advance_frame().map_err(io)?;
         let advances = requests.iter().filter(|r| matches!(r, GgrsRequest::AdvanceFrame { .. })).count();
         let mut seen = 0;
         for request in requests {
@@ -224,10 +369,12 @@ impl NetSession {
                         self.probe.1 = Some(hash);
                     }
                     cell.save(frame, Some(nes.snapshot()), Some(hash as u128));
+                    self.sim_frame = frame;
                 }
-                GgrsRequest::LoadGameState { cell, .. } => {
+                GgrsRequest::LoadGameState { cell, frame } => {
                     let snapshot = cell.load().expect("ggrs asked to load a state it never saved");
                     nes.restore(&snapshot);
+                    self.sim_frame = frame;
                 }
                 GgrsRequest::AdvanceFrame { inputs } => {
                     let mut pads = [0u8; 4];
@@ -236,7 +383,7 @@ impl NetSession {
                         if status == InputStatus::Disconnected {
                             continue;
                         }
-                        pads[slot] = input as u8;
+                        pads[slot] = expand_turbo(input, self.sim_frame);
                         reset |= input & INPUT_RESET != 0;
                     }
                     if reset {
@@ -249,11 +396,32 @@ impl NetSession {
                     if seen < advances {
                         nes.clear_audio();
                     }
+                    self.sim_frame += 1;
                 }
             }
         }
         self.last_rollback = advances.saturating_sub(1) as u32;
+        // Delay changes go after `advance_frame`, never between it and `add_local_input`, and
+        // only on a frame that advanced, so the input queue took a new input since the last
+        // change (two increases without one would send overlapping fill frames). A reset frame
+        // is skipped: an increase copies the last input, which would repeat the reset.
+        if advances > 0 && local_input & INPUT_RESET == 0 {
+            self.adapt_delay(Instant::now())?;
+        }
         Ok(FrameOutcome { advanced: advances > 0, rollback_frames: self.last_rollback })
+    }
+
+    fn adapt_delay(&mut self, now: Instant) -> Result<(), NetError> {
+        #[cfg(test)]
+        if let Some(d) = self.force_delay.take() {
+            self.delay.delay = d;
+            return self.ggrs.set_input_delay(self.local, d).map_err(io);
+        }
+        let target = self.delay_target();
+        if let Some(d) = self.delay.update(target, now) {
+            self.ggrs.set_input_delay(self.local, d).map_err(io)?;
+        }
+        Ok(())
     }
 
     pub fn events(&mut self) -> Vec<NetEvent> {
@@ -266,7 +434,12 @@ impl NetSession {
                     NetEvent::Interrupted { peer: addr, disconnect_in_ms: disconnect_timeout as u64 }
                 }
                 GgrsEvent::NetworkResumed { addr } => NetEvent::Resumed { peer: addr },
-                GgrsEvent::Disconnected { addr } => NetEvent::Disconnected { peer: addr },
+                GgrsEvent::Disconnected { addr } => {
+                    if let Some(handle) = self.slots.iter().position(|&p| p == addr) {
+                        self.gone[handle] = true;
+                    }
+                    NetEvent::Disconnected { peer: addr }
+                }
                 GgrsEvent::DesyncDetected { frame, .. } => NetEvent::Desync { frame },
                 // Pacing goes through `frames_ahead`.
                 GgrsEvent::WaitRecommendation { .. } => continue,
@@ -290,14 +463,14 @@ impl NetSession {
                 let bytes = sent.get(peer.0 as usize).copied().unwrap_or(0);
                 stats.kbps_sent = (bytes as f64 * 8.0 / 1000.0 / secs) as u32;
                 if let Ok(n) = self.ggrs.network_stats(slot) {
-                    stats.ping_ms = n.ping.min(u32::MAX as u128) as u32;
+                    stats.ping_ms = self.rtt[slot].srtt.map_or(n.ping.min(u32::MAX as u128) as u32, |r| r.round() as u32);
                     stats.local_frames_behind = n.local_frames_behind;
                     stats.remote_frames_behind = n.remote_frames_behind;
                 }
                 stats
             })
             .collect();
-        NetStats { peers, last_rollback: self.last_rollback }
+        NetStats { peers, last_rollback: self.last_rollback, input_delay: self.delay.delay() }
     }
 
     /// Frames we are ahead of the slowest peer (> 0: slow down a little).

@@ -27,11 +27,16 @@ pub use mesh::Link;
 pub use transport::{PeerId, RouteKind};
 
 /// Lobby `proto` value; peers with a different one refuse to play together.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_PLAYERS: usize = 4;
 pub const DEFAULT_DIRECT_PORT: u16 = 7777;
 /// Netplay input bit 8: press the console's Reset button on this frame.
 pub const INPUT_RESET: u16 = 0x100;
+/// Netplay input bit 9: turbo A is held. Every peer turns it into A presses from the simulated
+/// frame number (on when `(frame / 2) % 2 == 0`), so a held turbo button is a constant input.
+pub const INPUT_TURBO_A: u16 = 0x200;
+/// Netplay input bit 10: turbo B is held; expanded like `INPUT_TURBO_A`.
+pub const INPUT_TURBO_B: u16 = 0x400;
 /// Room code alphabet: no I, O, 0, 1.
 pub const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub const CODE_LEN: usize = 5;

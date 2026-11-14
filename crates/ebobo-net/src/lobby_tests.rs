@@ -90,6 +90,8 @@ fn direct_pair(guest_has_rom: bool) {
         assert_eq!(g.rom, rom);
         assert_eq!(g.region, Region::Ntsc);
         assert!(g.input_delay >= 1);
+        // `input_delay: None` on the host: Auto, announced as `"auto": true` to the guest.
+        assert!(g.delay_auto);
         assert!(!g.four_score);
         assert_eq!(g.names, vec!["Host".to_string(), "Guest".to_string()]);
         assert_eq!(g.rom_name, "nestest.nes");
@@ -207,7 +209,7 @@ fn delay_after(samples: &[f64]) -> usize {
     for &s in samples {
         c.add_sample(s);
     }
-    assert_eq!(c.samples as usize, samples.len());
+    assert_eq!(c.rtt.samples as usize, samples.len());
     auto_input_delay(c.delay_rtt().unwrap_or(0.0), NTSC_MS)
 }
 
@@ -219,17 +221,27 @@ fn lobby_delay_lan_jitter() {
 }
 
 #[test]
+fn lobby_delay_hides_three_frames_and_leaves_six_to_rollback() {
+    let d = |rtt: f64| auto_input_delay(rtt, NTSC_MS);
+    // Up to 3 frames one way the delay hides the latency: no rollbacks.
+    assert_eq!([d(0.0), d(30.0), d(60.0), d(99.0)], [1, 1, 2, 3]);
+    // The next 6 frames go to prediction: the delay stays at 3.
+    assert_eq!([d(120.0), d(200.0), d(299.0)], [3, 3, 3]);
+    // Past 9 frames one way it grows again, up to 6.
+    assert_eq!([d(300.0), d(340.0), d(370.0), d(600.0)], [4, 5, 6, 6]);
+}
+
+#[test]
 fn lobby_delay_steady_120() {
-    let d = delay_after(&[120.0; 16]);
-    assert!((4..=5).contains(&d), "steady 120 ms: {d}");
+    assert_eq!(delay_after(&[120.0; 16]), 3);
 }
 
 #[test]
 fn lobby_delay_cold_start_not_inflated() {
-    // RFC 6298 cold start (rttvar = R / 2) would plan for 240 ms → 8 → cap 6.
-    let d = delay_after(&[120.0]);
-    assert!(d < 6, "one 120 ms sample: {d}");
-    assert!(d >= 4, "one 120 ms sample still covers the one-way latency: {d}");
+    // RFC 6298 cold start (rttvar = R / 2) would plan for 240 ms after one 120 ms sample.
+    let mut c = Peer::new().ctrl;
+    c.add_sample(120.0);
+    assert_eq!(c.delay_rtt(), Some(150.0));
     // Warm-up boundary: 7 samples use srtt * 1.25, the 8th switches to srtt + 2 * rttvar.
     let mut c = Peer::new().ctrl;
     for _ in 0..7 {
@@ -237,7 +249,7 @@ fn lobby_delay_cold_start_not_inflated() {
     }
     assert_eq!(c.delay_rtt(), Some(150.0));
     c.add_sample(120.0);
-    assert_eq!(c.delay_rtt(), Some(c.rtt.unwrap() + 2.0 * c.rttvar));
+    assert_eq!(c.delay_rtt(), Some(c.rtt.srtt.unwrap() + 2.0 * c.rtt.rttvar));
 }
 
 #[test]

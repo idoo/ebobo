@@ -46,16 +46,22 @@ pub enum PointerEvent {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputFrame {
-    /// NES pad bits per seat: [0] = keyboard merged with the gamepad in seat 1, [1..4] = the
-    /// gamepads in seats 2-4. A gamepad without a seat feeds nothing; it takes the lowest free
-    /// seat the first time it presses a game button while seating is on (`set_seating`).
+    /// NES pad bits per seat that are plainly held (never turbo presses): [0] = keyboard merged
+    /// with the gamepad in seat 1, [1..4] = the gamepads in seats 2-4. A gamepad without a seat
+    /// feeds nothing; it takes the lowest free seat the first time it presses a game button
+    /// (a turbo button counts) while seating is on (`set_seating`).
     /// Opposite face buttons do the same: South and North = NES A, West and East = NES B
     /// (Nintendo pads: East and West = A, South and North = B, so the printed A and B match).
-    /// Left shoulder = turbo B, right shoulder = turbo A, Back/Share = Select,
-    /// Start/Options = Start, D-pad and left stick = D-pad. Keyboard: arrows, X = A, Z = B,
-    /// Enter = Start, Right Shift = Select, S = turbo A, A = turbo B. Turbo toggles every
-    /// 2 frames of `poll`.
+    /// Back/Share = Select, Start/Options = Start, D-pad and left stick = D-pad. Keyboard:
+    /// arrows, X = A, Z = B, Enter = Start, Right Shift = Select.
     pub pads: [u8; 4],
+    /// Per seat, the `pad::A` / `pad::B` bits whose turbo button is held: left shoulder =
+    /// turbo B, right shoulder = turbo A; keyboard (seat 1) S = turbo A, A = turbo B. Held
+    /// state, not presses: solo expands it with `solo_pads`, netplay sends it as held bits
+    /// that every peer expands from the simulated frame number.
+    pub turbo: [u8; 4],
+    /// Local turbo phase of this poll: on for 2 polls, off for 2.
+    pub turbo_on: bool,
     /// A keyboard key went down (auto-repeat not counted).
     pub key_used: bool,
     pub nav: Nav,
@@ -101,6 +107,19 @@ pub struct InputFrame {
     pub mouse_moved: bool,
     /// Gamepad buttons the on-screen keyboard uses.
     pub pad: PadPress,
+}
+
+impl InputFrame {
+    /// Pad bits for solo play: the held bits plus the turbo bits while the local phase is on.
+    pub fn solo_pads(&self) -> [u8; 4] {
+        let mut pads = self.pads;
+        if self.turbo_on {
+            for (p, t) in pads.iter_mut().zip(self.turbo) {
+                *p |= t;
+            }
+        }
+        pads
+    }
 }
 
 /// Gamepad presses this frame beyond `Nav`, for the on-screen keyboard.
@@ -232,11 +251,11 @@ fn mask_shot_combo(b: &PadButtons) -> PadButtons {
     }
 }
 
-/// Positional gamepad → NES bits. Opposite face buttons do the same, so any two neighbouring
-/// ones are B + A: South and North = A, West and East = B; on Nintendo pads East and West = A,
-/// South and North = B (the printed A and B). Shoulders are turbo B (left) and turbo A (right);
-/// `turbo_on` = current turbo phase.
-fn pad_bits(b: &PadButtons, kind: PadKind, turbo_on: bool) -> u8 {
+/// Positional gamepad → (held NES bits, turbo bits). Opposite face buttons do the same, so any
+/// two neighbouring ones are B + A: South and North = A, West and East = B; on Nintendo pads
+/// East and West = A, South and North = B (the printed A and B). Shoulders are turbo B (left)
+/// and turbo A (right): they set `pad::B` / `pad::A` in the turbo bits only.
+fn pad_bits(b: &PadButtons, kind: PadKind) -> (u8, u8) {
     let (nes_a, nes_b) = match kind {
         PadKind::Nintendo => (b.east || b.west, b.south || b.north),
         _ => (b.south || b.north, b.west || b.east),
@@ -250,20 +269,25 @@ fn pad_bits(b: &PadButtons, kind: PadKind, turbo_on: bool) -> u8 {
     };
     set(nes_b, pad::B);
     set(nes_a, pad::A);
-    set(b.l1 && turbo_on, pad::B);
-    set(b.r1 && turbo_on, pad::A);
+    let mut turbo = 0;
+    if b.l1 {
+        turbo |= pad::B;
+    }
+    if b.r1 {
+        turbo |= pad::A;
+    }
     set(b.back, pad::SELECT);
     set(b.start, pad::START);
     set(up, pad::UP);
     set(down, pad::DOWN);
     set(left, pad::LEFT);
     set(right, pad::RIGHT);
-    bits
+    (bits, turbo)
 }
 
-/// Keyboard → NES bits: arrows, X = A, Z = B, Enter = Start, Right Shift = Select,
-/// S = turbo A, A = turbo B.
-fn keyboard_bits(pressed: impl Fn(Scancode) -> bool, turbo_on: bool) -> u8 {
+/// Keyboard → (held NES bits, turbo bits): arrows, X = A, Z = B, Enter = Start,
+/// Right Shift = Select; S = turbo A, A = turbo B.
+fn keyboard_bits(pressed: impl Fn(Scancode) -> bool) -> (u8, u8) {
     let mut bits = 0;
     let map = [
         (Scancode::X, pad::A),
@@ -280,15 +304,14 @@ fn keyboard_bits(pressed: impl Fn(Scancode) -> bool, turbo_on: bool) -> u8 {
             bits |= bit;
         }
     }
-    if turbo_on {
-        if pressed(Scancode::S) {
-            bits |= pad::A;
-        }
-        if pressed(Scancode::A) {
-            bits |= pad::B;
-        }
+    let mut turbo = 0;
+    if pressed(Scancode::S) {
+        turbo |= pad::A;
     }
-    bits
+    if pressed(Scancode::A) {
+        turbo |= pad::B;
+    }
+    (bits, turbo)
 }
 
 /// Turbo phase: on for 2 polls, off for 2 polls.
@@ -753,9 +776,9 @@ impl Input {
             }
         }
 
-        let turbo_on = self.turbo.tick();
+        f.turbo_on = self.turbo.tick();
         let ks = events.keyboard_state();
-        f.pads[0] = keyboard_bits(|sc| ks.is_scancode_pressed(sc), turbo_on);
+        (f.pads[0], f.turbo[0]) = keyboard_bits(|sc| ks.is_scancode_pressed(sc));
         f.rewind = ks.is_scancode_pressed(Scancode::Backspace) && !self.text_on;
         f.fast_forward = ks.is_scancode_pressed(Scancode::Tab);
         let mut dirs = [
@@ -782,8 +805,10 @@ impl Input {
             f.fast_forward |= fast_forward;
             f.screenshot |= shot && !p.shot;
             p.shot = shot;
-            let game = mask_shot_combo(&b);
-            if p.info.slot.is_none() && self.seating && mask_combo(pad_bits(&game, p.info.kind, true)) != 0 {
+            // Both combos hide plain buttons only; turbo bits are A/B and pass through.
+            let (held, turbo) = pad_bits(&mask_shot_combo(&b), p.info.kind);
+            let held = mask_combo(held);
+            if p.info.slot.is_none() && self.seating && held | turbo != 0 {
                 if let Some(slot) = self.seats.sit(p.ctrl.instance_id(), &p.key) {
                     p.info.slot = Some(slot);
                     show_seat(&mut p.ctrl, Some(slot));
@@ -791,7 +816,8 @@ impl Input {
                 }
             }
             if let Some(slot) = p.info.slot {
-                f.pads[slot] |= mask_combo(pad_bits(&game, p.info.kind, turbo_on));
+                f.pads[slot] |= held;
+                f.turbo[slot] |= turbo;
             }
         }
 
@@ -846,33 +872,32 @@ mod tests {
         let (south, east) = (one(|b| b.south = true), one(|b| b.east = true));
         let (west, north) = (one(|b| b.west = true), one(|b| b.north = true));
 
-        for turbo_on in [true, false] {
-            // Bottom and top = A, left and right = B.
-            for kind in [PadKind::Xbox, PadKind::PlayStation, PadKind::SteamDeck, PadKind::Generic] {
-                assert_eq!(pad_bits(&south, kind, turbo_on), pad::A);
-                assert_eq!(pad_bits(&north, kind, turbo_on), pad::A);
-                assert_eq!(pad_bits(&west, kind, turbo_on), pad::B);
-                assert_eq!(pad_bits(&east, kind, turbo_on), pad::B);
-            }
-            // Nintendo: the printed A (right) and Y (left) = A, B (bottom) and X (top) = B.
-            assert_eq!(pad_bits(&east, PadKind::Nintendo, turbo_on), pad::A);
-            assert_eq!(pad_bits(&west, PadKind::Nintendo, turbo_on), pad::A);
-            assert_eq!(pad_bits(&south, PadKind::Nintendo, turbo_on), pad::B);
-            assert_eq!(pad_bits(&north, PadKind::Nintendo, turbo_on), pad::B);
+        // Bottom and top = A, left and right = B.
+        for kind in [PadKind::Xbox, PadKind::PlayStation, PadKind::SteamDeck, PadKind::Generic] {
+            assert_eq!(pad_bits(&south, kind), (pad::A, 0));
+            assert_eq!(pad_bits(&north, kind), (pad::A, 0));
+            assert_eq!(pad_bits(&west, kind), (pad::B, 0));
+            assert_eq!(pad_bits(&east, kind), (pad::B, 0));
         }
+        // Nintendo: the printed A (right) and Y (left) = A, B (bottom) and X (top) = B.
+        assert_eq!(pad_bits(&east, PadKind::Nintendo), (pad::A, 0));
+        assert_eq!(pad_bits(&west, PadKind::Nintendo), (pad::A, 0));
+        assert_eq!(pad_bits(&south, PadKind::Nintendo), (pad::B, 0));
+        assert_eq!(pad_bits(&north, PadKind::Nintendo), (pad::B, 0));
 
-        // Shoulders are turbo: pressed only on the turbo phase.
+        // Shoulders are turbo: they land in the turbo bits and never in the held ones.
         let (l1, r1) = (one(|b| b.l1 = true), one(|b| b.r1 = true));
         for kind in [PadKind::Xbox, PadKind::Nintendo] {
-            assert_eq!(pad_bits(&l1, kind, true), pad::B);
-            assert_eq!(pad_bits(&l1, kind, false), 0);
-            assert_eq!(pad_bits(&r1, kind, true), pad::A);
-            assert_eq!(pad_bits(&r1, kind, false), 0);
+            assert_eq!(pad_bits(&l1, kind), (0, pad::B));
+            assert_eq!(pad_bits(&r1, kind), (0, pad::A));
+            // Held and turbo of the same button stay apart.
+            let b = PadButtons { l1: true, r1: true, back: true, ..Default::default() };
+            assert_eq!(pad_bits(&b, kind), (pad::SELECT, pad::A | pad::B));
 
             let b = PadButtons { back: true, start: true, ..Default::default() };
-            assert_eq!(pad_bits(&b, kind, false), pad::SELECT | pad::START);
+            assert_eq!(pad_bits(&b, kind), (pad::SELECT | pad::START, 0));
             let b = PadButtons { lx: -0.6, ly: 0.4, up: true, ..Default::default() };
-            assert_eq!(pad_bits(&b, kind, false), pad::LEFT | pad::UP);
+            assert_eq!(pad_bits(&b, kind), (pad::LEFT | pad::UP, 0));
         }
 
         assert!(!PadButtons::default().active());
@@ -893,31 +918,42 @@ mod tests {
         // The combo is hidden from the game; other buttons pass through.
         let kind = PadKind::Xbox;
         let b = PadButtons { back: true, north: true, west: true, ..Default::default() };
-        assert_eq!(pad_bits(&mask_shot_combo(&b), kind, true), pad::B);
+        assert_eq!(pad_bits(&mask_shot_combo(&b), kind), (pad::B, 0));
         // Without Back, North is A.
         let b = PadButtons { north: true, west: true, ..Default::default() };
-        assert_eq!(pad_bits(&mask_shot_combo(&b), kind, true), pad::A | pad::B);
+        assert_eq!(pad_bits(&mask_shot_combo(&b), kind), (pad::A | pad::B, 0));
         let b = PadButtons { back: true, ..Default::default() };
-        assert_eq!(pad_bits(&mask_shot_combo(&b), kind, true), pad::SELECT);
+        assert_eq!(pad_bits(&mask_shot_combo(&b), kind), (pad::SELECT, 0));
         // Triggers never reach the NES pad.
         let b = PadButtons { lt: 1.0, rt: 1.0, ..Default::default() };
-        assert_eq!(pad_bits(&b, kind, true), 0);
+        assert_eq!(pad_bits(&b, kind), (0, 0));
     }
 
     #[test]
     fn input_keyboard_map() {
         let only = |k: Scancode| move |sc: Scancode| sc == k;
-        assert_eq!(keyboard_bits(only(Scancode::X), false), pad::A);
-        assert_eq!(keyboard_bits(only(Scancode::Z), false), pad::B);
-        assert_eq!(keyboard_bits(only(Scancode::Return), false), pad::START);
-        assert_eq!(keyboard_bits(only(Scancode::RShift), false), pad::SELECT);
-        assert_eq!(keyboard_bits(only(Scancode::Up), false), pad::UP);
-        assert_eq!(keyboard_bits(only(Scancode::Down), false), pad::DOWN);
-        assert_eq!(keyboard_bits(only(Scancode::Left), false), pad::LEFT);
-        assert_eq!(keyboard_bits(only(Scancode::Right), false), pad::RIGHT);
-        assert_eq!(keyboard_bits(only(Scancode::S), true), pad::A);
-        assert_eq!(keyboard_bits(only(Scancode::A), true), pad::B);
-        assert_eq!(keyboard_bits(only(Scancode::S), false), 0);
+        assert_eq!(keyboard_bits(only(Scancode::X)), (pad::A, 0));
+        assert_eq!(keyboard_bits(only(Scancode::Z)), (pad::B, 0));
+        assert_eq!(keyboard_bits(only(Scancode::Return)), (pad::START, 0));
+        assert_eq!(keyboard_bits(only(Scancode::RShift)), (pad::SELECT, 0));
+        assert_eq!(keyboard_bits(only(Scancode::Up)), (pad::UP, 0));
+        assert_eq!(keyboard_bits(only(Scancode::Down)), (pad::DOWN, 0));
+        assert_eq!(keyboard_bits(only(Scancode::Left)), (pad::LEFT, 0));
+        assert_eq!(keyboard_bits(only(Scancode::Right)), (pad::RIGHT, 0));
+        // Turbo keys land in the turbo bits and never in the held ones.
+        assert_eq!(keyboard_bits(only(Scancode::S)), (0, pad::A));
+        assert_eq!(keyboard_bits(only(Scancode::A)), (0, pad::B));
+        assert_eq!(keyboard_bits(|sc| matches!(sc, Scancode::S | Scancode::A | Scancode::Left)), (pad::LEFT, pad::A | pad::B));
+    }
+
+    #[test]
+    fn input_solo_pads_expand_turbo_on_the_local_phase() {
+        let mut f = InputFrame { pads: [pad::LEFT, pad::A, 0, 0], turbo: [pad::A, pad::B, 0, pad::A | pad::B], ..Default::default() };
+        assert_eq!(f.solo_pads(), [pad::LEFT, pad::A, 0, 0]);
+        f.turbo_on = true;
+        assert_eq!(f.solo_pads(), [pad::LEFT | pad::A, pad::A | pad::B, 0, pad::A | pad::B]);
+        // The frame itself keeps held and turbo apart for netplay.
+        assert_eq!(f.pads, [pad::LEFT, pad::A, 0, 0]);
     }
 
     #[test]
@@ -967,7 +1003,7 @@ mod tests {
         );
         assert_eq!(mask_combo(pad::START), pad::START);
         let b = PadButtons { back: true, start: true, south: true, ..Default::default() };
-        assert_eq!(mask_combo(pad_bits(&b, PadKind::Xbox, true)), pad::A);
+        assert_eq!(mask_combo(pad_bits(&b, PadKind::Xbox).0), pad::A);
     }
 
     #[test]
@@ -1061,6 +1097,15 @@ mod tests {
         press(first, Button::A, true);
         let f = poll(&mut input);
         assert_eq!((f.pads[0], f.seated), (pad::A, 1));
+
+        // A held turbo button seats a pad too, and shows up in `turbo` only, on every poll.
+        press(second, Button::RightShoulder, true);
+        for _ in 0..4 {
+            let f = poll(&mut input);
+            assert_eq!((f.pads[1], f.turbo[1], f.seated), (0, pad::A, 2));
+            assert_eq!(f.solo_pads()[1], if f.turbo_on { pad::A } else { 0 });
+        }
+        press(second, Button::RightShoulder, false);
 
         // The menu: a click of the right stick at once; Back+Start once, after 0.6 s, also
         // from a pad without a seat, and the game sees neither button meanwhile.

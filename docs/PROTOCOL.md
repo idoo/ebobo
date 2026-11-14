@@ -1,4 +1,4 @@
-# ebobo network protocol (v1)
+# ebobo network protocol (v2)
 
 Up to 4 players. Peer 0 is the host (NES controller 1 by default), guests get ids 1..3.
 GGRS runs as a full mesh: every peer exchanges inputs with every other peer, each pair over
@@ -155,9 +155,25 @@ as a packet arrives on the direct address. After 3 s of silence the lower id sen
 Roaming (lobby and game): a PUNCH or PUNCH_ACK carrying the peer's session token from a new
 address moves a decided direct route to that source address once the current address has been
 silent for at least 1 s (so late pairing punches cannot flap a working route); the PUNCH is
-answered with PUNCH_ACK. This covers NAT rebinding and Wi-Fi → LTE. A relay-routed pair stays on
-the relay: a `route` `relay` for a decided direct pair is the only switch the decider ever sends,
-and nothing switches back to direct. Direct-IP mode (token 0) never roams.
+answered with PUNCH_ACK. This covers NAT rebinding and Wi-Fi → LTE. A relay-routed pair does not
+roam. Direct-IP mode (token 0) never roams.
+
+Return to direct (game only): a pair that fell back from a direct route to the relay during the
+game probes the direct path again. Pairs relayed by decision (`relay_only`, `force_relay`, or
+punching never worked before the game) never probe and stay on the relay; so does a pair that
+fell back in the lobby. Probing starts 5 s after the fallback. Each further fallback of the same
+pair doubles that wait (10 s, 20 s, 40 s), up to 60 s; a direct route that stayed in use for 30 s
+resets it. While probing, both sides send a PUNCH once per second to the old route address, to the
+peer's candidates and to the source of the peer's latest token-matched PUNCH (the peer may have
+moved); every such PUNCH is answered with PUNCH_ACK. The decider (lower id) returns once it has
+3 PUNCH_ACKs from one address, at least 0.5 s apart, within 4 s: it sends
+`{"t":"route","to":<peer>,"mode":"direct","addr":"<peer address>"}` and switches. The other side
+accepts `route` `direct` from the lower id only for a fallen-back pair, and uses the address of
+its own PUNCH_ACKs, else the source of the peer's PUNCH, else the old route address. Both sides
+start the route's silence clock fresh. Each side also mirrors every packet over the relay until a
+non-punch packet arrives from the peer on the direct address (proof that the peer switched), so
+nothing is lost during the switch. Candidates are not gathered again: probes use the candidates
+from the last `cands` message.
 
 ### Direct IP mode (2 players, no server)
 
@@ -204,10 +220,10 @@ every chunk.
 Host → each guest, as soon as the route is up:
 
 ```json
-{"t":"game","proto":1,"core":"0.1.0","name":"Ivan","rom":{"crc32":"1a2b3c4d","size":131088,"name":"Test Game (USA).nes"},"region":"ntsc","four_score":false}
+{"t":"game","proto":2,"core":"0.1.0","name":"Ivan","rom":{"crc32":"1a2b3c4d","size":131088,"name":"Test Game (USA).nes"},"region":"ntsc","four_score":false}
 ```
 
-Guest → host: `{"t":"rom","have":true,"name":"Sasha","proto":1,"ver":"0.1.0"}` (the guest
+Guest → host: `{"t":"rom","have":true,"name":"Sasha","proto":2,"ver":"0.1.0"}` (the guest
 looked the CRC up in its library; `name` is the guest's nickname, needed in direct-IP mode where
 no server announces it; `ver` is the guest's ebobo version). If `have` is false the host streams
 the raw ROM file (header included) with ROM_CHUNK; the guest verifies the PRG+CHR CRC-32 and
@@ -238,22 +254,28 @@ The host may start when ≥ 2 peers are present and every guest is ready with li
 present peers. Host sends `{"t":"lock"}` to the server, then to every guest:
 
 ```json
-{"t":"start","slots":[0,1,2],"delay":2,"four_score":true}
+{"t":"start","slots":[0,1,2],"delay":2,"auto":true,"four_score":true}
 ```
 
-`slots[i]` = peer id playing NES controller i+1. `delay` = GGRS input delay chosen by the host:
-its setting (1-6), or auto = clamp(ceil(R / 2 / frame_ms), 1, 6), where R is the worst peer's
-planning RTT: SRTT + 2·RTTVAR once that peer has at least 8 samples, otherwise SRTT·1.25 (RFC
-6298's cold-start RTTVAR = R/2 would add a whole extra RTT). A peer with no samples counts as
-0 ms, and the start never waits for samples. frame_ms is 16.64 (NTSC) or 20 (PAL). `four_score`
-= true when more than 2 slots are used or the ROM header asks for it. Each peer starts GGRS when
-it receives (guests) or sends (host) `start`.
+`slots[i]` = peer id playing NES controller i+1. `delay` = GGRS input delay every peer starts
+with, chosen by the host: its setting (1-6), or auto. Auto: L = ceil(R / 2 / frame_ms) is the
+one-way latency in frames; delay = clamp(min(L, 3) + max(L - 9, 0), 1, 6). The first 3 frames of
+latency are hidden by delay (no rollbacks), the next 6 are left to rollback, the rest is delay
+again. R is the worst peer's planning RTT: SRTT + 2·RTTVAR once that peer has at least 8 samples,
+otherwise SRTT·1.25 (RFC 6298's cold-start RTTVAR = R/2 would add a whole extra RTT). A peer with
+no samples counts as 0 ms, and the start never waits for samples. frame_ms is 16.64 (NTSC) or 20
+(PAL). `auto` = true when the host's input delay setting is Auto: then every peer adapts its own
+delay during the game (section 5); false keeps `delay` fixed for everyone. Direct-IP mode uses
+the same rule. `four_score` = true when more than 2 slots are used or the ROM header asks for it.
+Each peer starts GGRS when it receives (guests) or sends (host) `start`.
 
 `{"t":"leave"}` (any → all) and BYE packets end the lobby/game for that peer.
 
 ## 5. Game (GGRS)
 
-`ggrs::Config`: `Input = u16` (bits 0-7 NES pad, bit 8 = reset request), `State =
+GGRS is pinned to upstream revision `25bd998` (0.13.0 plus fixes; its input packets carry the
+frame they are delta-encoded against, which 0.13.0's did not, so the two do not interoperate).
+`ggrs::Config`: `Input = u16`, `State =
 ebobo_core::Snapshot`, `Address = PeerId(u8)`. Players = `slots.len()`, local handle = own slot
 index, every other slot is `PlayerType::Remote(PeerId)`. FPS = 60 (NTSC) / 50 (PAL). The
 session takes the `Link` from `GameStart.link` (the lobby's live mesh, section 2), or
@@ -263,6 +285,27 @@ disconnects its player.
 Max prediction 10, desync detection every 60 frames (checksum = `Nes::state_hash` truncated to
 u128), disconnect timeout 20 s, notify after 1.5 s. A frame whose combined input has any reset
 bit runs `Nes::reset()` before `run_frame`.
+
+Input word: bits 0-7 = NES pad held, bit 8 = reset request (one frame), bit 9 = turbo A held,
+bit 10 = turbo B held. Turbo travels as a held bit; every peer expands it from the GGRS frame
+number f being simulated: the turbo phase is on when `(f / 2) % 2 == 0` (2 frames on, 2 off).
+A pad button is pressed when its bit is held, or when its turbo bit is set and the phase is on.
+Disconnected players read as all released.
+
+Prediction: a missing remote input is predicted as that player's last input without the reset
+bit. Held and turbo bits repeat, so a held turbo button predicts correctly.
+
+Smoothed RTT: each peer samples GGRS's ping to every remote player every 200 ms (none during the
+first second, none for players that left) into the same RFC 6298 estimator the lobby uses
+(SRTT, RTTVAR, warm after 8 samples). The in-game ping shown is the SRTT.
+
+Adaptive input delay (only when `start.auto` is true): each peer changes only its own delay. The
+target is the section 4 formula applied to the worst warm remote link. The delay rises by one
+frame after the target was above it for 1 s without a break, and falls by one after it was below
+for 10 s without a break. Two changes are at least 1 s apart, the delay stays within 1-6, and
+nothing changes while no link is warm. A change is applied after a frame advanced, never on a
+frame carrying a reset. GGRS sends copies of the last input to fill the gap on a rise and drops
+the next inputs on a fall, so peers stay in sync without extra messages.
 
 Tuning (measured with the network profiles in `crates/ebobo-net/src/session_tests.rs`, release
 build): prediction 10 instead of 8 cuts stalls on a 150 ms one-way link from 14-33 % to 4-11 % of

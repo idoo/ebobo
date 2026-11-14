@@ -191,7 +191,7 @@ pub fn run(args: Vec<String>) -> i32 {
             break;
         }
         deadline = logic::next_deadline(deadline, Instant::now(), app.period());
-        wait_until(deadline, app.in_game());
+        wait_until(deadline, app.in_game(), || app.net_poll());
     }
     app.end_game();
     // Quitting with a downloaded update: install it (no relaunch) so the next start is current.
@@ -215,9 +215,14 @@ pub fn run(args: Vec<String>) -> i32 {
 }
 
 /// Waits until `deadline`. In game: coarse sleep until ~1.5 ms before, then yield-spin for
-/// accurate pacing. In menus/lobby: one plain sleep (no busy CPU).
-fn wait_until(deadline: Instant, precise: bool) {
+/// accurate pacing. In menus/lobby: one plain sleep (no busy CPU). `poll` returns whether it
+/// wants to run again during the wait: while it does (netplay), the coarse sleep is cut into
+/// slices of at most 2 ms with a `poll` after each, so acks and ping replies leave at once;
+/// otherwise (solo) the coarse sleep is one piece.
+fn wait_until(deadline: Instant, precise: bool, mut poll: impl FnMut() -> bool) {
     const SPIN: Duration = Duration::from_micros(1500);
+    const SLICE: Duration = Duration::from_millis(2);
+    let mut sliced = precise && poll();
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -229,7 +234,12 @@ fn wait_until(deadline: Instant, precise: bool) {
             return;
         }
         if left > SPIN {
-            thread::sleep(left - SPIN);
+            if sliced {
+                thread::sleep((left - SPIN).min(SLICE));
+                sliced = poll();
+            } else {
+                thread::sleep(left - SPIN);
+            }
         } else {
             thread::yield_now();
         }
@@ -343,6 +353,17 @@ impl App {
 
     fn in_game(&self) -> bool {
         matches!(self.state, State::Solo(_) | State::Net(_))
+    }
+
+    /// Network work between two frames; false outside netplay (nothing to poll).
+    fn net_poll(&mut self) -> bool {
+        match &mut self.state {
+            State::Net(n) => {
+                n.session.poll();
+                true
+            }
+            _ => false,
+        }
     }
 
     fn period(&self) -> Duration {
@@ -829,7 +850,7 @@ impl App {
         nes.set_four_score(start.four_score);
         nes.set_sprite_limit(self.config.sprite_limit.applies(start.four_score));
         let fps = if start.region == Region::Pal { 50 } else { 60 };
-        let session = match NetSession::new(start.link, &start.slots, start.input_delay, fps) {
+        let session = match NetSession::new(start.link, &start.slots, start.input_delay, start.delay_auto, fps) {
             Ok(session) => session,
             Err(err) => {
                 self.ui.show_main();
@@ -936,14 +957,15 @@ impl App {
                     s.ff_on = logic::fast_forward(self.config.ff_toggle, frame.fast_forward, s.ff_held, s.ff_on);
                     s.ff_held = frame.fast_forward;
                     let n = if s.ff_on { 3 } else { 1 };
+                    let pads = frame.solo_pads();
                     for i in 0..n {
                         if s.since_snapshot == 0 {
-                            s.rewind.push((s.nes.snapshot(), frame.pads));
+                            s.rewind.push((s.nes.snapshot(), pads));
                         }
                         s.since_snapshot = (s.since_snapshot + 1) % rewind::EVERY;
                         // Only the last frame of a fast-forward tick draws pixels and sound.
                         s.nes.set_fast_forward(i + 1 < n);
-                        s.nes.run_frame(frame.pads);
+                        s.nes.run_frame(pads);
                     }
                 }
             }
@@ -982,7 +1004,7 @@ impl App {
                 }
                 let mut local: u16 = 0;
                 if !ui_visible {
-                    local = frame.pads.iter().fold(0u16, |acc, p| acc | *p as u16);
+                    local = logic::net_input(&frame.pads, &frame.turbo);
                 }
                 if n.reset_pending {
                     local |= INPUT_RESET;
@@ -1008,7 +1030,13 @@ impl App {
                 }
                 n.frame = n.frame.wrapping_add(1);
                 if n.frame % STATS_EVERY == 0 {
-                    n.stats = n.session.stats();
+                    let stats = n.session.stats();
+                    if stats.input_delay != n.stats.input_delay {
+                        let ping = stats.peers.iter().map(|p| p.ping_ms).max().unwrap_or(0);
+                        println!("ebobo: input delay {} -> {} (ping {ping} ms)", n.stats.input_delay, stats.input_delay);
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                    n.stats = stats;
                 }
             }
             State::Menu | State::Lobby(_) => {}
