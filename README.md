@@ -28,13 +28,15 @@ If someone can't get in, Settings > Advanced > Network check usually tells you w
 
 ROMs are found in `~/ROMs`, `~/Downloads`, EmuDeck's folder and a few other usual places. You can also drop one on the window.
 
-On the Steam Deck everything works by touch, and text fields bring up ebobo's own keyboard (Steam's keyboard can't type into it in Game Mode). Your Steam name is the default nickname.
+On the Steam Deck everything works by touch, and text fields bring up ebobo's own keyboard (Steam's keyboard can't type into it in Game Mode). Your Steam name is the default nickname. In Desktop Mode Steam makes the Deck's buttons type keys; ebobo switches them to a gamepad while its window is in front and back when you leave.
 
 Settings > Effect turns the picture into an old CRT TV (curved glass, scanlines, glow), a flat studio monitor, or a handheld LCD.
 
 ## Keys
 
-Arrows to move, X is A, Z is B, Enter is Start, right Shift is Select, Esc opens the menu. Hold Tab to fast-forward and Backspace to rewind. F5 and F7 save and load. Gamepads just work.
+Arrows to move, X is A, Z is B, Enter is Start, right Shift is Select, Esc opens the menu. Hold Tab to fast-forward and Backspace to rewind. F5 and F7 save and load.
+
+On a gamepad the left face button is B and the bottom one is A (X and A on a Steam Deck or Xbox pad). The other two are turbo B and turbo A. `Settings > Buttons` switches to bottom = B, right = A. L2 rewinds, R2 fast-forwards, holding Select+Start opens the menu.
 
 ## Building
 

@@ -6,6 +6,7 @@ mod logic;
 mod png;
 mod rewind;
 mod slots;
+mod steam_input;
 mod update;
 
 /// Save-state slots per game.
@@ -46,6 +47,8 @@ const STALL_DIM_AFTER: Duration = Duration::from_millis(500);
 const SLEEP_GAP: Duration = Duration::from_secs(2);
 /// The mouse cursor hides this long after the mouse last moved.
 const CURSOR_IDLE: Duration = Duration::from_secs(2);
+/// The "Deck buttons type keys" hint stays this long.
+const KEYS_HINT_SECS: f32 = 8.0;
 
 struct Solo {
     nes: Nes,
@@ -137,6 +140,9 @@ struct App {
     updater: update::Updater,
     /// When the real mouse last moved (cursor visibility).
     mouse_at: Option<Instant>,
+    /// Steam Deck Desktop Mode: keeps the Deck's buttons a gamepad while the window has focus.
+    steam_input: steam_input::SteamInput,
+    keys_hint: steam_input::KeysHint,
 }
 
 /// Runs the app; returns the process exit code.
@@ -238,7 +244,8 @@ impl App {
 
         let sdl = sdl2::init()?;
         // Input sets the controller hints; it must open the game-controller subsystem first.
-        let input = Input::new(&sdl)?;
+        let mut input = Input::new(&sdl)?;
+        input.set_buttons(config.buttons);
         let pump = sdl.event_pump()?;
         let mut video = Video::new(&sdl, config.fullscreen, config.scale, config.screen)?;
         video.set_effect(config.effect);
@@ -293,6 +300,8 @@ impl App {
             net_check: None,
             updater,
             mouse_at: None,
+            steam_input: steam_input::SteamInput::new(config::is_steam_deck()),
+            keys_hint: steam_input::KeysHint::default(),
         })
     }
 
@@ -348,6 +357,13 @@ impl App {
             // Sleep/suspend: GGRS resyncs or times peers out by itself; the frame debt cap in
             // `next_deadline` prevents a catch-up burst.
             self.ui.toast(self.ui.text(Text::SleepGap));
+        }
+        self.steam_input.set_focus(self.video.focused());
+        self.steam_input.tick(dt);
+        if self.steam_input.deck_desktop() && self.keys_hint.update(frame.key_used, frame.pad.used, dt) {
+            // Steam ignored the pin (or ebobo has no Steam shortcut): the buttons still type.
+            self.ui.toast_secs(self.ui.text(Text::DeckKeys), KEYS_HINT_SECS);
+            self.ui.toast_secs(self.ui.text(Text::DeckKeysFix), KEYS_HINT_SECS);
         }
         self.poll_net_check();
         self.poll_update();
@@ -645,7 +661,6 @@ impl App {
                     self.ui.toast(self.ui.text(text));
                 }
             }
-            UiAction::ToggleFullscreen => self.toggle_fullscreen(),
             UiAction::ConfigChanged => self.apply_config(),
             UiAction::Rescan => self.library.rescan(),
             UiAction::RunNetCheck => self.start_net_check(),
@@ -669,6 +684,7 @@ impl App {
         }
         self.video.set_screen_mode(self.config.screen);
         self.video.set_effect(self.config.effect);
+        self.input.set_buttons(self.config.buttons);
         if let Some(audio) = &mut self.audio {
             audio.set_volume(self.config.volume);
         }
@@ -1105,7 +1121,6 @@ fn make_ctx<'a>(
             rom_name: &s.name,
             netplay: false,
             names: &[],
-            local_slot: None,
             stats: None,
             notice: None,
             desync: false,
@@ -1116,7 +1131,6 @@ fn make_ctx<'a>(
             rom_name: &n.rom_name,
             netplay: true,
             names: &n.names,
-            local_slot: Some(n.session.local_slot()),
             stats: Some(&n.stats),
             notice,
             desync: n.desync,

@@ -10,6 +10,8 @@ use sdl2::keyboard::{Mod, Scancode};
 use sdl2::mouse::MouseButton;
 use sdl2::{GameControllerSubsystem, JoystickSubsystem};
 
+use crate::config::ButtonLayout;
+
 /// Menu navigation, edge-triggered. Directions auto-repeat while held (400 ms delay, then
 /// every 80 ms). Keyboard: arrows, Enter = confirm, Esc/Backspace = back. Gamepad: D-pad or
 /// left stick, South (A on Xbox/Deck, Cross on PlayStation) = confirm, East (B / Circle) = back.
@@ -47,11 +49,15 @@ pub enum PointerEvent {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputFrame {
     /// NES pad bits per local device: [0] = keyboard merged with the first gamepad,
-    /// [1..4] = second..fourth gamepad. Gamepad layout is positional: South = NES B,
-    /// East = NES A, West = turbo B, North = turbo A, Back/Share = Select, Start/Options =
-    /// Start, D-pad and left stick = D-pad. Keyboard: arrows, X = A, Z = B, Enter = Start,
-    /// Right Shift = Select, S = turbo A, A = turbo B. Turbo toggles every 2 frames of `poll`.
+    /// [1..4] = second..fourth gamepad. Gamepad face buttons are positional and follow the
+    /// "Buttons" setting: by default West = NES B, South = NES A, North = turbo B, East =
+    /// turbo A; with `ButtonLayout::BottomRight` South = NES B, East = NES A, West = turbo B,
+    /// North = turbo A. Back/Share = Select, Start/Options = Start, D-pad and left stick =
+    /// D-pad. Keyboard: arrows, X = A, Z = B, Enter = Start, Right Shift = Select,
+    /// S = turbo A, A = turbo B. Turbo toggles every 2 frames of `poll`.
     pub pads: [u8; 4],
+    /// A keyboard key went down (auto-repeat not counted).
+    pub key_used: bool,
     pub nav: Nav,
     /// Text typed since the last poll (only while text input is enabled).
     pub text: String,
@@ -193,8 +199,13 @@ fn mask_shot_combo(b: &PadButtons) -> PadButtons {
     }
 }
 
-/// Positional gamepad → NES bits. `turbo_on` = current turbo phase.
-fn pad_bits(b: &PadButtons, turbo_on: bool) -> u8 {
+/// Positional gamepad → NES bits; `layout` picks the face buttons of NES B and A and of their
+/// turbo versions. `turbo_on` = current turbo phase.
+fn pad_bits(b: &PadButtons, layout: ButtonLayout, turbo_on: bool) -> u8 {
+    let (nes_b, nes_a, turbo_b, turbo_a) = match layout {
+        ButtonLayout::LeftBottom => (b.west, b.south, b.north, b.east),
+        ButtonLayout::BottomRight => (b.south, b.east, b.west, b.north),
+    };
     let (up, down, left, right) = b.dirs();
     let mut bits = 0;
     let mut set = |on: bool, bit: u8| {
@@ -202,10 +213,10 @@ fn pad_bits(b: &PadButtons, turbo_on: bool) -> u8 {
             bits |= bit;
         }
     };
-    set(b.south, pad::B);
-    set(b.east, pad::A);
-    set(b.west && turbo_on, pad::B);
-    set(b.north && turbo_on, pad::A);
+    set(nes_b, pad::B);
+    set(nes_a, pad::A);
+    set(turbo_b && turbo_on, pad::B);
+    set(turbo_a && turbo_on, pad::A);
     set(b.back, pad::SELECT);
     set(b.start, pad::START);
     set(up, pad::UP);
@@ -436,6 +447,8 @@ pub struct Input {
     events: Vec<PadEvent>,
     /// The finger being tracked (`touch_id`, `finger_id`); other fingers are ignored.
     finger: Option<(i64, i64)>,
+    /// Which face buttons are NES B and A.
+    buttons: ButtonLayout,
 }
 
 impl Input {
@@ -475,6 +488,7 @@ impl Input {
             repeat: Default::default(),
             events: Vec::new(),
             finger: None,
+            buttons: ButtonLayout::default(),
         };
         let n = input.joy.num_joysticks().unwrap_or(0);
         for i in 0..n {
@@ -528,6 +542,11 @@ impl Input {
         }
     }
 
+    /// Applies the "Buttons" setting to every gamepad from the next `poll`.
+    pub fn set_buttons(&mut self, layout: ButtonLayout) {
+        self.buttons = layout;
+    }
+
     /// Drains SDL events. `dt` = time since the previous call (auto-repeat, hold timers);
     /// `to_canvas` maps mouse and touch positions to UI canvas pixels.
     pub fn poll(
@@ -569,6 +588,9 @@ impl Input {
                     let cmd = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD);
                     let ctrl = keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD);
                     let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
+                    if !repeat {
+                        f.key_used = true;
+                    }
                     match sc {
                         Scancode::F11 if !repeat => f.fullscreen = true,
                         Scancode::Return | Scancode::KpEnter if alt => {
@@ -665,7 +687,8 @@ impl Input {
             f.fast_forward |= fast_forward;
             f.screenshot |= shot && !p.shot;
             p.shot = shot;
-            f.pads[p.info.slot] |= mask_combo(pad_bits(&mask_shot_combo(&b), turbo_on));
+            f.pads[p.info.slot] |=
+                mask_combo(pad_bits(&mask_shot_combo(&b), self.buttons, turbo_on));
         }
 
         let [up, down, left, right] = dirs;
@@ -709,17 +732,41 @@ mod tests {
 
     #[test]
     fn input_positional_mapping() {
-        let b = PadButtons { south: true, ..Default::default() };
-        assert_eq!(pad_bits(&b, true), pad::B);
-        let b = PadButtons { east: true, ..Default::default() };
-        assert_eq!(pad_bits(&b, true), pad::A);
-        let b = PadButtons { back: true, start: true, ..Default::default() };
-        assert_eq!(pad_bits(&b, false), pad::SELECT | pad::START);
-        let b = PadButtons { lx: -0.6, ly: 0.4, up: true, ..Default::default() };
-        assert_eq!(pad_bits(&b, false), pad::LEFT | pad::UP);
-        let b = PadButtons { west: true, north: true, ..Default::default() };
-        assert_eq!(pad_bits(&b, true), pad::A | pad::B);
-        assert_eq!(pad_bits(&b, false), 0);
+        use ButtonLayout::{BottomRight, LeftBottom};
+        let one = |f: fn(&mut PadButtons)| {
+            let mut b = PadButtons::default();
+            f(&mut b);
+            b
+        };
+        let (south, east) = (one(|b| b.south = true), one(|b| b.east = true));
+        let (west, north) = (one(|b| b.west = true), one(|b| b.north = true));
+
+        // Default: left = B, bottom = A, top = turbo B, right = turbo A.
+        for turbo_on in [true, false] {
+            assert_eq!(pad_bits(&west, LeftBottom, turbo_on), pad::B);
+            assert_eq!(pad_bits(&south, LeftBottom, turbo_on), pad::A);
+        }
+        assert_eq!(pad_bits(&north, LeftBottom, true), pad::B);
+        assert_eq!(pad_bits(&north, LeftBottom, false), 0);
+        assert_eq!(pad_bits(&east, LeftBottom, true), pad::A);
+        assert_eq!(pad_bits(&east, LeftBottom, false), 0);
+
+        // Bottom = B, right = A, left = turbo B, top = turbo A.
+        for turbo_on in [true, false] {
+            assert_eq!(pad_bits(&south, BottomRight, turbo_on), pad::B);
+            assert_eq!(pad_bits(&east, BottomRight, turbo_on), pad::A);
+        }
+        assert_eq!(pad_bits(&west, BottomRight, true), pad::B);
+        assert_eq!(pad_bits(&west, BottomRight, false), 0);
+        assert_eq!(pad_bits(&north, BottomRight, true), pad::A);
+        assert_eq!(pad_bits(&north, BottomRight, false), 0);
+
+        for layout in [LeftBottom, BottomRight] {
+            let b = PadButtons { back: true, start: true, ..Default::default() };
+            assert_eq!(pad_bits(&b, layout, false), pad::SELECT | pad::START);
+            let b = PadButtons { lx: -0.6, ly: 0.4, up: true, ..Default::default() };
+            assert_eq!(pad_bits(&b, layout, false), pad::LEFT | pad::UP);
+        }
     }
 
     #[test]
@@ -732,12 +779,16 @@ mod tests {
         let b = PadButtons { back: true, north: true, south: true, ..Default::default() };
         assert_eq!(pad_hotkeys(&b), (false, false, true));
         // The combo is hidden from the game; other buttons pass through.
-        assert_eq!(pad_bits(&mask_shot_combo(&b), true), pad::B);
+        let layout = ButtonLayout::default();
+        assert_eq!(pad_bits(&mask_shot_combo(&b), layout, true), pad::A);
+        // Without Back, North is turbo B.
+        let b = PadButtons { north: true, south: true, ..Default::default() };
+        assert_eq!(pad_bits(&mask_shot_combo(&b), layout, true), pad::A | pad::B);
         let b = PadButtons { back: true, ..Default::default() };
-        assert_eq!(pad_bits(&mask_shot_combo(&b), true), pad::SELECT);
+        assert_eq!(pad_bits(&mask_shot_combo(&b), layout, true), pad::SELECT);
         // Triggers never reach the NES pad.
         let b = PadButtons { lt: 1.0, rt: 1.0, ..Default::default() };
-        assert_eq!(pad_bits(&b, true), 0);
+        assert_eq!(pad_bits(&b, layout, true), 0);
     }
 
     #[test]
@@ -803,7 +854,7 @@ mod tests {
         );
         assert_eq!(mask_combo(pad::START), pad::START);
         let b = PadButtons { back: true, start: true, south: true, ..Default::default() };
-        assert_eq!(mask_combo(pad_bits(&b, true)), pad::B);
+        assert_eq!(mask_combo(pad_bits(&b, ButtonLayout::default(), true)), pad::A);
     }
 
     #[test]

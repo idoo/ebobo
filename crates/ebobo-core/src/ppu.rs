@@ -425,13 +425,13 @@ impl Ppu {
     }
 
     /// Current scanline: -1 = pre-render, 0-239 visible, 240 post-render, 241.. vblank.
-    #[inline]
+    #[cfg(test)]
     pub fn scanline(&self) -> i16 {
         self.scanline
     }
 
     /// Current dot within the scanline, 0-340.
-    #[inline]
+    #[cfg(test)]
     pub fn dot(&self) -> u16 {
         self.dot
     }
@@ -1139,7 +1139,7 @@ mod tests {
     #[test]
     fn ppu_palette_mirroring() {
         let (mut p, mut c) = (Ppu::new(Region::Ntsc), cart());
-        let mut write = |p: &mut Ppu, c: &mut Cartridge, addr: u16, val: u8| {
+        let write = |p: &mut Ppu, c: &mut Cartridge, addr: u16, val: u8| {
             p.write_register(0x2006, (addr >> 8) as u8, c);
             p.write_register(0x2006, addr as u8, c);
             p.write_register(0x2007, val, c);
@@ -1149,7 +1149,7 @@ mod tests {
         write(&mut p, &mut c, 0x3F10, 0x22);
         write(&mut p, &mut c, 0x3F14, 0x23);
 
-        let mut read = |p: &mut Ppu, c: &mut Cartridge, addr: u16| -> u8 {
+        let read = |p: &mut Ppu, c: &mut Cartridge, addr: u16| -> u8 {
             p.write_register(0x2006, (addr >> 8) as u8, c);
             p.write_register(0x2006, addr as u8, c);
             p.read_register(0x2007, c) & 0x3F

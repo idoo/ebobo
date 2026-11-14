@@ -553,7 +553,7 @@ mod tests {
         c.cpu_write(0x5105, 0b01_11_10_00, 0);
         c.cpu_write(0x5106, 0x77, 0);
         c.cpu_write(0x5107, 2, 0);
-        let mut poke = |p: &mut Ppu, c: &mut Cartridge, a: u16, v: u8| {
+        let poke = |p: &mut Ppu, c: &mut Cartridge, a: u16, v: u8| {
             p.write_register(0x2006, (a >> 8) as u8, c);
             p.write_register(0x2006, a as u8, c);
             p.write_register(0x2007, v, c);

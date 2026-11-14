@@ -8,7 +8,7 @@ use ebobo_net::{
 };
 
 use crate::canvas::{Canvas, Color, Font};
-use crate::config::{is_steam_deck, Config, ScreenMode, SpriteLimit};
+use crate::config::{is_steam_deck, ButtonLayout, Config, ScreenMode, SpriteLimit};
 use crate::crt::Effect;
 use crate::i18n::{Lang, S};
 use crate::input::{InputFrame, Nav, PadEvent, PadInfo, PadKind, PointerEvent};
@@ -36,7 +36,6 @@ pub enum UiAction {
     /// Pause menu slot row changed the current save slot (0-based).
     SelectSlot(u8),
     LeaveGame,
-    ToggleFullscreen,
     /// `UiCtx::config` was edited; the app saves it and applies scale/volume/fullscreen.
     ConfigChanged,
     Rescan,
@@ -51,8 +50,6 @@ pub struct GameView<'a> {
     pub netplay: bool,
     /// Player names by NES controller slot (netplay), empty in solo.
     pub names: &'a [String],
-    /// Slot this machine controls (netplay).
-    pub local_slot: Option<usize>,
     pub stats: Option<&'a NetStats>,
     /// Netplay warning line, e.g. a peer's connection is interrupted (already localised by
     /// the app via `Ui::text`).
@@ -99,6 +96,10 @@ pub enum Text {
     UpdateMoveToApps,
     /// Linux self-update impossible (install dir not writable).
     UpdateRerunInstaller,
+    /// The Deck's buttons arrive as keyboard keys (Steam's Desktop Layout).
+    DeckKeys,
+    /// How to switch the Deck to its gamepad layout.
+    DeckKeysFix,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -459,7 +460,12 @@ impl Ui {
 
     /// Short notice at the bottom for ~2.5 s, also during play.
     pub fn toast(&mut self, message: &str) {
-        self.toasts.push((message.to_string(), TOAST_SECS));
+        self.toast_secs(message, TOAST_SECS);
+    }
+
+    /// Like `toast`, shown for `secs` seconds.
+    pub fn toast_secs(&mut self, message: &str, secs: f32) {
+        self.toasts.push((message.to_string(), secs));
         if self.toasts.len() > 2 {
             self.toasts.remove(0);
         }
@@ -484,6 +490,8 @@ impl Ui {
             Text::ScreenshotFailed => S::ScreenshotFailed,
             Text::UpdateMoveToApps => S::UpdateMoveToApps,
             Text::UpdateRerunInstaller => S::UpdateRerunInstaller,
+            Text::DeckKeys => S::DeckKeys,
+            Text::DeckKeysFix => S::DeckKeysFix,
         })
     }
 
@@ -1075,7 +1083,20 @@ impl Ui {
         }
     }
 
-    fn settings_items(&self, cfg: &Config) -> Vec<Item> {
+    /// "<pad button>=<NES button>" for B and A, in the lettering of the pad `kind`
+    /// (PlayStation in ASCII: the font has no square or circle).
+    fn buttons_value(layout: ButtonLayout, kind: Option<PadKind>) -> &'static str {
+        match (kind, layout) {
+            (Some(PadKind::Nintendo), ButtonLayout::LeftBottom) => "Y=B B=A",
+            (Some(PadKind::Nintendo), ButtonLayout::BottomRight) => "B=B A=A",
+            (Some(PadKind::PlayStation), ButtonLayout::LeftBottom) => "Sq=B X=A",
+            (Some(PadKind::PlayStation), ButtonLayout::BottomRight) => "X=B O=A",
+            (_, ButtonLayout::LeftBottom) => "X=B A=A",
+            (_, ButtonLayout::BottomRight) => "A=B B=A",
+        }
+    }
+
+    fn settings_items(&self, cfg: &Config, kind: Option<PadKind>) -> Vec<Item> {
         let onoff = |b: bool| self.t(if b { S::On } else { S::Off }).to_string();
         vec![
             Item::value(self.t(S::Nick), trunc(&cfg.nickname, 11), false),
@@ -1103,6 +1124,7 @@ impl Ui {
                 true,
             ),
             Item::value(self.t(S::Volume), format!("{}%", (cfg.volume * 100.0).round() as u32), true),
+            Item::value(self.t(S::Buttons), Self::buttons_value(cfg.buttons, kind).to_string(), true),
             Item::value(self.t(S::Language), if self.lang == Lang::Ru { "Русский" } else { "English" }.to_string(), true),
             Item::new(self.t(S::Advanced)),
         ]
@@ -1149,7 +1171,7 @@ impl Ui {
             self.pop();
             return None;
         }
-        let confirm = self.menu_step(Screen::Settings, 8, nav);
+        let confirm = self.menu_step(Screen::Settings, 9, nav);
         let row = self.sel[Screen::Settings.slot()];
         let delta: i32 = if nav.right || confirm.is_some() { 1 } else if nav.left { -1 } else { 0 };
         let cfg = &mut *ctx.config;
@@ -1159,12 +1181,12 @@ impl Ui {
                 self.open_field(Field::Nick, nick);
                 None
             }
-            7 if confirm.is_some() => {
+            8 if confirm.is_some() => {
                 self.sel[Screen::Advanced.slot()] = 0;
                 self.push(Screen::Advanced);
                 None
             }
-            0 | 7 => None,
+            0 | 8 => None,
             _ if delta == 0 => None,
             1 => {
                 cfg.fullscreen = !cfg.fullscreen;
@@ -1192,6 +1214,13 @@ impl Ui {
                 let changed = volume != cfg.volume;
                 cfg.volume = volume;
                 changed.then_some(UiAction::ConfigChanged)
+            }
+            6 => {
+                cfg.buttons = match cfg.buttons {
+                    ButtonLayout::LeftBottom => ButtonLayout::BottomRight,
+                    ButtonLayout::BottomRight => ButtonLayout::LeftBottom,
+                };
+                Some(UiAction::ConfigChanged)
             }
             _ => {
                 self.lang = if self.lang == Lang::Ru { Lang::En } else { Lang::Ru };
@@ -1476,14 +1505,14 @@ impl Ui {
 
     fn draw_settings(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 8, self.t(S::Settings), WHITE, 1);
-        let items = self.settings_items(ctx.config);
+        let items = self.settings_items(ctx.config, ctx.pads.first().map(|p| p.kind));
         Self::draw_rows(c, f, &items, self.sel[Screen::Settings.slot()], 28, 14, h);
-        f.draw(c, 16, 148, self.t(S::Gamepads), SEC, 1);
+        f.draw(c, 16, 162, self.t(S::Gamepads), SEC, 1);
         if ctx.pads.is_empty() {
-            f.draw(c, 24, 160, self.t(S::NoPads), DIS, 1);
+            f.draw(c, 24, 174, self.t(S::NoPads), DIS, 1);
         }
         for (i, pad) in ctx.pads.iter().take(4).enumerate() {
-            let y = 160 + i as i32 * 10;
+            let y = 174 + i as i32 * 10;
             let col = SLOT[pad.slot.min(3)];
             f.draw(c, 24, y, &(pad.slot + 1).to_string(), col, 1);
             f.draw(c, 40, y, &trunc(&pad.name, 25), WHITE, 1);
@@ -1765,7 +1794,7 @@ impl Ui {
                 Some(Screen::Picker(_)) => vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back), (Glyph::LeftRight, S::Page)],
                 Some(Screen::Code) => vec![(Glyph::Confirm, S::Join), (Glyph::Back, S::Back)],
                 Some(Screen::Field(_)) => vec![(Glyph::Confirm, S::Ok), (Glyph::Back, S::Back)],
-                Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 7 => {
+                Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 8 => {
                     vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)]
                 }
                 Some(Screen::Advanced) if self.sel[Screen::Advanced.slot()] == 2 => {
@@ -2164,7 +2193,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 6;
+        ui.sel[Screen::Settings.slot()] = 7;
         let mut c = ctx(&mut cfg, &[], None);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(ui.lang, Lang::En);
@@ -2238,7 +2267,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.show_pause();
-        let solo = |slot| GameView { rom_name: "X", netplay: false, names: &[], local_slot: None, stats: None, notice: None, desync: false, stalled: false, save_slot: Some((slot, None)) };
+        let solo = |slot| GameView { rom_name: "X", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((slot, None)) };
         let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(solo(0)), pads: &[], config: &mut cfg, version: "0.1.0" };
         ui.update(&nav(|n| n.down = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::SelectSlot(1)));
@@ -2261,7 +2290,7 @@ mod tests {
         let names = vec!["A".to_string(), "B".to_string()];
         let mut ui = Ui::new(Lang::Ru);
         ui.show_pause();
-        let game = GameView { rom_name: "X", netplay: true, names: &names, local_slot: Some(0), stats: None, notice: None, desync: false, stalled: false, save_slot: None };
+        let game = GameView { rom_name: "X", netplay: true, names: &names, stats: None, notice: None, desync: false, stalled: false, save_slot: None };
         let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &[], config: &mut cfg, version: "0.1.0" };
         ui.update(&nav(|n| n.up = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "exit must confirm");
@@ -2294,11 +2323,11 @@ mod tests {
     fn ui_settings_top_level_fits() {
         let cfg = Config::default();
         let ui = Ui::new(Lang::Ru);
-        assert!(ui.settings_items(&cfg).len() <= 8);
+        assert!(ui.settings_items(&cfg, None).len() <= 9);
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 7;
+        ui.sel[Screen::Settings.slot()] = 8;
         let mut c = ctx(&mut cfg, &[], None);
         ui.update(&nav(|n| n.confirm = true), &mut c, DT);
         assert_eq!(ui.stack.last(), Some(&Screen::Advanced));
@@ -2308,6 +2337,54 @@ mod tests {
         ui.update(&nav(|n| n.up = true), &mut c, DT);
         ui.update(&nav(|n| n.confirm = true), &mut c, DT);
         assert_eq!(ui.stack.last(), Some(&Screen::Field(Field::Server)));
+    }
+
+    #[test]
+    fn ui_settings_buttons_row_toggles() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.stack = vec![Screen::Settings];
+        assert_eq!(ui.settings_items(&cfg, None).len(), 9);
+        assert_eq!(cfg.buttons, ButtonLayout::LeftBottom);
+        let mut c = ctx(&mut cfg, &[], None);
+        for _ in 0..6 {
+            assert_eq!(ui.update(&nav(|n| n.down = true), &mut c, DT), None);
+        }
+        assert_eq!(ui.sel[Screen::Settings.slot()], 6);
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.buttons, ButtonLayout::BottomRight);
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.buttons, ButtonLayout::LeftBottom);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.buttons, ButtonLayout::BottomRight);
+        assert_eq!(ui.lang, Lang::Ru, "the Buttons row leaves the language alone");
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 7);
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(ui.lang, Lang::En);
+        assert_eq!(c.config.buttons, ButtonLayout::BottomRight);
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 8);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
+        assert_eq!(ui.stack.last(), Some(&Screen::Advanced));
+    }
+
+    #[test]
+    fn ui_buttons_value_per_pad_kind() {
+        use ButtonLayout::{BottomRight, LeftBottom};
+        for kind in [None, Some(PadKind::Xbox), Some(PadKind::SteamDeck)] {
+            assert_eq!(Ui::buttons_value(LeftBottom, kind), "X=B A=A");
+            assert_eq!(Ui::buttons_value(BottomRight, kind), "A=B B=A");
+        }
+        assert_eq!(Ui::buttons_value(LeftBottom, Some(PadKind::Nintendo)), "Y=B B=A");
+        assert_eq!(Ui::buttons_value(BottomRight, Some(PadKind::Nintendo)), "B=B A=A");
+        assert_eq!(Ui::buttons_value(LeftBottom, Some(PadKind::PlayStation)), "Sq=B X=A");
+        assert_eq!(Ui::buttons_value(BottomRight, Some(PadKind::PlayStation)), "X=B O=A");
+        for s in [S::DeckKeys, S::DeckKeysFix] {
+            for lang in [Lang::Ru, Lang::En] {
+                assert!(lang.tr(s).chars().count() <= 30, "toasts are cut at 30");
+            }
+        }
     }
 
     #[test]
@@ -2481,7 +2558,7 @@ mod tests {
             ui.stack = vec![screen];
             ui.toast("Геймпад DualSense → игрок 2");
             let mut canvas = Canvas::new();
-            let game = (screen == Screen::Pause).then(|| GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, local_slot: Some(0), stats: Some(&stats), notice: None, desync: false, stalled: false, save_slot: None });
+            let game = (screen == Screen::Pause).then(|| GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice: None, desync: false, stalled: false, save_slot: None });
             if game.is_some() {
                 canvas.clear(rgb(0x5C, 0x94, 0xFC));
             }
@@ -2566,7 +2643,7 @@ mod tests {
         let mut canvas = Canvas::new();
         canvas.clear(rgb(0x5C, 0x94, 0xFC));
         let notice = Some("Ждём Саша... 7 с".to_string());
-        let game = GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, local_slot: Some(0), stats: Some(&stats), notice, desync: false, stalled: true, save_slot: None };
+        let game = GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice, desync: false, stalled: true, save_slot: None };
         let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
         ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
         write_png("/tmp/ebobo-ui-game-wait.png", &canvas.px, 256, 240);
@@ -2743,6 +2820,56 @@ mod tests {
                 }
             }
             write_png(&format!("/tmp/crtwire-settings-{name}.png"), &big, 256 * k, 240 * k);
+        }
+    }
+
+    /// Renders Settings with four pads and the Buttons row selected, in Russian and English
+    /// (`/tmp/padwire-settings-{ru,en}.png`), with a PlayStation pad first
+    /// (`/tmp/padwire-settings-ps-{ru,en}.png`) and the two Deck toasts stacked
+    /// (`/tmp/padwire-toasts-{ru,en}.png`), all at 4x.
+    #[test]
+    #[ignore]
+    fn ui_settings_buttons_snapshots() {
+        let mut font = Font::new();
+        let pad = |name: &str, kind, slot| PadInfo { name: name.into(), kind, slot };
+        let deck_first = [
+            pad("Steam Deck", PadKind::SteamDeck, 0),
+            pad("DualSense Wireless Controller", PadKind::PlayStation, 1),
+            pad("Nintendo Switch Pro Controller", PadKind::Nintendo, 2),
+            pad("Xbox Series X Controller", PadKind::Xbox, 3),
+        ];
+        let ps_first = [
+            pad("DualSense Wireless Controller", PadKind::PlayStation, 0),
+            pad("Steam Deck", PadKind::SteamDeck, 1),
+            pad("Nintendo Switch Pro Controller", PadKind::Nintendo, 2),
+            pad("Xbox Series X Controller", PadKind::Xbox, 3),
+        ];
+        for (lang, name) in [(Lang::Ru, "ru"), (Lang::En, "en")] {
+            for (shot, pads, toasts) in
+                [("settings", &deck_first, false), ("settings-ps", &ps_first, false), ("toasts", &deck_first, true)]
+            {
+                let mut cfg = Config::default();
+                cfg.nickname = "Ваня".into();
+                let mut ui = Ui::new(lang);
+                ui.stack = vec![Screen::Main, Screen::Settings];
+                ui.sel[Screen::Settings.slot()] = 6;
+                if toasts {
+                    ui.toast_secs(ui.text(Text::DeckKeys), 6.0);
+                    ui.toast_secs(ui.text(Text::DeckKeysFix), 6.0);
+                }
+                let c = UiCtx { library: &[], scanning: false, lobby: None, game: None, pads, config: &mut cfg, version: "0.1.0" };
+                let mut canvas = Canvas::new();
+                ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
+                let k = 4;
+                let mut big = vec![0u8; 256 * k * 240 * k * 4];
+                for y in 0..240 * k {
+                    for x in 0..256 * k {
+                        let s = ((y / k) * 256 + x / k) * 4;
+                        big[(y * 256 * k + x) * 4..][..4].copy_from_slice(&canvas.px[s..s + 4]);
+                    }
+                }
+                write_png(&format!("/tmp/padwire-{shot}-{name}.png"), &big, 256 * k, 240 * k);
+            }
         }
     }
 }

@@ -193,7 +193,8 @@ fn glow_for(effect: Effect, mean: f32) -> f32 {
 }
 
 /// Average gain of `mask` × picture + glow on a uniform grey frame.
-pub fn mid_grey_gain(m: &Mask) -> f32 {
+#[cfg(test)]
+fn mid_grey_gain(m: &Mask) -> f32 {
     if m.rgba.is_empty() {
         return 1.0;
     }

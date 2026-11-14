@@ -40,6 +40,8 @@ pub struct Config {
     pub sprite_limit: SpriteLimit,
     /// Check GitHub for a newer ebobo on start and install it (Settings ▸ Advanced).
     pub auto_update: bool,
+    /// Which face buttons of a gamepad are NES B and A.
+    pub buttons: ButtonLayout,
 }
 
 /// "Sprite limit" setting.
@@ -79,6 +81,20 @@ pub enum ScreenMode {
     Pixel,
 }
 
+/// "Buttons" setting: which face buttons of a gamepad are NES B and A. By position, not by
+/// label, so it reads the same on every pad.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ButtonLayout {
+    /// NES B = left button, NES A = bottom button (X and A on Xbox and the Steam Deck, Square
+    /// and Cross on PlayStation); top = turbo B, right = turbo A.
+    #[default]
+    LeftBottom,
+    /// NES B = bottom button, NES A = right button (A and B on Xbox and the Steam Deck, B and A
+    /// on Nintendo pads); left = turbo B, top = turbo A.
+    BottomRight,
+}
+
 impl Default for Config {
     fn default() -> Config {
         Config {
@@ -98,6 +114,7 @@ impl Default for Config {
             ff_toggle: false,
             sprite_limit: SpriteLimit::Auto,
             auto_update: true,
+            buttons: ButtonLayout::LeftBottom,
         }
     }
 }
@@ -288,6 +305,16 @@ mod tests {
         assert_eq!(fit.screen, ScreenMode::Fit);
         let text = toml::to_string_pretty(&Config { screen: ScreenMode::Pixel, ..Config::default() }).unwrap();
         assert!(text.contains("screen = \"pixel\""));
+    }
+
+    #[test]
+    fn buttons_default_and_round_trip() {
+        let old: Config = toml::from_str("fullscreen = true\nscale = 2\n").unwrap();
+        assert_eq!(old.buttons, ButtonLayout::LeftBottom);
+        let classic: Config = toml::from_str("buttons = \"bottom-right\"\n").unwrap();
+        assert_eq!(classic.buttons, ButtonLayout::BottomRight);
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(text.contains("buttons = \"left-bottom\""));
     }
 
     #[test]

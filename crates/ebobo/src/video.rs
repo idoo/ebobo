@@ -415,6 +415,11 @@ impl Video {
         let _ = self.canvas.window_mut().set_title(title);
     }
 
+    /// The window has keyboard focus.
+    pub fn focused(&self) -> bool {
+        self.canvas.window().window_flags() & sdl2::sys::SDL_WindowFlags::SDL_WINDOW_INPUT_FOCUS as u32 != 0
+    }
+
     /// Shows or hides the mouse cursor.
     pub fn set_cursor_visible(&mut self, on: bool) {
         if on != self.cursor {

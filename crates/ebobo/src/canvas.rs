@@ -25,12 +25,6 @@ impl Canvas {
         }
     }
 
-    /// Copies a full RGBA frame (e.g. `Nes::frame_rgba` output).
-    pub fn copy_from(&mut self, rgba: &[u8]) {
-        let n = self.px.len().min(rgba.len());
-        self.px[..n].copy_from_slice(&rgba[..n]);
-    }
-
     /// Darkens everything by `amount` (0.0-1.0), for menus over the game.
     pub fn dim(&mut self, amount: f32) {
         let keep = ((1.0 - amount.clamp(0.0, 1.0)) * 256.0).round() as u32;
@@ -295,7 +289,5 @@ mod tests {
         assert_eq!((at(20, 20), at(23, 22), at(21, 21), at(22, 21)), (9, 9, 0, 0));
         c.dim(0.5);
         assert_eq!(c.px[0], 128);
-        c.copy_from(&vec![7; W * H * 4]);
-        assert!(c.px.iter().all(|&b| b == 7));
     }
 }
