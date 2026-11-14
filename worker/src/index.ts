@@ -2,6 +2,9 @@ import { DurableObject } from "cloudflare:workers";
 
 interface Env {
   ROOM: DurableObjectNamespace<Room>;
+  /** Cloudflare Realtime TURN key (optional secrets; without them `turn` answers `unavailable`). */
+  TURN_KEY_ID?: string;
+  TURN_KEY_API_TOKEN?: string;
 }
 
 type Role = "host" | "guest";
@@ -32,6 +35,8 @@ const MAX_ROOM_MS = 12 * 60 * 60 * 1000;
 const GRACE_MS = 60 * 1000;
 /** Close codes that mean "I am leaving" (everything else is a drop that may come back). */
 const LEAVE_CODES = new Set([1000, 1005]);
+/** TURN credentials issued per room (4 peers plus rejoins); stops one room minting endless relays. */
+const MAX_TURN_PER_ROOM = 16;
 
 function err(status: number, code: string): Response {
   return new Response(JSON.stringify({ error: code }), {
@@ -194,6 +199,10 @@ export class Room extends DurableObject<Env> {
         if (me.role === "host") await this.ctx.storage.put("locked", o.t === "lock");
         return;
       }
+      if (o.t === "turn" && !("to" in o)) {
+        Room.send(ws, JSON.stringify(await this.turnCredentials()));
+        return;
+      }
       const to = o.to;
       if (to !== "*" && typeof to !== "number") return;
       o.from = me.id;
@@ -212,6 +221,40 @@ export class Room extends DurableObject<Env> {
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     if (LEAVE_CODES.has(code)) await this.leave(ws);
     else await this.drop(ws);
+  }
+
+  /** Short-lived Cloudflare TURN credential (UDP URLs only) valid until the room expires. */
+  private async turnCredentials(): Promise<Record<string, unknown>> {
+    const unavailable = { t: "turn", error: "unavailable" };
+    if (!this.env.TURN_KEY_ID || !this.env.TURN_KEY_API_TOKEN) return unavailable;
+    const issued = (await this.ctx.storage.get<number>("turn_issued")) ?? 0;
+    if (issued >= MAX_TURN_PER_ROOM) return unavailable;
+    await this.ctx.storage.put("turn_issued", issued + 1);
+    const created = (await this.ctx.storage.get<number>("created")) ?? Date.now();
+    const ttl = Math.max(600, Math.floor((created + MAX_ROOM_MS - Date.now()) / 1000));
+    try {
+      const res = await fetch(
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${this.env.TURN_KEY_ID}/credentials/generate-ice-servers`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${this.env.TURN_KEY_API_TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ ttl }),
+        },
+      );
+      if (!res.ok) return unavailable;
+      const body = (await res.json()) as { iceServers?: { urls?: string[] | string; username?: string; credential?: string }[] };
+      for (const s of body.iceServers ?? []) {
+        const urls = (Array.isArray(s.urls) ? s.urls : [s.urls ?? ""]).filter(
+          (u) => u.startsWith("turn:") && u.includes("transport=udp") && !u.includes(":53?"),
+        );
+        if (urls.length && s.username && s.credential) {
+          return { t: "turn", urls, username: s.username, credential: s.credential, ttl };
+        }
+      }
+    } catch {
+      /* fall through */
+    }
+    return unavailable;
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {

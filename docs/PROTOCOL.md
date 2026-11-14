@@ -59,6 +59,7 @@ Client → server:
 | any object with `"to": <id>` | forwarded to peer `<id>` with `"from": <sender id>` set by the server (client-supplied `from` is overwritten); dropped if no such peer |
 | any object with `"to": "*"` | same, to every other peer |
 | literal text `ping` | server answers `pong` (auto-response, keeps NAT/proxies alive; clients send every 20 s) |
+| `{"t":"turn"}` | server answers only the sender with a short-lived Cloudflare TURN credential: `{"t":"turn","urls":["turn:turn.cloudflare.com:3478?transport=udp",...],"username":"...","credential":"...","ttl":<s>}`, UDP URLs only, valid until the room expires (at least 600 s). `{"t":"turn","error":"unavailable"}` when the server has no TURN key (secrets `TURN_KEY_ID`/`TURN_KEY_API_TOKEN` unset), the room already got 16 credentials, or Cloudflare refused |
 
 Text frames over 4 KiB are dropped.
 

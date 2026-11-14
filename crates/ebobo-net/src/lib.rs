@@ -17,6 +17,7 @@ pub mod packet;
 mod session;
 mod stun;
 mod transport;
+pub mod turn;
 
 use std::fmt;
 
