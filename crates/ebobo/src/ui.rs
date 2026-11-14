@@ -100,6 +100,9 @@ pub enum Text {
     DeckKeys,
     /// How to switch the Deck to its gamepad layout.
     DeckKeysFix,
+    /// How to open the menu from a game, for a gamepad and for the keyboard.
+    MenuHintPad,
+    MenuHintKeys,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -492,6 +495,8 @@ impl Ui {
             Text::UpdateRerunInstaller => S::UpdateRerunInstaller,
             Text::DeckKeys => S::DeckKeys,
             Text::DeckKeysFix => S::DeckKeysFix,
+            Text::MenuHintPad => S::MenuHintPad,
+            Text::MenuHintKeys => S::MenuHintKeys,
         })
     }
 

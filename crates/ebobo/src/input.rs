@@ -65,8 +65,8 @@ pub struct InputFrame {
     pub backspace: bool,
     /// Cmd+V / Ctrl+V clipboard text.
     pub paste: Option<String>,
-    /// Open/close the menu: Esc, gamepad Guide/PS button, PlayStation touchpad click, or
-    /// Back+Start held for 0.6 s.
+    /// Open/close the menu: Esc, a click of the right stick, gamepad Guide/PS button,
+    /// PlayStation touchpad click, or Back+Start held for 0.6 s.
     pub menu: bool,
     /// 0.0-1.0 progress of the Back+Start hold (for an on-screen hint), 0 when not held.
     pub menu_hold: f32,
@@ -658,6 +658,9 @@ impl Input {
                         Button::Start => f.pad.start = true,
                         Button::Guide => f.menu = true,
                         Button::Touchpad => f.menu = true,
+                        // Free on every pad and never pressed by accident: the left stick
+                        // moves, the right one does nothing.
+                        Button::RightStick => f.menu = true,
                         // Misc1 is Share on Xbox and Capture on Switch pads, but the
                         // microphone mute on a DualSense.
                         Button::Misc1 => {
@@ -1058,6 +1061,19 @@ mod tests {
         press(first, Button::A, true);
         let f = poll(&mut input);
         assert_eq!((f.pads[0], f.seated), (pad::A, 1));
+
+        // The menu: a click of the right stick at once; Back+Start once, after 0.6 s, also
+        // from a pad without a seat, and the game sees neither button meanwhile.
+        press(first, Button::A, false);
+        press(first, Button::RightStick, true);
+        assert!(poll(&mut input).menu);
+        press(first, Button::RightStick, false);
+        press(second, Button::Back, true);
+        press(second, Button::Start, true);
+        let frames: Vec<InputFrame> = (0..60).map(|_| poll(&mut input)).collect();
+        let fired: Vec<usize> = frames.iter().enumerate().filter(|(_, f)| f.menu).map(|(i, _)| i).collect();
+        assert_eq!(fired, [37]);
+        assert!(frames.iter().all(|f| f.pads == [0; 4]));
     }
 
     #[test]

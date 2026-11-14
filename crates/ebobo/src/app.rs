@@ -28,7 +28,7 @@ use crate::audio::Audio;
 use crate::canvas::{self, Canvas, Font};
 use crate::config::{self, Config};
 use crate::i18n::Lang;
-use crate::input::{Input, InputFrame, PadEvent, PadInfo};
+use crate::input::{Input, InputFrame, PadEvent, PadInfo, PointerEvent};
 use crate::library::{self, Library, RomEntry};
 use crate::ui::{GameView, Text, Ui, UiAction, UiCtx};
 use crate::video::Video;
@@ -45,6 +45,8 @@ const STATS_EVERY: u32 = 10;
 const STALL_DIM_AFTER: Duration = Duration::from_millis(500);
 /// A gap this long between two loop iterations in netplay means the machine slept.
 const SLEEP_GAP: Duration = Duration::from_secs(2);
+/// How long the "how to open the menu" notice stays after a game starts.
+const MENU_HINT_SECS: f32 = 5.0;
 /// The mouse cursor hides this long after the mouse last moved.
 const CURSOR_IDLE: Duration = Duration::from_secs(2);
 /// The "Deck buttons type keys" hint stays this long.
@@ -143,6 +145,8 @@ struct App {
     /// Steam Deck Desktop Mode: keeps the Deck's buttons a gamepad while the window has focus.
     steam_input: steam_input::SteamInput,
     keys_hint: steam_input::KeysHint,
+    /// A game just started: say how to open the menu, once the last-used device is known.
+    menu_hint: bool,
 }
 
 /// Runs the app; returns the process exit code.
@@ -301,6 +305,7 @@ impl App {
             mouse_at: None,
             steam_input: steam_input::SteamInput::new(config::is_steam_deck()),
             keys_hint: steam_input::KeysHint::default(),
+            menu_hint: false,
         })
     }
 
@@ -352,6 +357,10 @@ impl App {
         let video = &self.video;
         let frame = self.input.poll(&mut self.pump, dt, |pos| video.to_canvas(pos));
         self.ui.tick(&frame, dt);
+        if std::mem::take(&mut self.menu_hint) && self.in_game() {
+            let hint = if frame.hint_kind.is_some() { Text::MenuHintPad } else { Text::MenuHintKeys };
+            self.ui.toast_secs(self.ui.text(hint), MENU_HINT_SECS);
+        }
         if dt > SLEEP_GAP && matches!(self.state, State::Net(_)) {
             // Sleep/suspend: GGRS resyncs or times peers out by itself; the frame debt cap in
             // `next_deadline` prevents a catch-up burst.
@@ -407,9 +416,11 @@ impl App {
             }
         }
 
-        // Menu toggle over a running game.
+        // Menu toggle over a running game. A tap or a click on the game opens it too: in Game
+        // Mode gamescope turns the Deck's touchscreen into mouse clicks.
         let mut menu_opened = false;
-        if self.in_game() && frame.menu {
+        let tapped = !self.ui.is_visible() && frame.pointer.iter().any(|e| matches!(e, PointerEvent::Up(_)));
+        if self.in_game() && (frame.menu || tapped) {
             if !self.ui.is_visible() {
                 self.ui.show_pause();
                 menu_opened = true;
@@ -762,6 +773,7 @@ impl App {
         self.pads = self.input.pads();
         self.state = State::Solo(Box::new(solo));
         self.ui.hide();
+        self.menu_hint = true;
         self.video.power_on();
     }
 
@@ -843,6 +855,7 @@ impl App {
             last_advance: Instant::now(),
         }));
         self.ui.hide();
+        self.menu_hint = true;
         self.video.power_on();
     }
 
