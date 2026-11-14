@@ -773,8 +773,9 @@ impl Ui {
             h.extend(k.key_rects().map(|(i, r)| (Area { x: r.x, y: r.y, w: r.w, h: r.h }, Hit::Osk(i))));
         }
         if let Some(modal) = &self.modal {
-            // Only the modal takes taps while it is open.
+            // Only the modal takes taps while it is open, and only it reads at full strength.
             h.clear();
+            canvas.dim(0.55);
             self.draw_modal(canvas, font, modal, &mut h);
         }
         // The keyboard covers the hint bar (its keys say the same) and the toast line.
