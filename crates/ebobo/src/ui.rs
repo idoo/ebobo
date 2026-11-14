@@ -2063,7 +2063,7 @@ impl Ui {
 /// 4x7 triangle pointing left or right with its box at (x, y).
 fn tri(c: &mut Canvas, x: i32, y: i32, col: Color, right: bool) {
     for k in 0..4 {
-        let cx = if right { x + 3 - k } else { x + k };
+        let cx = if right { x + k } else { x + 3 - k };
         c.fill_rect(cx, y + k, 1, 7 - 2 * k, col);
     }
 }
