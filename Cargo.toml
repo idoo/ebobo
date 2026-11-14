@@ -4,7 +4,7 @@ members = ["crates/ebobo-core", "crates/ebobo-net", "crates/ebobo"]
 exclude = ["vendor/ggrs"]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 license = "MIT"
 
