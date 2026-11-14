@@ -18,8 +18,12 @@ if [ -z "${ALLOW_DIRTY:-}" ] && [ -n "$(git status --porcelain --untracked-files
     echo "commit your changes first (or ALLOW_DIRTY=1 to release HEAD anyway)" >&2; exit 1
 fi
 
+# Another clone may have pushed meanwhile (air-ci, a second session): stop before tagging, or
+# the tag lands on a commit main never gets. --atomic: the tag is pushed only with main.
+git -c credential.helper='!gh auth git-credential' fetch -q origin main
+git merge-base --is-ancestor FETCH_HEAD HEAD || { echo "origin/main is ahead: git pull --rebase, then release again" >&2; exit 1; }
 git tag -a "$tag" -m "ebobo $version" 2>/dev/null || echo "tag $tag exists, reusing"
-git -c credential.helper='!gh auth git-credential' push -q origin main "$tag"
+git -c credential.helper='!gh auth git-credential' push -q --atomic origin main "$tag"
 
 src="$(mktemp -d)"
 trap 'rm -rf "$src"' EXIT
