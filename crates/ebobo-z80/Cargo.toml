@@ -7,3 +7,6 @@ description = "Zilog Z80 CPU core"
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
+
+[dev-dependencies]
+serde_json = "1"
