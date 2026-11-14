@@ -216,13 +216,19 @@ impl Nes {
     /// region, then the bincode of the CPU and [`Snapshot`] bus state. ROM bytes are not
     /// included; load it into a `Nes` running the same ROM.
     pub fn save_state(&self) -> Vec<u8> {
+        self.encode_state(&self.snapshot())
+    }
+
+    /// The [`Nes::save_state`] bytes this machine would give if it were in `snapshot` (a
+    /// snapshot of this machine): netplay writes a state it took at an earlier, confirmed frame.
+    pub fn encode_state(&self, snapshot: &Snapshot) -> Vec<u8> {
         let mut out = Vec::with_capacity(16 * 1024);
         out.extend_from_slice(STATE_MAGIC);
         out.extend_from_slice(&STATE_VERSION.to_le_bytes());
         out.extend_from_slice(&self.info.crc32.to_le_bytes());
         out.push(region_byte(self.info.region));
         state_options()
-            .serialize_into(&mut out, &(&self.cpu, self.bus.state()))
+            .serialize_into(&mut out, &(&snapshot.cpu, &snapshot.bus))
             .expect("in-memory state serialization cannot fail");
         out
     }
@@ -367,5 +373,43 @@ impl Hasher for StateHasher {
 
     fn finish(&self) -> u64 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 16 KiB NROM image whose program counts frames-worth of work into RAM forever:
+    /// `INC $10; BNE loop; INC $11; JMP loop`, interrupts return at once.
+    fn counting_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 16 + 0x4000 + 0x2000];
+        rom[..8].copy_from_slice(&[b'N', b'E', b'S', 0x1A, 1, 1, 0, 0]);
+        let prg = &mut rom[16..16 + 0x4000];
+        prg[..10].copy_from_slice(&[0xE6, 0x10, 0xD0, 0xFC, 0xE6, 0x11, 0x4C, 0x00, 0x80, 0x40]);
+        prg[0x3FFA..].copy_from_slice(&[0x09, 0x80, 0x00, 0x80, 0x09, 0x80]);
+        rom
+    }
+
+    #[test]
+    fn encode_state_round_trips_an_earlier_snapshot() {
+        let rom = counting_rom();
+        let mut nes = Nes::new(&rom, None).unwrap();
+        for _ in 0..7 {
+            nes.run_frame([0; 4]);
+        }
+        let snapshot = nes.snapshot();
+        let hash_then = nes.state_hash();
+        assert_eq!(nes.encode_state(&snapshot), nes.save_state(), "same state, same bytes");
+        for _ in 0..5 {
+            nes.run_frame([0x01, 0, 0, 0]);
+        }
+        assert_ne!(nes.state_hash(), hash_then, "the machine moved on");
+        let bytes = nes.encode_state(&snapshot);
+        assert_ne!(bytes, nes.save_state());
+
+        let mut other = Nes::new(&rom, None).unwrap();
+        other.load_state(&bytes).unwrap();
+        assert_eq!(other.state_hash(), hash_then);
     }
 }

@@ -268,7 +268,7 @@ fn run_lossy(n: usize, seed: u64, probe: i32, timeout: Duration, shuffle_delay: 
     let mut sessions: Vec<NetSession> = transports
         .into_iter()
         .map(|t| {
-            let mut s = NetSession::new(t, &slots, 2, false, 60).expect("session");
+            let mut s = NetSession::new(t, &slots, 2, false, 60, None).expect("session");
             s.probe = (probe, None);
             s
         })
@@ -283,7 +283,8 @@ fn run_lossy(n: usize, seed: u64, probe: i32, timeout: Duration, shuffle_delay: 
     let started = Instant::now();
     let deadline = started + timeout;
     loop {
-        let done = advanced.iter().all(|&a| a as i32 >= probe)
+        // Past the probe: the state of frame `probe` is saved by the call that simulates it.
+        let done = advanced.iter().all(|&a| a as i32 > probe)
             && sessions.iter().all(|s| s.ggrs.confirmed_frame() > probe);
         if done {
             break;
@@ -367,14 +368,20 @@ fn session_lossy_soak_4p() {
     run_lossy(4, 0x50A4_50A4, 5000, Duration::from_secs(600), false);
 }
 
+/// The predictor repeats held pad and turbo bits but never a one-frame bit: a repeated save or
+/// load would save or load again on every predicted frame until the real input arrives.
 #[test]
-fn predictor_repeats_held_and_turbo_not_reset() {
+fn predictor_repeats_held_and_turbo_not_one_frame_bits() {
     use ggrs::InputPredictor;
     let held = ebobo_core::pad::A as u16 | ebobo_core::pad::START as u16 | INPUT_TURBO_A | INPUT_TURBO_B;
     assert_eq!(PredictHeld::predict(held), held);
-    assert_eq!(PredictHeld::predict(held | INPUT_RESET), held);
-    assert_eq!(PredictHeld::predict(INPUT_RESET), 0);
+    for bit in [INPUT_RESET, INPUT_SAVE, INPUT_LOAD] {
+        assert_eq!(PredictHeld::predict(held | bit), held, "bit {bit:#x}");
+        assert_eq!(PredictHeld::predict(bit), 0, "bit {bit:#x}");
+    }
+    assert_eq!(PredictHeld::predict(held | INPUT_RESET | INPUT_SAVE | INPUT_LOAD), held);
     assert_eq!(PredictHeld::predict(0), 0);
+    assert_eq!(PredictHeld::predict(u16::MAX), u16::MAX & !(INPUT_RESET | INPUT_SAVE | INPUT_LOAD));
 }
 
 #[test]
@@ -705,8 +712,8 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// Bad-network matrix: profiles × 2/4 peers × input delay 1-6 × max prediction 8/10/12, paced
-/// at 60 fps. Prints stalls, rollback depth, desyncs and Interrupted/Disconnected counts.
+/// Bad-network matrix: profiles × 2/4 peers × input delay 1-6 × max prediction 8/10/12/16/20,
+/// paced at 60 fps. Prints stalls, rollback depth, desyncs and Interrupted/Disconnected counts.
 /// `cargo test --release -p ebobo-net session_profile -- --ignored --nocapture`
 /// (`EBOBO_PROFILE_SECS`, default 10, run length; `EBOBO_PROFILE_JOBS`, default 8, parallel runs).
 #[test]
@@ -721,7 +728,7 @@ fn session_profile_matrix() {
     for profile in Profile::MEASURED {
         for n in [2, 4] {
             for delay in 1..=6 {
-                for pred in [8, 10, 12] {
+                for pred in [8, 10, 12, 16, 20] {
                     jobs.push((profile, n, delay, pred));
                 }
             }
@@ -808,7 +815,7 @@ fn session_netcode_gains() {
                 let Some((idx, (profile, n, delay, how))) = queue.lock().unwrap().pop() else { return };
                 // Both runs of a pair see the same network.
                 let seed = 0x6A1A_0000 + (idx as u64 / 2) * 0x1_0001;
-                let st = run_paced(profile, n, delay, MAX_PREDICTION, secs, seed, how).expect("ROMs present");
+                let st = run_paced(profile, n, delay, max_prediction(n), secs, seed, how).expect("ROMs present");
                 results.lock().unwrap().push((idx, st));
             })
         })
@@ -966,4 +973,507 @@ fn session_peer_leaving_caught_up_keeps_playing() {
     for _ in 0..30 {
         assert!(sa.advance(&mut na, 1).unwrap().advanced);
     }
+}
+
+/// Drives both for `frames` more frames on each and returns the `Saved` events of each.
+fn saved_events(sa: &mut NetSession, sb: &mut NetSession, na: &mut Nes, nb: &mut Nes, frames: u32) -> [Vec<NetEvent>; 2] {
+    let (mut fa, mut fb) = (0, 0);
+    let mut saved = [Vec::new(), Vec::new()];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while fa < frames || fb < frames {
+        assert!(Instant::now() < deadline, "timed out");
+        fa += sa.advance(na, 1).unwrap().advanced as u32;
+        fb += sb.advance(nb, 2).unwrap().advanced as u32;
+        for (s, out) in [&mut *sa, &mut *sb].into_iter().zip(&mut saved) {
+            out.extend(s.events().into_iter().filter(|e| matches!(e, NetEvent::Saved { .. })));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    saved
+}
+
+/// A save pressed on the frame right after the input delay fell: GGRS drops that frame's input
+/// (it would land on a frame that already has one), and the save went with it.
+#[test]
+fn session_one_frame_bit_survives_a_delay_drop() {
+    let (mut sa, mut sb) = direct_pair();
+    let Some(mut na) = nes() else { return };
+    let mut nb = nes().unwrap();
+    warm_up(&mut sa, &mut sb, &mut na, &mut nb, 60);
+    sa.force_delay = Some(1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sa.force_delay.is_some() {
+        assert!(Instant::now() < deadline, "the delay never changed");
+        let _ = sa.advance(&mut na, 1).unwrap();
+        let _ = sb.advance(&mut nb, 2).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let _ = sa.advance(&mut na, 1 | INPUT_SAVE).unwrap();
+    let saved = saved_events(&mut sa, &mut sb, &mut na, &mut nb, 120);
+    assert_eq!(saved, [vec![NetEvent::Saved { slot: 0 }], vec![NetEvent::Saved { slot: 0 }]]);
+}
+
+/// A save pressed while the session waits at the prediction window: GGRS already holds an
+/// input for that frame and ignores the repeat, and the save went with it.
+#[test]
+fn session_one_frame_bit_survives_a_stall() {
+    let (mut sa, mut sb) = direct_pair();
+    let Some(mut na) = nes() else { return };
+    let mut nb = nes().unwrap();
+    warm_up(&mut sa, &mut sb, &mut na, &mut nb, 60);
+    // `sb` goes quiet (well under the disconnect notice) until `sa` cannot advance.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while sa.advance(&mut na, 1).unwrap().advanced {
+        assert!(Instant::now() < deadline, "sa never reached the prediction window");
+    }
+    assert!(!sa.advance(&mut na, 1 | INPUT_SAVE).unwrap().advanced);
+    let saved = saved_events(&mut sa, &mut sb, &mut na, &mut nb, 120);
+    assert_eq!(saved, [vec![NetEvent::Saved { slot: 0 }], vec![NetEvent::Saved { slot: 0 }]]);
+}
+
+/// Input delay of the save/load runs. GGRS keeps the input of an `advance` that hits the
+/// prediction window and drops the repeat on the next call, so a bit sent once, on a call made
+/// at GGRS frame `k`, lands on frame `k + SAVE_DELAY`.
+const SAVE_DELAY: usize = 2;
+
+/// A one-frame bit `peer` sends once, on its first `advance` at GGRS frame `after`; it lands on
+/// frame `after + SAVE_DELAY`.
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    peer: usize,
+    after: u32,
+    bits: u16,
+}
+
+impl Press {
+    fn frame(self) -> i32 {
+        (self.after as usize + SAVE_DELAY) as i32
+    }
+}
+
+/// The frame procedure of `NetSession::advance`, run on a plain `Nes` without a network over the
+/// final input words of every frame.
+struct Reference {
+    events: Vec<NetEvent>,
+    /// State hash of every save, in frame order.
+    saved: Vec<u64>,
+    /// State hash of the checkpoints at frames 300, 600, ...
+    checkpoints: Vec<u64>,
+    /// State hash at the start of every frame, before its procedure.
+    at_start: Vec<u64>,
+}
+
+fn reference(log: &[[u16; 4]], start: Option<&ebobo_core::Snapshot>) -> Reference {
+    let mut nes = nes().expect("ROMs present");
+    if let Some(s) = start {
+        nes.restore(s);
+    }
+    let mut save = start.cloned();
+    let mut r = Reference { events: Vec::new(), saved: Vec::new(), checkpoints: Vec::new(), at_start: Vec::new() };
+    for (frame, words) in log.iter().enumerate() {
+        let frame = frame as i32;
+        r.at_start.push(nes.state_hash());
+        let lowest = |bit: u16| words.iter().position(|w| w & bit != 0);
+        // The save a load of this frame finds: the one before a save of this same frame.
+        let mut before = None;
+        if let Some(slot) = lowest(INPUT_SAVE) {
+            r.events.push(NetEvent::Saved { slot });
+            r.saved.push(nes.state_hash());
+            before = Some(save.replace(nes.snapshot()));
+        }
+        if frame > 0 && frame % 300 == 0 {
+            r.checkpoints.push(nes.state_hash());
+        }
+        if let Some(slot) = lowest(INPUT_LOAD) {
+            if let Some(s) = before.as_ref().unwrap_or(&save) {
+                nes.restore(s);
+                r.events.push(NetEvent::Loaded { slot });
+            }
+        }
+        if words.iter().any(|w| w & INPUT_RESET != 0) {
+            nes.reset();
+        }
+        nes.run_frame(std::array::from_fn(|i| expand_turbo(words[i], frame)));
+    }
+    r
+}
+
+fn state_hash_of(snapshot: &ebobo_core::Snapshot) -> u64 {
+    let mut scratch = nes().expect("ROMs present");
+    scratch.restore(snapshot);
+    scratch.state_hash()
+}
+
+/// What `run_saves` saw; every peer agreed on it.
+struct SaveRun {
+    /// Final input words of every frame up to the last frame final on every peer.
+    log: Vec<[u16; 4]>,
+    reference: Reference,
+    /// Frames re-simulated by all peers together.
+    rollback_frames: u64,
+    /// State hash at the start of `probe`.
+    probe_hash: u64,
+}
+
+/// Runs `n` peers on `profile`, each advancing at most once per 60 fps tick like the frontend,
+/// with random input on every frame (most late remote frames mispredict, so save and load frames
+/// get re-simulated) plus the one-frame `presses`, until every peer has `probe` and every pressed
+/// frame final. `start`: the shared save every peer loaded before the first frame. `observe` sees
+/// every peer after each `advance`.
+///
+/// Asserts no desync, equal final inputs on every peer, the pressed bits on their frames, and
+/// against `reference` over those inputs: every peer's `Saved`/`Loaded` sequence, the state of
+/// every `take_saved` and `take_checkpoint` snapshot, and the state at `probe`.
+fn run_saves(
+    n: usize,
+    profile: Profile,
+    seed: u64,
+    presses: &[Press],
+    probe: i32,
+    start: Option<&ebobo_core::Snapshot>,
+    observe: &mut dyn FnMut(usize, &NetSession),
+) -> Option<SaveRun> {
+    let first = nes()?;
+    let (transports, _proxy) = lossy_mesh(n, seed, profile);
+    let slots: Vec<PeerId> = (0..n as u8).map(PeerId).collect();
+    let mut sessions: Vec<NetSession> = transports
+        .into_iter()
+        .map(|t| {
+            let mut s = NetSession::new(t, &slots, SAVE_DELAY, false, 60, start.cloned()).expect("session");
+            s.probe = (probe, None);
+            s
+        })
+        .collect();
+    let mut emus: Vec<Nes> = std::iter::once(first).chain((1..n).map(|_| nes().unwrap())).collect();
+    if let Some(s) = start {
+        emus.iter_mut().for_each(|e| e.restore(s));
+    }
+    let mut rngs: Vec<XorShift> = (0..n).map(|i| XorShift(seed ^ (0x9E37_79B9 * (i as u64 + 1)))).collect();
+    // Per peer, latest first so `pop` gives the next one.
+    let mut queues: Vec<Vec<Press>> = (0..n)
+        .map(|i| {
+            let mut q: Vec<Press> = presses.iter().filter(|p| p.peer == i).copied().collect();
+            q.sort_by_key(|p| std::cmp::Reverse(p.after));
+            q
+        })
+        .collect();
+    let until = presses.iter().map(|p| p.frame()).fold(probe, i32::max);
+    let mut advanced = vec![0u32; n];
+    let mut rollback_frames = 0u64;
+    let mut events = vec![Vec::new(); n];
+    let mut saved = vec![Vec::new(); n];
+    let mut checkpoints = vec![Vec::new(); n];
+    let mut desyncs = Vec::new();
+    let period = Duration::from_secs_f64(1.0 / 60.0);
+    let mut next = vec![Instant::now(); n];
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !sessions.iter().all(|s| s.final_through >= until) {
+        let finals: Vec<i32> = sessions.iter().map(|s| s.final_through).collect();
+        let now = Instant::now();
+        assert!(now < deadline, "timed out: advanced {advanced:?}, final through {finals:?}");
+        for i in 0..n {
+            let s = &mut sessions[i];
+            s.poll();
+            if s.is_running() {
+                if now < next[i] {
+                    continue;
+                }
+                // Frame debt above 3 ticks is dropped, as the frontend does.
+                next[i] = if now.saturating_duration_since(next[i]) > period * 3 { now + period } else { next[i] + period };
+            }
+            let mut input = (rngs[i].next() & RANDOM_INPUT) as u16;
+            // Only a running session takes the input; it lands `SAVE_DELAY` after the current frame.
+            while s.is_running() && queues[i].last().is_some_and(|p| s.ggrs.current_frame() >= p.after as i32) {
+                input |= queues[i].pop().unwrap().bits;
+            }
+            let out = s.advance(&mut emus[i], input).expect("advance");
+            advanced[i] += out.advanced as u32;
+            rollback_frames += out.rollback_frames as u64;
+            if let Some(snap) = s.take_saved() {
+                saved[i].push(state_hash_of(&snap));
+            }
+            if let Some(snap) = s.take_checkpoint() {
+                checkpoints[i].push(state_hash_of(&snap));
+            }
+            observe(i, s);
+            for e in s.events() {
+                match e {
+                    NetEvent::Saved { .. } | NetEvent::Loaded { .. } => events[i].push(e),
+                    NetEvent::Desync { frame } => desyncs.push((i, frame)),
+                    _ => {}
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_micros(500));
+    }
+    assert!(desyncs.is_empty(), "desync events: {desyncs:?}");
+    let cut = sessions.iter().map(|s| s.final_through).min().unwrap() as usize + 1;
+    let log = sessions[0].input_log[..cut].to_vec();
+    for (i, s) in sessions.iter().enumerate() {
+        assert!(s.input_log[..cut] == log[..], "peer {i} simulated other final inputs");
+    }
+    for p in presses {
+        let word = log[p.frame() as usize][p.peer];
+        assert_eq!(word & p.bits, p.bits, "{p:?} is not on frame {}: {word:#x}", p.frame());
+    }
+    let r = reference(&log, start);
+    let probe_hash = r.at_start[probe as usize];
+    for i in 0..n {
+        assert_eq!(events[i], r.events, "peer {i} events");
+        assert_eq!(saved[i], r.saved, "peer {i} saved states");
+        // A peer may have one more final checkpoint past the common cut.
+        assert!(checkpoints[i].len() >= r.checkpoints.len(), "peer {i}: {} checkpoints", checkpoints[i].len());
+        assert_eq!(checkpoints[i][..r.checkpoints.len()], r.checkpoints[..], "peer {i} checkpoints");
+        assert_eq!(sessions[i].probe.1, Some(probe_hash), "peer {i} state at frame {probe}");
+    }
+    Some(SaveRun { log, reference: r, rollback_frames, probe_hash })
+}
+
+fn press(peer: usize, after: u32, bits: u16) -> Press {
+    Press { peer, after, bits }
+}
+
+/// Both peers save and load at different frames on a lossy, jittery link with input that
+/// mispredicts nearly every late frame: both report the same saves and loads, hand out the same
+/// saved and checkpoint states, and every one of them, and the state after the loads, is what a
+/// plain `Nes` replaying the final inputs with the same frame procedure has. A snapshot handed out
+/// before the rollback that corrected its frame would differ from the reference. The load on
+/// frame 32 finds no save and does nothing.
+#[test]
+fn session_saves_and_loads_match_reference_on_lossy_link_2p() {
+    let presses = [
+        press(0, 30, INPUT_LOAD),
+        press(0, 100, INPUT_SAVE),
+        press(1, 250, INPUT_LOAD),
+        press(1, 400, INPUT_SAVE),
+        press(0, 520, INPUT_LOAD),
+    ];
+    let Some(run) = run_saves(2, Profile::Lossy, 0x5A7E_0002, &presses, 700, None, &mut |_, _| {}) else { return };
+    use NetEvent::{Loaded, Saved};
+    assert_eq!(run.reference.events, [Saved { slot: 0 }, Loaded { slot: 1 }, Saved { slot: 1 }, Loaded { slot: 0 }]);
+    assert_eq!(run.reference.checkpoints.len(), 2, "checkpoints at 300 and 600");
+    assert!(run.rollback_frames > 100, "the link caused only {} re-simulated frames", run.rollback_frames);
+    println!("lossy 2p: {} frames final, {} rollback frames, probe {:x}", run.log.len(), run.rollback_frames, run.probe_hash);
+}
+
+/// A load two frames after the other player's save, 150 ms away: the loading peer first
+/// simulates its load before the save's input arrived (no save yet: nothing to load), and the
+/// rollback must re-run both so the load restores that save. Then a save and a load on the same
+/// frame by different players: the save keeps the state the frame starts with, the load restores
+/// the save before it, and a later load restores the new save.
+#[test]
+fn session_load_inside_save_rollback_window_and_same_frame_save_load() {
+    let presses = [
+        press(0, 100, INPUT_SAVE),
+        press(1, 102, INPUT_LOAD),
+        press(0, 300, INPUT_SAVE),
+        press(1, 300, INPUT_LOAD),
+        press(0, 400, INPUT_LOAD),
+    ];
+    // Peer 1's `has_save` when it first simulated past its load on frame 104.
+    let mut blind = None;
+    let mut observe = |i: usize, s: &NetSession| {
+        if i == 1 && s.sim_frame > 104 && blind.is_none() {
+            blind = Some(!s.has_save());
+        }
+    };
+    let Some(run) = run_saves(2, Profile::Far, 0x5A7E_0003, &presses, 520, None, &mut observe) else { return };
+    use NetEvent::{Loaded, Saved};
+    assert_eq!(
+        run.reference.events,
+        [Saved { slot: 0 }, Loaded { slot: 1 }, Saved { slot: 0 }, Loaded { slot: 1 }, Loaded { slot: 0 }]
+    );
+    assert_eq!(blind, Some(true), "peer 1 knew of the save before simulating its load: no rollback tested");
+    let log = &run.log;
+    assert_eq!(log[302][0] & INPUT_SAVE, INPUT_SAVE);
+    assert_eq!(log[302][1] & INPUT_LOAD, INPUT_LOAD);
+    // Independent of `reference`: the load on 302 restores the save of 102, so the next frame
+    // starts with frame 102's state run with frame 302's pads.
+    let mut nes = nes().unwrap();
+    for (f, words) in log[..=102].iter().enumerate() {
+        if f == 102 {
+            assert_eq!(nes.state_hash(), run.reference.saved[0]);
+        } else {
+            nes.run_frame(std::array::from_fn(|i| expand_turbo(words[i], f as i32)));
+        }
+    }
+    let after_102 = nes.snapshot();
+    nes.run_frame(std::array::from_fn(|i| expand_turbo(log[302][i], 302)));
+    assert_eq!(nes.state_hash(), run.reference.at_start[303], "the load on 302 did not restore the save of 102");
+    // And the load on 104 restored the same save.
+    nes.restore(&after_102);
+    nes.run_frame(std::array::from_fn(|i| expand_turbo(log[104][i], 104)));
+    assert_eq!(nes.state_hash(), run.reference.at_start[105], "the load on 104 did not restore the save of 102");
+}
+
+/// A game continued from a save: `has_save` is true from the first moment, and a load before any
+/// save restores the start state on both peers.
+#[test]
+fn session_start_save_is_loaded_before_any_save() {
+    let Some(mut nes) = nes() else { return };
+    for f in 0..200u32 {
+        nes.run_frame([(f * 7) as u8, (f * 13) as u8, 0, 0]);
+    }
+    let start = nes.snapshot();
+    let presses = [press(1, 60, INPUT_LOAD), press(0, 200, INPUT_SAVE)];
+    let mut always = true;
+    let Some(run) = run_saves(2, Profile::Lossy, 0x5A7E_0004, &presses, 63, Some(&start), &mut |_, s: &NetSession| {
+        always &= s.has_save()
+    }) else {
+        return;
+    };
+    use NetEvent::{Loaded, Saved};
+    assert_eq!(run.reference.events, [Loaded { slot: 1 }, Saved { slot: 0 }]);
+    assert!(always, "has_save was false in a game started from a save");
+    // Independent of `reference`: frame 63 starts with the start state run with frame 62's pads.
+    nes.restore(&start);
+    nes.run_frame(std::array::from_fn(|i| expand_turbo(run.log[62][i], 62)));
+    assert_eq!(nes.state_hash(), run.probe_hash, "the load on 62 did not restore the start save");
+}
+
+/// A game from power-on: `has_save` stays false until a save exists, a load before it does
+/// nothing and reports nothing, and it is true once the save is final.
+#[test]
+fn session_power_on_has_no_save_until_the_first() {
+    let presses = [press(1, 40, INPUT_LOAD), press(0, 150, INPUT_SAVE)];
+    let save_frame = presses[1].frame();
+    let mut bad = Vec::new();
+    let mut observe = |i: usize, s: &NetSession| {
+        let has = s.has_save();
+        // A save only exists once its frame was simulated; once final it never goes away.
+        if (has && s.sim_frame <= save_frame) || (!has && s.final_through >= save_frame) {
+            bad.push((i, s.sim_frame, s.final_through, has));
+        }
+    };
+    let Some(run) = run_saves(2, Profile::Lossy, 0x5A7E_0005, &presses, 250, None, &mut observe) else { return };
+    assert_eq!(run.reference.events, [NetEvent::Saved { slot: 0 }]);
+    assert!(bad.is_empty(), "has_save wrong at (peer, sim frame, final through, has): {bad:?}");
+}
+
+/// Four peers on the lossy link: player 3 saves, player 4 loads; all four agree with the
+/// reference.
+#[test]
+fn session_saves_and_loads_match_reference_4p() {
+    let presses = [press(2, 150, INPUT_SAVE), press(3, 260, INPUT_LOAD)];
+    let Some(run) = run_saves(4, Profile::Lossy, 0x5A7E_0006, &presses, 400, None, &mut |_, _| {}) else { return };
+    assert_eq!(run.reference.events, [NetEvent::Saved { slot: 2 }, NetEvent::Loaded { slot: 3 }]);
+}
+
+/// What the two remaining peers of `run_uneven_leaver` saw.
+struct LeaverRun {
+    sessions: Vec<NetSession>,
+    /// Hash of the newest `take_saved` snapshot of peers 0 and 1.
+    saves: Vec<Option<u64>>,
+    /// `Saved`/`Loaded` events of peers 0 and 1.
+    events: Vec<Vec<NetEvent>>,
+    /// `(peer, frame)` of every `Desync` event of peers 0 and 1.
+    desyncs: Vec<(usize, i32)>,
+}
+
+/// Three peers on the `Shift` link; player 3 leaves after the two others received different
+/// amounts of its input. Peer 1 (input delay 8) stops polling at frame 200, holding the leaver's
+/// input to about 202 while it already sent its own to 208, so peer 0 receives more of the
+/// leaver's input than peer 1 reports to hold. After 500 ms both drop the leaver (driven through
+/// `disconnect_player` directly; the emulated network has no one-way cut), and GGRS moves peer
+/// 0's disconnect down to peer 1's frame and re-simulates from there. Runs until both finalized
+/// frame 262; the state at frame 260 is in `probe`. With `save_load`, player 1 saves on 205 and
+/// loads on 242: the save lies between the frames the two peers hold of the leaver.
+fn run_uneven_leaver(seed: u64, save_load: bool) -> Option<LeaverRun> {
+    let first = nes()?;
+    let (transports, _proxy) = lossy_mesh(3, seed, Profile::Shift);
+    let slots: Vec<PeerId> = (0..3u8).map(PeerId).collect();
+    let mut sessions: Vec<NetSession> = transports
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut s = NetSession::new(t, &slots, if i == 1 { 8 } else { 2 }, false, 60, None).expect("session");
+            s.probe = (260, None);
+            s
+        })
+        .collect();
+    let mut emus: Vec<Nes> = std::iter::once(first).chain((1..3).map(|_| nes().unwrap())).collect();
+    let mut rngs: Vec<XorShift> = (0..3).map(|i| XorShift(0x1EA7 ^ (0x9E37_79B9 * (i as u64 + 1)))).collect();
+    let (mut saves, mut events, mut desyncs) = (vec![None; 2], vec![Vec::new(); 2], Vec::new());
+    let (mut paused_at, mut dropped) = (None::<Instant>, false);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !(dropped && sessions[..2].iter().all(|s| s.final_through >= 262)) {
+        assert!(Instant::now() < deadline, "timed out: final {:?}", sessions.iter().map(|s| s.final_through).collect::<Vec<_>>());
+        if paused_at.is_none() && sessions[1].ggrs.current_frame() >= 200 {
+            paused_at = Some(Instant::now());
+        }
+        let paused = paused_at.is_some() && !dropped;
+        if paused && paused_at.unwrap().elapsed() > Duration::from_millis(500) {
+            // The leaver vanishes; each remaining peer drops it at the input it has.
+            for s in &mut sessions[..2] {
+                s.ggrs.disconnect_player(2).expect("disconnect");
+                s.gone[2] = true;
+            }
+            dropped = true;
+            continue;
+        }
+        for i in 0..3 {
+            if (i == 1 && paused) || (i == 2 && dropped) {
+                continue;
+            }
+            let s = &mut sessions[i];
+            s.poll();
+            let mut input = (rngs[i].next() & RANDOM_INPUT) as u16;
+            let f = s.ggrs.current_frame();
+            if save_load && s.is_running() && i == 0 && s.input_log.len() <= 205 && f == 203 {
+                input |= INPUT_SAVE;
+            }
+            if save_load && s.is_running() && i == 0 && f == 240 && s.input_log.len() <= 242 {
+                input |= INPUT_LOAD;
+            }
+            s.advance(&mut emus[i], input).expect("advance");
+            if i < 2 {
+                if let Some(snap) = s.take_saved() {
+                    saves[i] = Some(state_hash_of(&snap));
+                }
+                for e in s.events() {
+                    match e {
+                        NetEvent::Saved { .. } | NetEvent::Loaded { .. } => events[i].push(e),
+                        NetEvent::Desync { frame } => desyncs.push((i, frame)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Some(LeaverRun { sessions, saves, events, desyncs })
+}
+
+/// A player leaving after the two others received different amounts of its input crashes
+/// neither of them and leaves both in the same state, without a desync. GGRS `25bd998` panicked
+/// here (`input_queue.rs:140`, or `sync_layer.rs:238` with a wider gap): peer 0 had confirmed,
+/// and discarded, inputs above the frame peer 1's disconnect moved it back to.
+#[test]
+fn session_leaver_with_uneven_input_keeps_others_in_step() {
+    let Some(run) = run_uneven_leaver(0x1EA7_0004, false) else { return };
+    let (a, b) = (&run.sessions[0], &run.sessions[1]);
+    assert!(run.desyncs.is_empty(), "desync events: {:?}", run.desyncs);
+    assert!(a.probe.1.is_some() && a.probe.1 == b.probe.1, "states at 260 differ: {:x?} / {:x?}", a.probe.1, b.probe.1);
+    assert!(run.events.iter().all(Vec::is_empty), "save events without saves: {:?}", run.events);
+}
+
+/// The same leaver with a save between the frames the two peers hold of its input and a load
+/// after: neither crashes, both end with the same shared save, one `Saved` and one `Loaded`
+/// each, the same state after the load and no desync.
+#[test]
+fn session_leaver_with_uneven_input_keeps_shared_save_in_step() {
+    let Some(run) = run_uneven_leaver(0x1EA7_0003, true) else { return };
+    let (a, b) = (&run.sessions[0], &run.sessions[1]);
+    let saves = &run.saves;
+    assert_eq!(a.input_log[205][0] & INPUT_SAVE, INPUT_SAVE, "save not on 205");
+    assert_eq!(a.input_log[242][0] & INPUT_LOAD, INPUT_LOAD, "load not on 242");
+    println!("final through {} / {}, saves {saves:x?}, events {:?}", a.final_through, b.final_through, run.events);
+    assert!(run.desyncs.is_empty(), "desync events: {:?}", run.desyncs);
+    assert!(saves[0].is_some() && saves[0] == saves[1], "shared saves differ: {saves:x?}");
+    let (sa, sb) = (&a.saves.last().unwrap().state, &b.saves.last().unwrap().state);
+    assert_eq!(state_hash_of(sa), state_hash_of(sb), "in-memory shared saves differ");
+    assert!(a.probe.1.is_some() && a.probe.1 == b.probe.1, "states after the load differ");
+    use NetEvent::{Loaded, Saved};
+    assert_eq!(run.events[0], [Saved { slot: 0 }, Loaded { slot: 0 }]);
+    assert_eq!(run.events[1], run.events[0]);
 }

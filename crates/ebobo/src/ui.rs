@@ -4,7 +4,8 @@
 use std::time::{Duration, SystemTime};
 
 use ebobo_net::{
-    normalize_code, LobbyStatus, NatKind, NetDiag, NetError, NetStats, RomState, RouteKind, Stage, CODE_ALPHABET, CODE_LEN,
+    normalize_code, LobbyStatus, NatKind, NetDiag, NetError, NetStats, ResumeInfo, ResumeKind, RomState, RouteKind, Stage,
+    CODE_ALPHABET, CODE_LEN,
 };
 
 use crate::canvas::{Canvas, Color, Font};
@@ -29,6 +30,9 @@ pub enum UiAction {
     /// Host pressed Start in the lobby.
     StartLobbyGame,
     LeaveLobby,
+    /// Host changed what the game starts from in the lobby: an index into the options given
+    /// to `Ui::set_resume_options`, `None` = a new game.
+    PickResume(Option<usize>),
     Resume,
     Reset,
     SaveState,
@@ -59,6 +63,8 @@ pub struct GameView<'a> {
     pub stalled: bool,
     /// Solo: current save slot (0-based) and when it was written (`None` = empty).
     pub save_slot: Option<(u8, Option<SystemTime>)>,
+    /// Netplay: a shared save exists, so "Load for everyone" can load it.
+    pub can_load: bool,
 }
 
 pub struct UiCtx<'a> {
@@ -103,6 +109,12 @@ pub enum Text {
     /// How to open the menu from a game, for a gamepad and for the keyboard.
     MenuHintPad,
     MenuHintKeys,
+    /// "{name} saved for everyone" / "{name} loaded the save" (netplay, `{name}` = the player).
+    NetSaved,
+    NetLoaded,
+    /// A netplay game started from the last moment / from the save.
+    ResumedLast,
+    ResumedSave,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -144,6 +156,14 @@ fn ping_color(ms: u32) -> Color {
     }
 }
 
+/// Name of a saved online game kind.
+fn resume_label(kind: ResumeKind) -> S {
+    match kind {
+        ResumeKind::Last => S::ResumeLast,
+        ResumeKind::Save => S::ResumeSave,
+    }
+}
+
 /// Cuts `s` to `cols` characters, ending with ".." when cut.
 fn trunc(s: &str, cols: usize) -> String {
     if s.chars().count() <= cols {
@@ -153,6 +173,37 @@ fn trunc(s: &str, cols: usize) -> String {
         out.push_str("..");
         out
     }
+}
+
+/// `DD.MM` of a Unix time in the local time zone.
+#[cfg(unix)]
+fn day_month(unix_secs: u64) -> Option<String> {
+    use sdl2::libc;
+    let t = libc::time_t::try_from(unix_secs).ok()?;
+    // SAFETY: `tm` is plain integers (and a nullable pointer), so all-zero is a valid value;
+    // `localtime_r` only reads `t` and writes `tm`, both live for the call.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return None;
+    }
+    Some(format!("{:02}.{:02}", tm.tm_mday, tm.tm_mon + 1))
+}
+
+/// No `localtime_r` outside Unix: no date is shown.
+#[cfg(not(unix))]
+fn day_month(_unix_secs: u64) -> Option<String> {
+    None
+}
+
+/// Date tag of picker row `i`: when the file arrived, only for a name another row shares
+/// (two builds of one game, e.g. an older copy and a newer one received from a host), so the
+/// player can tell them apart. The library is sorted by lower-cased name, so rows sharing a
+/// name are neighbours.
+fn build_date_tag(lib: &[RomEntry], i: usize) -> Option<String> {
+    let key = lib[i].name.to_lowercase();
+    let same = |j: usize| lib.get(j).is_some_and(|e| e.name.to_lowercase() == key);
+    let shared = i.checked_sub(1).is_some_and(same) || same(i + 1);
+    if shared { day_month(lib[i].mtime) } else { None }
 }
 
 /// Word wrap to `cols` characters per line.
@@ -236,10 +287,17 @@ impl Screen {
 struct Modal {
     title: String,
     lines: Vec<String>,
-    /// Two-choice confirmation (Leave / Stay) performing this action on Leave, instead of an
-    /// OK box.
-    confirm: Option<UiAction>,
+    /// Two-choice confirmation instead of an OK box.
+    confirm: Option<Confirm>,
     sel: usize,
+}
+
+/// The two answers of a confirmation box: the first performs `action`, the second (the safe
+/// one, preselected) closes the box.
+struct Confirm {
+    action: UiAction,
+    yes: S,
+    no: S,
 }
 
 /// One menu row.
@@ -262,7 +320,7 @@ impl Item {
 
 const MAIN_ITEMS: [S; 6] = [S::CreateRoom, S::JoinByCode, S::PlaySolo, S::ByIp, S::Settings, S::Quit];
 const PAUSE_SOLO: [S; 6] = [S::Resume, S::Slot, S::SaveState, S::LoadState, S::Reset, S::ExitToMenu];
-const PAUSE_NET: [S; 3] = [S::Resume, S::ResetAll, S::ExitGame];
+const PAUSE_NET: [S; 5] = [S::Resume, S::SaveAll, S::LoadAll, S::ResetAll, S::ExitGame];
 const DELAYS: [Option<u8>; 7] = [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)];
 
 /// Hint bar glyphs.
@@ -370,6 +428,10 @@ pub struct Ui {
     osk_tap: Option<usize>,
     /// The last confirm came from a gamepad or a tap: the next field opens with the keyboard.
     osk_wanted: bool,
+    /// Host lobby: what the game can start from (`Last` before `Save`) and the current pick
+    /// (`None` = a new game). Empty for guests and when nothing was saved.
+    resume_options: Vec<ResumeInfo>,
+    resume_pick: Option<usize>,
 }
 
 impl Ui {
@@ -394,6 +456,8 @@ impl Ui {
             osk: None,
             osk_tap: None,
             osk_wanted: false,
+            resume_options: Vec::new(),
+            resume_pick: None,
         }
     }
 
@@ -417,10 +481,18 @@ impl Ui {
         self.update = version;
     }
 
-    /// Lobby screen (room code, players, Start for the host).
+    /// Host lobby: the saves this game can continue from and the one picked (`None` = a new
+    /// game). The lobby shows a row to change it when `options` is not empty.
+    pub fn set_resume_options(&mut self, options: Vec<ResumeInfo>, pick: Option<usize>) {
+        self.resume_options = options;
+        self.resume_pick = pick;
+    }
+
+    /// Lobby screen (room code, players, Start for the host). The selection starts on Start,
+    /// which is row 1 under the host's resume row and clamps to row 0 without it.
     pub fn show_lobby(&mut self) {
         self.stack = vec![Screen::Lobby];
-        self.sel[Screen::Lobby.slot()] = 0;
+        self.sel[Screen::Lobby.slot()] = 1;
         self.press = None;
     }
 
@@ -497,6 +569,10 @@ impl Ui {
             Text::DeckKeysFix => S::DeckKeysFix,
             Text::MenuHintPad => S::MenuHintPad,
             Text::MenuHintKeys => S::MenuHintKeys,
+            Text::NetSaved => S::NetSaved,
+            Text::NetLoaded => S::NetLoaded,
+            Text::ResumedLast => S::ResumedLast,
+            Text::ResumedSave => S::ResumedSave,
         })
     }
 
@@ -553,7 +629,7 @@ impl Ui {
                 } else if nav.confirm {
                     let modal = self.modal.take()?;
                     if modal.sel == 0 {
-                        return modal.confirm;
+                        return modal.confirm.map(|c| c.action);
                     }
                 }
             } else if nav.confirm || nav.back {
@@ -599,7 +675,17 @@ impl Ui {
                     return None;
                 }
                 let lobby = ctx.lobby?;
-                (nav.confirm && lobby.is_host && lobby.stage == Stage::Lobby && lobby.can_start).then_some(UiAction::StartLobbyGame)
+                let host = lobby.is_host && lobby.stage == Stage::Lobby;
+                let choosing = host && !self.resume_options.is_empty();
+                let confirm = self.menu_step(top, if choosing { 2 } else { 1 }, &nav);
+                if choosing && self.sel[top.slot()] == 0 {
+                    if !(nav.left || nav.right || confirm.is_some()) {
+                        return None;
+                    }
+                    self.resume_pick = self.cycle_resume(nav.left);
+                    return Some(UiAction::PickResume(self.resume_pick));
+                }
+                (confirm.is_some() && host && lobby.can_start).then_some(UiAction::StartLobbyGame)
             }
             Screen::Pause => {
                 if nav.back || input.menu {
@@ -607,6 +693,7 @@ impl Ui {
                     return Some(UiAction::Resume);
                 }
                 let netplay = ctx.game.as_ref().is_some_and(|g| g.netplay);
+                let can_load = ctx.game.as_ref().is_some_and(|g| g.can_load);
                 let items: &[S] = if netplay { &PAUSE_NET } else { &PAUSE_SOLO };
                 let sel = self.sel[top.slot()].min(items.len() - 1);
                 if items[sel] == S::Slot && (nav.left || nav.right || nav.confirm) {
@@ -619,8 +706,17 @@ impl Ui {
                         self.hide();
                         UiAction::Resume
                     }
-                    S::SaveState => UiAction::SaveState,
+                    S::SaveState | S::SaveAll => UiAction::SaveState,
                     S::LoadState => UiAction::LoadState,
+                    // Loading throws away everyone's progress since the save: ask first. F7
+                    // skips the question (the app handles it without the menu).
+                    S::LoadAll => {
+                        if can_load {
+                            let lines = wrap(self.t(S::LoadAllLoses), 27);
+                            self.ask(S::LoadAllQ, lines, Confirm { action: UiAction::LoadState, yes: S::LoadYes, no: S::Cancel });
+                        }
+                        return None;
+                    }
                     S::Reset | S::ResetAll => UiAction::Reset,
                     _ if netplay => {
                         self.ask_leave(S::LeaveGameQ, UiAction::LeaveGame);
@@ -705,6 +801,20 @@ impl Ui {
             _ => (S::DaysAgo, mins / 1440),
         };
         self.t(s).replace("{n}", &n.to_string())
+    }
+
+    /// `save_age` of a time in Unix seconds (online saves travel as Unix seconds).
+    fn unix_age(&self, saved_at: u64) -> String {
+        self.save_age(SystemTime::UNIX_EPOCH + Duration::from_secs(saved_at), SystemTime::now())
+    }
+
+    /// The host's lobby row choosing what the game starts from: the pick, with its age for a
+    /// save; ◀ ▶ (or a tap on either side) change it. "New game" draws the arrows alone.
+    fn resume_item(&self) -> Item {
+        match self.resume_pick.and_then(|i| self.resume_options.get(i)) {
+            Some(r) => Item::value(self.t(resume_label(r.kind)), self.unix_age(r.saved_at), true),
+            None => Item::value(self.t(S::ResumeNew), String::new(), true),
+        }
     }
 
     fn push(&mut self, screen: Screen) {
@@ -837,7 +947,21 @@ impl Ui {
 
     /// Leave / Stay confirmation; "Stay" is preselected so a stray confirm is harmless.
     fn ask_leave(&mut self, title: S, action: UiAction) {
-        self.modal = Some(Modal { title: self.t(title).to_string(), lines: Vec::new(), confirm: Some(action), sel: 1 });
+        self.ask(title, Vec::new(), Confirm { action, yes: S::Leave, no: S::Stay });
+    }
+
+    /// Confirmation box with the safe answer (`confirm.no`) preselected.
+    fn ask(&mut self, title: S, lines: Vec<String>, confirm: Confirm) {
+        self.modal = Some(Modal { title: self.t(title).to_string(), lines, confirm: Some(confirm), sel: 1 });
+    }
+
+    /// The resume pick after the current one (`back`: before it), cycling through "new game"
+    /// (`None`), then each option in order.
+    fn cycle_resume(&self, back: bool) -> Option<usize> {
+        let n = self.resume_options.len() + 1;
+        let pos = self.resume_pick.map_or(0, |i| i + 1);
+        let next = if back { (pos + n - 1) % n } else { (pos + 1) % n };
+        next.checked_sub(1)
     }
 
     fn open_code(&mut self) {
@@ -1403,10 +1527,18 @@ impl Ui {
             } else {
                 (String::new(), SEC)
             };
+            // Right-aligned tags: the build date (only for names that repeat), then PAL or
+            // the unsupported mapper; the name gets whatever is left.
+            let date = build_date_tag(lib, i);
+            let date_w = date.as_deref().map_or(0, |d| f.width(d, 1));
             let tag_w = f.width(&tag, 1);
-            let cols = ((244 - tag_w - 20 - if tag_w > 0 { 8 } else { 0 }) / 8) as usize;
+            let tags_w = tag_w + date_w + if tag_w > 0 && date_w > 0 { 8 } else { 0 };
+            let cols = ((244 - tags_w - 20 - if tags_w > 0 { 8 } else { 0 }) / 8) as usize;
             let col = if !e.supported { DIS } else { WHITE };
             f.draw(c, 20, y, &trunc(&e.name, cols), col, 1);
+            if let Some(date) = &date {
+                f.draw(c, 244 - tags_w, y, date, if selected { WHITE } else { SEC }, 1);
+            }
             if tag_w > 0 {
                 f.draw(c, 244 - tag_w, y, &tag, tag_col, 1);
             }
@@ -1610,14 +1742,26 @@ impl Ui {
             f.draw_centered(c, 172, &format!("{}...", self.t(S::Starting)), WHITE, 1);
         } else if lobby.is_host {
             let block = self.lobby_block(lobby);
+            let mut rows = Vec::with_capacity(2);
+            if !self.resume_options.is_empty() {
+                rows.push(self.resume_item());
+            }
             let mut start = Item::new(self.t(S::Start));
             start.disabled = block.is_some();
-            Self::draw_rows(c, f, &[start], 0, 172, 16, h);
+            rows.push(start);
+            // Two rows start higher so the reason line keeps clear of the toasts.
+            let y0 = if rows.len() == 2 { 164 } else { 172 };
+            let sel = self.sel[Screen::Lobby.slot()].min(rows.len() - 1);
+            Self::draw_rows(c, f, &rows, sel, y0, 16, h);
             if let Some(reason) = block {
-                f.draw_centered(c, 192, self.t(reason), WARN, 1);
+                f.draw_centered(c, y0 + rows.len() as i32 * 16 + 4, self.t(reason), WARN, 1);
             }
         } else {
-            f.draw_centered(c, 172, self.t(S::WaitHost), SEC, 1);
+            if let Some(r) = lobby.resume {
+                let line = format!("{} ({})", self.t(resume_label(r.kind)), self.unix_age(r.saved_at));
+                f.draw_centered(c, 161, &trunc(&line, 30), WHITE, 1);
+            }
+            f.draw_centered(c, 174, self.t(S::WaitHost), SEC, 1);
         }
     }
 
@@ -1638,6 +1782,7 @@ impl Ui {
                     let when = at.map_or_else(|| self.t(S::SlotEmpty).to_string(), |at| self.save_age(at, SystemTime::now()));
                     Item::value(&format!("{} {}", self.t(S::Slot), slot + 1), when, true)
                 }
+                (S::LoadAll, _) => Item { disabled: !ctx.game.as_ref().is_some_and(|g| g.can_load), ..Item::new(self.t(S::LoadAll)) },
                 _ => Item::new(self.t(*s)),
             })
             .collect();
@@ -1783,10 +1928,9 @@ impl Ui {
             f.draw(c, 20, y0 + 26 + i as i32 * 10, line, WHITE, 1);
         }
         let by = y0 + 26 + m.lines.len() as i32 * 10 + 12;
-        let items: Vec<Item> = if leave {
-            vec![Item::new(self.t(S::Leave)), Item::new(self.t(S::Stay))]
-        } else {
-            vec![Item::new(self.t(S::Ok))]
+        let items: Vec<Item> = match &m.confirm {
+            Some(confirm) => vec![Item::new(self.t(confirm.yes)), Item::new(self.t(confirm.no))],
+            None => vec![Item::new(self.t(S::Ok))],
         };
         for (i, it) in items.iter().enumerate() {
             let y = by + i as i32 * 16;
@@ -1834,7 +1978,9 @@ impl Ui {
                 Some(Screen::Lobby) => {
                     let host = ctx.lobby.is_some_and(|l| l.is_host && l.stage == Stage::Lobby);
                     let mut v = vec![(Glyph::Back, S::Leave)];
-                    if host {
+                    if host && !self.resume_options.is_empty() && self.sel[Screen::Lobby.slot()] == 0 {
+                        v.insert(0, (Glyph::LeftRight, S::Change));
+                    } else if host {
                         v.insert(0, (Glyph::Confirm, S::Start));
                     }
                     v
@@ -2031,7 +2177,58 @@ mod tests {
     const DT: Duration = Duration::from_millis(16);
 
     fn entry(name: &str, supported: bool, region: Region) -> RomEntry {
-        RomEntry { path: PathBuf::from(format!("/r/{name}.nes")), name: name.into(), crc32: 1, mapper: if supported { 1 } else { 90 }, supported, region }
+        RomEntry { path: PathBuf::from(format!("/r/{name}.nes")), name: name.into(), crc32: 1, mapper: if supported { 1 } else { 90 }, supported, region, mtime: 0 }
+    }
+
+    /// A build of `name` dated `unix_secs`, in its own folder (as received ROMs are).
+    fn build(name: &str, crc32: u32, unix_secs: u64, region: Region) -> RomEntry {
+        RomEntry { path: PathBuf::from(format!("/r/{crc32:08x}/{name}.nes")), crc32, mtime: unix_secs, ..entry(name, true, region) }
+    }
+
+    /// Two builds of the Chip 'n Dale hack (newest first, as the library sorts them), one of
+    /// Contra and an unsupported game between unique names.
+    fn library_with_builds() -> Vec<RomEntry> {
+        // 2026-11-14 12:00 and 2026-11-09 12:00 UTC: midday keeps the day in any zone ±11 h.
+        let (new, old) = (1_794_657_600, 1_794_225_600);
+        vec![
+            entry("Battletoads (USA)", true, Region::Ntsc),
+            build("Chip 'n Dale - Rescue Rangers 4P (Europe)", 0x1111_1111, new, Region::Pal),
+            build("Chip 'n Dale - Rescue Rangers 4P (Europe)", 0x2222_2222, old, Region::Pal),
+            build("Contra (USA)", 0x3333_3333, new, Region::Ntsc),
+            build("contra (usa)", 0x4444_4444, old, Region::Ntsc),
+            entry("Kirby's Adventure (USA)", false, Region::Ntsc),
+            entry("Super Mario Bros. (World)", true, Region::Ntsc),
+        ]
+    }
+
+    #[test]
+    fn ui_picker_dates_only_repeated_names() {
+        let lib = library_with_builds();
+        let tags: Vec<Option<String>> = (0..lib.len()).map(|i| build_date_tag(&lib, i)).collect();
+        let dated = |s: &str| Some(s.to_string());
+        assert_eq!(tags, [None, dated("14.11"), dated("09.11"), dated("14.11"), dated("09.11"), None, None]);
+        assert_eq!(build_date_tag(&lib[..1], 0), None, "a one-game library has no neighbours");
+    }
+
+    #[test]
+    fn ui_picker_rows_with_builds() {
+        let mut cfg = Config::default();
+        let lib = library_with_builds();
+        let mut ui = Ui::new(Lang::En);
+        ui.stack = vec![Screen::Main, Screen::Picker(Purpose::Host)];
+        let mut c = ctx(&mut cfg, &lib, None);
+        redraw(&mut ui, &c);
+        // One row per entry in library order, then Rescan.
+        let rows: Vec<usize> = ui.regions.iter().filter_map(|(_, hit)| match hit { Hit::Row { i, .. } => Some(*i), _ => None }).collect();
+        assert_eq!(rows, (0..=lib.len()).collect::<Vec<_>>());
+        // Down twice reaches the older Chip 'n Dale build; confirming hosts that file.
+        let down = nav(|n| n.down = true);
+        ui.update(&down, &mut c, DT);
+        ui.update(&down, &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::HostRoom(lib[2].clone())));
+        // A tap on the newer build's row hosts the newer one.
+        redraw(&mut ui, &c);
+        assert_eq!(ui.update(&tap(128, 26 + PICKER_STEP), &mut c, DT), Some(UiAction::HostRoom(lib[1].clone())));
     }
 
     fn nav(f: impl FnOnce(&mut Nav)) -> InputFrame {
@@ -2058,7 +2255,7 @@ mod tests {
                 away: i == 2,
             })
             .collect();
-        LobbyStatus { stage: Stage::Lobby, code: Some("K7QPA".into()), me: Some(PeerId(0)), is_host: host, players, rom_name: Some("Super Mario Bros. 3 (USA)".into()), can_start, error: None }
+        LobbyStatus { stage: Stage::Lobby, code: Some("K7QPA".into()), me: Some(PeerId(0)), is_host: host, players, rom_name: Some("Super Mario Bros. 3 (USA)".into()), can_start, error: None, resume: None }
     }
 
     fn pointer(events: &[PointerEvent]) -> InputFrame {
@@ -2316,7 +2513,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.show_pause();
-        let solo = |slot| GameView { rom_name: "X", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((slot, None)) };
+        let solo = |slot| GameView { rom_name: "X", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((slot, None)), can_load: false };
         let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(solo(0)), pads: &[], config: &mut cfg, version: "0.1.0" };
         ui.update(&nav(|n| n.down = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::SelectSlot(1)));
@@ -2339,12 +2536,113 @@ mod tests {
         let names = vec!["A".to_string(), "B".to_string()];
         let mut ui = Ui::new(Lang::Ru);
         ui.show_pause();
-        let game = GameView { rom_name: "X", netplay: true, names: &names, stats: None, notice: None, desync: false, stalled: false, save_slot: None };
+        let game = GameView { rom_name: "X", netplay: true, names: &names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, can_load: false };
         let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &[], config: &mut cfg, version: "0.1.0" };
         ui.update(&nav(|n| n.up = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "exit must confirm");
         ui.update(&nav(|n| n.up = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::LeaveGame));
+    }
+
+    fn resume_options() -> Vec<ResumeInfo> {
+        vec![ResumeInfo { kind: ResumeKind::Last, saved_at: 1_000 }, ResumeInfo { kind: ResumeKind::Save, saved_at: 900 }]
+    }
+
+    fn lobby_rows(ui: &Ui) -> usize {
+        ui.regions.iter().filter(|(_, h)| matches!(h, Hit::Row { .. })).count()
+    }
+
+    #[test]
+    fn ui_lobby_resume_row_cycles_for_the_host() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.set_resume_options(resume_options(), Some(0));
+        ui.show_lobby();
+        let ready = lobby(2, true, true);
+        let mut c = ctx(&mut cfg, &[], Some(&ready));
+        redraw(&mut ui, &c);
+        assert_eq!(lobby_rows(&ui), 2, "resume row above Start");
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::StartLobbyGame), "Start is preselected");
+        ui.update(&nav(|n| n.up = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::PickResume(Some(1))));
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::PickResume(None)), "after the save: new game");
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::PickResume(Some(0))));
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::PickResume(None)));
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::PickResume(Some(0))), "confirm steps forward");
+        // A tap: the left part of the value area steps back, the rest of the row forward.
+        redraw(&mut ui, &c);
+        let (area, back) = ui
+            .regions
+            .iter()
+            .find_map(|(a, h)| match h {
+                Hit::Row { i: 0, back: Some(b), .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("resume row takes taps");
+        let y = area.y + area.h / 2;
+        assert_eq!(ui.update(&tap(back.0 + 1, y), &mut c, DT), Some(UiAction::PickResume(None)));
+        assert_eq!(ui.update(&tap(40, y), &mut c, DT), Some(UiAction::PickResume(Some(0))));
+        assert_eq!(ui.resume_pick, Some(0));
+    }
+
+    #[test]
+    fn ui_lobby_resume_row_hidden_without_saves_and_for_guests() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.show_lobby();
+        let ready = lobby(2, true, true);
+        let mut c = ctx(&mut cfg, &[], Some(&ready));
+        redraw(&mut ui, &c);
+        assert_eq!(lobby_rows(&ui), 1, "nothing to continue from: Start only");
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), None);
+        assert_eq!(ui.update(&nav(|n| n.up = true), &mut c, DT), None);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::StartLobbyGame));
+
+        // A guest sees the host's choice as text and cannot change it.
+        let mut guest = lobby(2, false, false);
+        guest.resume = Some(ResumeInfo { kind: ResumeKind::Save, saved_at: 1_000 });
+        let mut ui = Ui::new(Lang::Ru);
+        ui.set_resume_options(resume_options(), Some(0));
+        ui.show_lobby();
+        let mut c = ctx(&mut cfg, &[], Some(&guest));
+        redraw(&mut ui, &c);
+        assert_eq!(lobby_rows(&ui), 0);
+        for key in [Key::Up, Key::Left, Key::Right, Key::Confirm] {
+            assert_eq!(ui.update(&nav(|n| *n = key.nav()), &mut c, DT), None, "{key:?}");
+        }
+    }
+
+    fn net_game(names: &[String], can_load: bool) -> GameView<'_> {
+        GameView { rom_name: "X", netplay: true, names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, can_load }
+    }
+
+    #[test]
+    fn ui_netplay_pause_saves_and_loads_for_everyone() {
+        let mut cfg = Config::default();
+        let names = vec!["A".to_string(), "B".to_string()];
+        let mut ui = Ui::new(Lang::Ru);
+        ui.show_pause();
+        let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(net_game(&names, false)), pads: &[], config: &mut cfg, version: "0.1.0" };
+        redraw(&mut ui, &c);
+        let rows: Vec<bool> = ui.regions.iter().filter_map(|(_, h)| if let Hit::Row { enabled, .. } = h { Some(*enabled) } else { None }).collect();
+        assert_eq!(rows, [true, true, false, true, true], "Resume, Save, Load (no save yet), Reset, Leave");
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::SaveState));
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "no save: Load does nothing");
+        assert!(ui.modal.is_none());
+
+        c.game = Some(net_game(&names, true));
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "Load asks first");
+        let m = ui.modal.as_ref().expect("confirm box");
+        assert_eq!((m.title.as_str(), m.sel), ("Загрузить сохранение?", 1), "Cancel preselected");
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "a stray confirm cancels");
+        assert!(ui.modal.is_none());
+        ui.update(&nav(|n| n.confirm = true), &mut c, DT);
+        ui.update(&nav(|n| n.up = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::LoadState));
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::Reset));
     }
 
     #[test]
@@ -2593,6 +2891,26 @@ mod tests {
         std::fs::write(path, out).unwrap();
     }
 
+    /// The ROM picker with two builds of the same games, Russian and English
+    /// (`/tmp/ebobo-picker-dups-<lang>.png`): the older Chip 'n Dale build selected, dates
+    /// beside PAL, unique names untagged.
+    #[test]
+    #[ignore]
+    fn ui_render_picker_dups_snapshots() {
+        let mut font = Font::new();
+        let mut cfg = Config::default();
+        let lib = library_with_builds();
+        for (lang, code) in [(Lang::Ru, "ru"), (Lang::En, "en")] {
+            let mut ui = Ui::new(lang);
+            ui.stack = vec![Screen::Main, Screen::Picker(Purpose::Host)];
+            ui.sel[Screen::Picker(Purpose::Host).slot()] = 2;
+            let c = ctx(&mut cfg, &lib, None);
+            let mut canvas = Canvas::new();
+            ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
+            write_png(&format!("/tmp/ebobo-picker-dups-{code}.png"), &canvas.px, 256, 240);
+        }
+    }
+
     /// Renders Main, Lobby (3 players) and Pause to /tmp/ebobo-ui-*.png for a visual check.
     #[test]
     #[ignore]
@@ -2610,13 +2928,91 @@ mod tests {
             ui.stack = vec![screen];
             ui.toast("Геймпад DualSense → игрок 2");
             let mut canvas = Canvas::new();
-            let game = (screen == Screen::Pause).then(|| GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice: None, desync: false, stalled: false, save_slot: None });
+            let game = (screen == Screen::Pause).then(|| GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice: None, desync: false, stalled: false, save_slot: None, can_load: true });
             if game.is_some() {
                 canvas.clear(rgb(0x5C, 0x94, 0xFC));
             }
             let c = UiCtx { library: &[], scanning: false, lobby: Some(&lob), game, pads: &pads, config: &mut cfg, version: "0.1.0" };
             ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
             write_png(&format!("/tmp/ebobo-ui-{name}.png"), &canvas.px, 256, 240);
+        }
+    }
+
+    /// Online saves, Russian and English (`/tmp/ebobo-netsave-<name>-<lang>.png`): the host's
+    /// lobby with the resume row (2 and 4 players, long names), the guest's read-only line,
+    /// the netplay pause menu with Load enabled and disabled, and the load confirmation.
+    #[test]
+    #[ignore]
+    fn ui_render_netsave_snapshots() {
+        let mut font = Font::new();
+        let mut cfg = Config::default();
+        let pads = [PadInfo { name: "DualSense".into(), kind: PadKind::PlayStation, slot: Some(0) }];
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let options = vec![ResumeInfo { kind: ResumeKind::Last, saved_at: now - 59 * 60 }, ResumeInfo { kind: ResumeKind::Save, saved_at: now - 12 * 86_400 }];
+        let long = ["Константин Ивано", "VeryLongNickname", "Евгения Петрова1", "Maximilian_Svens"];
+        let four = |host: bool, can_start: bool| {
+            let mut l = lobby(3, host, can_start);
+            l.players.push(PlayerInfo { id: PeerId(3), ..l.players[1].clone() });
+            for (p, name) in l.players.iter_mut().zip(long) {
+                p.name = name.into();
+            }
+            l.rom_name = Some("Chip 'n Dale - Rescue Rangers (Europe)".into());
+            l
+        };
+        let names: Vec<String> = long.iter().map(|s| s.to_string()).collect();
+        let stats = NetStats::default();
+        for (lang, code) in [(Lang::Ru, "ru"), (Lang::En, "en")] {
+            let write = |ui: &mut Ui, font: &mut Font, c: &UiCtx, name: &str, game: bool| {
+                let mut canvas = Canvas::new();
+                if game {
+                    canvas.clear(rgb(0x5C, 0x94, 0xFC));
+                }
+                ui.draw(&mut canvas, font, c, &hint(PadKind::PlayStation));
+                write_png(&format!("/tmp/ebobo-netsave-{name}-{code}.png"), &canvas.px, 256, 240);
+            };
+            // Host, 2 players: "last moment" picked and focused (◀ ▶ shown).
+            let two = lobby(2, true, true);
+            let mut ui = Ui::new(lang);
+            ui.set_resume_options(options.clone(), Some(0));
+            ui.show_lobby();
+            ui.sel[Screen::Lobby.slot()] = 0;
+            let c = UiCtx { library: &[], scanning: false, lobby: Some(&two), game: None, pads: &pads, config: &mut cfg, version: "0.1.0" };
+            write(&mut ui, &mut font, &c, "host2", false);
+            // New game picked.
+            ui.set_resume_options(options.clone(), None);
+            write(&mut ui, &mut font, &c, "host2-new", false);
+            // Host, 4 long names, the save picked, Start focused but blocked (reason line).
+            let full = four(true, false);
+            let mut ui = Ui::new(lang);
+            ui.set_resume_options(options.clone(), Some(1));
+            ui.show_lobby();
+            ui.toast("Геймпад DualSense → игрок 2");
+            let c = UiCtx { library: &[], scanning: false, lobby: Some(&full), game: None, pads: &pads, config: &mut cfg, version: "0.1.0" };
+            write(&mut ui, &mut font, &c, "host4", false);
+            // Guest, 4 long names, the host continues from the last moment.
+            let mut guest = four(false, false);
+            guest.me = Some(PeerId(1));
+            guest.resume = Some(options[0]);
+            let mut ui = Ui::new(lang);
+            ui.show_lobby();
+            let c = UiCtx { library: &[], scanning: false, lobby: Some(&guest), game: None, pads: &pads, config: &mut cfg, version: "0.1.0" };
+            write(&mut ui, &mut font, &c, "guest4", false);
+            // Netplay pause menu on "Load for everyone": enabled, disabled, then its question.
+            for (name, can_load) in [("pause-load", true), ("pause-noload", false)] {
+                let mut ui = Ui::new(lang);
+                ui.show_pause();
+                ui.sel[Screen::Pause.slot()] = 2;
+                let game = GameView { stats: Some(&stats), ..net_game(&names, can_load) };
+                let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
+                write(&mut ui, &mut font, &c, name, true);
+            }
+            let mut ui = Ui::new(lang);
+            ui.show_pause();
+            ui.sel[Screen::Pause.slot()] = 2;
+            let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(net_game(&names, true)), pads: &pads, config: &mut cfg, version: "0.1.0" };
+            ui.update(&nav(|n| n.confirm = true), &mut c, DT);
+            assert!(ui.modal.is_some());
+            write(&mut ui, &mut font, &c, "pause-confirm", true);
         }
     }
 
@@ -2695,7 +3091,7 @@ mod tests {
         let mut canvas = Canvas::new();
         canvas.clear(rgb(0x5C, 0x94, 0xFC));
         let notice = Some("Ждём Саша... 7 с".to_string());
-        let game = GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice, desync: false, stalled: true, save_slot: None };
+        let game = GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice, desync: false, stalled: true, save_slot: None, can_load: false };
         let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
         ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
         write_png("/tmp/ebobo-ui-game-wait.png", &canvas.px, 256, 240);

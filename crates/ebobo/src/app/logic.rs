@@ -1,5 +1,6 @@
 //! Pure helpers of the app loop: region hint, frame pacing, save naming, config merge.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ebobo_core::{pad, Region};
@@ -69,8 +70,8 @@ pub fn save_file_name(stem: &str, crc32: u32) -> String {
 
 /// File name for a ROM a netplay host sent us. The name comes from another machine, so none
 /// of it may act as a path: separators and control characters are replaced and leading dots
-/// dropped. `crc32` is appended when the plain name is already taken by another game.
-pub fn received_rom_file_name(name: &str, crc32: Option<u32>) -> String {
+/// dropped.
+pub fn received_rom_file_name(name: &str) -> String {
     let stem: String = name
         .strip_suffix(".nes")
         .unwrap_or(name)
@@ -80,10 +81,14 @@ pub fn received_rom_file_name(name: &str, crc32: Option<u32>) -> String {
         .collect();
     let stem = stem.trim().trim_start_matches('.');
     let stem = if stem.is_empty() { "game" } else { stem };
-    match crc32 {
-        Some(crc) => format!("{stem}-{crc:08x}.nes"),
-        None => format!("{stem}.nes"),
-    }
+    format!("{stem}.nes")
+}
+
+/// Where a received ROM is kept: `<roms_dir>/<crc32 as 8 hex>/<clean name>.nes`. One folder
+/// per CRC lets a newer build of a game sit beside the old one under the host's own name, so
+/// the library lists both by that name (dated) instead of a `<name>-<crc>` row.
+pub fn received_rom_path(roms_dir: &Path, crc32: u32, name: &str) -> PathBuf {
+    roms_dir.join(format!("{crc32:08x}")).join(received_rom_file_name(name))
 }
 
 /// Copies onto `saved` (the on-disk config) only the fields that changed from `before` to
@@ -208,10 +213,27 @@ mod tests {
 
     #[test]
     fn app_received_rom_name_stays_inside_the_roms_dir() {
-        assert_eq!(received_rom_file_name("Game (USA).nes", None), "Game (USA).nes");
-        assert_eq!(received_rom_file_name("../../.ssh/authorized_keys", None), "_.._.ssh_authorized_keys.nes");
-        assert_eq!(received_rom_file_name("a\\b\0c", None), "a_b_c.nes");
-        assert_eq!(received_rom_file_name("..", Some(0xAB)), "game-000000ab.nes");
+        assert_eq!(received_rom_file_name("Game (USA).nes"), "Game (USA).nes");
+        assert_eq!(received_rom_file_name("Game (USA)"), "Game (USA).nes");
+        assert_eq!(received_rom_file_name("../../.ssh/authorized_keys"), "_.._.ssh_authorized_keys.nes");
+        assert_eq!(received_rom_file_name("a\\b\0c"), "a_b_c.nes");
+        assert_eq!(received_rom_file_name("C:evil"), "C_evil.nes");
+        assert_eq!(received_rom_file_name(".."), "game.nes");
+        assert_eq!(received_rom_file_name("  .hidden "), "hidden.nes");
+        assert_eq!(received_rom_file_name(&"x".repeat(200)), format!("{}.nes", "x".repeat(80)));
+    }
+
+    #[test]
+    fn app_received_rom_path_is_one_folder_per_crc() {
+        let roms = Path::new("/data/ebobo/roms");
+        assert_eq!(received_rom_path(roms, 0xAB, "Chip 'n Dale 4P (Europe)"), roms.join("000000ab/Chip 'n Dale 4P (Europe).nes"));
+        let hostile = ["../../.ssh/authorized_keys", "/etc/passwd", "..", ".", "", "a/../../b", "\\..\\..\\x", "x\n/../y", "C:\\Windows"];
+        for name in hostile {
+            let path = received_rom_path(roms, 0xDEAD_BEEF, name);
+            assert_eq!(path.parent(), Some(roms.join("deadbeef").as_path()), "{name:?} -> {}", path.display());
+            assert!(path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_))), "{name:?}");
+            assert!(path.extension().is_some_and(|e| e == "nes"), "{name:?}");
+        }
     }
 
     #[test]

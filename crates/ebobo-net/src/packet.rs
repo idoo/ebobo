@@ -4,6 +4,8 @@
 pub const MAGIC: u8 = 0xEB;
 pub const MAX_PACKET: usize = 1200;
 pub const ROM_CHUNK_DATA: usize = 1024;
+/// Payload of one saved-game chunk; every chunk but the last carries exactly this much.
+pub const STATE_CHUNK_DATA: usize = 1024;
 
 pub mod kind {
     pub const PUNCH: u8 = 0x01;
@@ -13,6 +15,8 @@ pub mod kind {
     pub const CTRL_ACK: u8 = 0x11;
     pub const ROM_CHUNK: u8 = 0x20;
     pub const ROM_ACK: u8 = 0x21;
+    pub const STATE_CHUNK: u8 = 0x22;
+    pub const STATE_ACK: u8 = 0x23;
     pub const GGRS: u8 = 0x30;
     pub const BYE: u8 = 0x3F;
 }
@@ -26,6 +30,11 @@ pub enum Packet<'a> {
     CtrlAck { seq: u32 },
     RomChunk { offset: u32, total: u32, data: &'a [u8] },
     RomAck { next: u32 },
+    /// One chunk of the saved game the host starts from: transfer `id`, the `total` size and
+    /// CRC-32 of the whole state, the chunk `index` and its bytes.
+    StateChunk { id: u32, total: u32, crc: u32, index: u16, data: &'a [u8] },
+    /// The chunks of transfer `id` the guest holds: bit `i % 8` of byte `i / 8` = chunk `i`.
+    StateAck { id: u32, have: &'a [u8] },
     Ggrs(&'a [u8]),
     Bye,
 }
@@ -65,6 +74,15 @@ impl<'a> Packet<'a> {
                 Some(Packet::RomChunk { offset: u32_at(0)?, total: u32_at(4)?, data })
             }
             kind::ROM_ACK => (body.len() == 4).then_some(Packet::RomAck { next: u32_at(0)? }),
+            kind::STATE_CHUNK => {
+                let data = body.get(14..)?;
+                if data.is_empty() || data.len() > STATE_CHUNK_DATA {
+                    return None;
+                }
+                let index = u16::from_le_bytes([body[12], body[13]]);
+                Some(Packet::StateChunk { id: u32_at(0)?, total: u32_at(4)?, crc: u32_at(8)?, index, data })
+            }
+            kind::STATE_ACK => Some(Packet::StateAck { id: u32_at(0)?, have: &body[4..] }),
             kind::GGRS => Some(Packet::Ggrs(body)),
             kind::BYE => body.is_empty().then_some(Packet::Bye),
             _ => None,
@@ -101,6 +119,19 @@ impl<'a> Packet<'a> {
             Packet::RomAck { next } => {
                 out.push(kind::ROM_ACK);
                 out.extend_from_slice(&next.to_le_bytes());
+            }
+            Packet::StateChunk { id, total, crc, index, data } => {
+                out.push(kind::STATE_CHUNK);
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(&total.to_le_bytes());
+                out.extend_from_slice(&crc.to_le_bytes());
+                out.extend_from_slice(&index.to_le_bytes());
+                out.extend_from_slice(data);
+            }
+            Packet::StateAck { id, have } => {
+                out.push(kind::STATE_ACK);
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(have);
             }
             Packet::Ggrs(body) => {
                 out.push(kind::GGRS);

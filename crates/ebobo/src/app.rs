@@ -3,6 +3,7 @@
 
 mod cli;
 mod logic;
+mod netsave;
 mod png;
 mod rewind;
 mod slots;
@@ -20,8 +21,8 @@ use std::time::{Duration, Instant};
 use ebobo_core::{Nes, Region, Snapshot};
 use ebobo_net::{
     GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, NetDiag, NetError, NetEvent, NetSession, NetStats, PeerId,
-    Stage,
-    INPUT_RESET,
+    Resume, ResumeInfo, ResumeKind, Stage,
+    INPUT_LOAD, INPUT_RESET, INPUT_SAVE,
 };
 
 use crate::audio::Audio;
@@ -33,7 +34,7 @@ use crate::library::{self, Library, RomEntry};
 use crate::ui::{GameView, Text, Ui, UiAction, UiCtx};
 use crate::video::Video;
 
-use cli::{Parsed, Start};
+use cli::{Parsed, ResumeFrom, ScriptKey, Start};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKDROP: canvas::Color = [0x14, 0x13, 0x1A, 0xFF];
@@ -90,7 +91,15 @@ struct Net {
     interrupted: Vec<(PeerId, Instant)>,
     gone: Vec<PeerId>,
     desync: bool,
+    /// "Reset / Save / Load for everyone" asked: the bit goes into the next local input word.
     reset_pending: bool,
+    save_pending: bool,
+    load_pending: bool,
+    /// Writing an online save file failed this session (the player is told once).
+    write_failed: bool,
+    /// `--script` steps and the next one to press.
+    script: Vec<(u64, ScriptKey)>,
+    script_at: usize,
     stats: NetStats,
     frame: u32,
     /// Frames actually advanced this session (for `ebobo: frame N hash H` lines).
@@ -147,6 +156,13 @@ struct App {
     keys_hint: steam_input::KeysHint,
     /// A game just started: say how to open the menu, once the last-used device is known.
     menu_hint: bool,
+    /// `--resume`: what a host starts from instead of the default choice.
+    resume_from: Option<ResumeFrom>,
+    /// `--script`: F5 / F7 presses at advanced frames of every netplay game.
+    script: Vec<(u64, ScriptKey)>,
+    /// Host lobby: the saves this game can continue from (`Ui::set_resume_options` has the
+    /// same list without the bytes).
+    host_resume: Vec<Resume>,
 }
 
 /// Runs the app; returns the process exit code.
@@ -316,6 +332,9 @@ impl App {
             steam_input: steam_input::SteamInput::new(config::is_steam_deck()),
             keys_hint: steam_input::KeysHint::default(),
             menu_hint: false,
+            resume_from: cli.resume,
+            script: cli.script.clone(),
+            host_resume: Vec::new(),
         })
     }
 
@@ -449,16 +468,17 @@ impl App {
                 self.ui.hide();
             }
         }
-        if let State::Solo(_) = self.state {
+        if self.in_game() {
+            // Solo: the current slot. Netplay: for everyone, F7 without asking.
             if frame.save_state {
                 self.perform(UiAction::SaveState);
             }
             if frame.load_state {
                 self.perform(UiAction::LoadState);
             }
-            if frame.screenshot {
-                self.screenshot();
-            }
+        }
+        if frame.screenshot && matches!(self.state, State::Solo(_)) {
+            self.screenshot();
         }
 
         self.poll_lobby();
@@ -654,13 +674,22 @@ impl App {
                 }
                 self.ui.hide();
             }
+            UiAction::PickResume(pick) => {
+                if let State::Lobby(lobby) = &self.state {
+                    lobby.set_resume(pick.and_then(|i| self.host_resume.get(i)).cloned());
+                }
+            }
             UiAction::SelectSlot(slot) => {
                 if let State::Solo(s) = &mut self.state {
                     s.slot = slot.min(slots::SLOTS - 1);
                 }
             }
-            UiAction::SaveState => {
-                if let State::Solo(s) = &mut self.state {
+            UiAction::SaveState => match &mut self.state {
+                State::Net(n) => {
+                    n.press(ScriptKey::Save);
+                    self.ui.hide();
+                }
+                State::Solo(s) => {
                     let path = s.slot_path(s.slot);
                     let text = match slots::save(&s.nes, &path) {
                         Ok(()) => {
@@ -675,9 +704,16 @@ impl App {
                     };
                     self.ui.toast(self.ui.text(text));
                 }
-            }
-            UiAction::LoadState => {
-                if let State::Solo(s) = &mut self.state {
+                State::Menu | State::Lobby(_) => {}
+            },
+            UiAction::LoadState => match &mut self.state {
+                State::Net(n) => {
+                    if !n.press(ScriptKey::Load) {
+                        self.ui.toast(self.ui.text(Text::NoQuickSave));
+                    }
+                    self.ui.hide();
+                }
+                State::Solo(s) => {
                     let path = s.slot_path(s.slot);
                     let text = match slots::load(&mut s.nes, &path) {
                         Ok(()) => {
@@ -699,7 +735,8 @@ impl App {
                     };
                     self.ui.toast(self.ui.text(text));
                 }
-            }
+                State::Menu | State::Lobby(_) => {}
+            },
             UiAction::ConfigChanged => self.apply_config(),
             UiAction::Rescan => self.library.rescan(),
             UiAction::RunNetCheck => self.start_net_check(),
@@ -809,15 +846,30 @@ impl App {
             Err(err) => return self.fail(&format!("{}: {err}", entry.name)),
         };
         let rom_name = entry.name;
+        // What this game can continue from; a scratch machine of the header region (the one
+        // the lobby announces) checks that each file loads.
+        let options = match Nes::new(&rom, None) {
+            Ok(mut scratch) => netsave::candidates(&netsave::dir(), &mut scratch),
+            Err(_) => Vec::new(),
+        };
+        let pick = netsave::pick(&options, self.resume_from);
         self.start_lobby(if direct {
             LobbyMode::HostDirect { port: self.config.direct_port, rom, rom_name }
         } else {
             LobbyMode::HostRoom { rom, rom_name }
         });
+        if let State::Lobby(lobby) = &self.state {
+            lobby.set_resume(pick.map(|i| options[i].clone()));
+        }
+        let infos = options.iter().map(|r| ResumeInfo { kind: r.kind, saved_at: r.saved_at }).collect();
+        self.ui.set_resume_options(infos, pick);
+        self.host_resume = options;
     }
 
     fn start_lobby(&mut self, mode: LobbyMode) {
         self.end_game();
+        self.host_resume = Vec::new();
+        self.ui.set_resume_options(Vec::new(), None);
         let lib = self.library.clone();
         let lobby = Lobby::start(LobbyConfig {
             server: self.config.server.clone(),
@@ -834,7 +886,9 @@ impl App {
         self.ui.show_lobby();
     }
 
+    /// Starts the netplay game, from `start.state` when the host continues a saved game.
     fn start_net(&mut self, start: GameStart) {
+        let resume = start.resume.map(|r| r.kind);
         self.end_game();
         let mut nes = match Nes::new(&start.rom, Some(start.region)) {
             Ok(nes) => nes,
@@ -850,7 +904,33 @@ impl App {
         nes.set_four_score(start.four_score);
         nes.set_sprite_limit(self.config.sprite_limit.applies(start.four_score));
         let fps = if start.region == Region::Pal { 50 } else { 60 };
-        let session = match NetSession::new(start.link, &start.slots, start.input_delay, start.delay_auto, fps) {
+        // A continued game: every peer loads the host's bytes before frame 0, and that state is
+        // the shared save "Load for everyone" returns to until somebody saves.
+        let shared_save = match &start.state {
+            None => None,
+            Some(state) => match nes.load_state(state) {
+                Ok(()) => {
+                    // The adapter is part of the saved machine; this game's player count
+                    // decides, as for a game from power-on (a save made by two players can be
+                    // continued by four).
+                    nes.set_four_score(start.four_score);
+                    let kind = resume.unwrap_or(ResumeKind::Save);
+                    println!("ebobo: resumed {} sha {}", netsave::kind_name(kind), netsave::sha16(state));
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let text = if kind == ResumeKind::Last { Text::ResumedLast } else { Text::ResumedSave };
+                    self.ui.toast_secs(self.ui.text(text), MENU_HINT_SECS);
+                    Some(nes.snapshot())
+                }
+                Err(err) => {
+                    eprintln!("ebobo: the host's saved game does not load: {err}");
+                    start.link.close();
+                    self.ui.show_main();
+                    self.ui.error(self.ui.text(slots::LoadError::State(err).text()));
+                    return;
+                }
+            },
+        };
+        let session = match NetSession::new(start.link, &start.slots, start.input_delay, start.delay_auto, fps, shared_save) {
             Ok(session) => session,
             Err(err) => {
                 self.ui.show_main();
@@ -871,6 +951,11 @@ impl App {
             gone: Vec::new(),
             desync: false,
             reset_pending: false,
+            save_pending: false,
+            load_pending: false,
+            write_failed: false,
+            script: self.script.clone(),
+            script_at: 0,
             frame: 0,
             advanced: 0,
             last_advance: Instant::now(),
@@ -881,18 +966,17 @@ impl App {
     }
 
     /// Keeps a ROM the host sent in this player's own library, so the game is there next time
-    /// and for solo play.
+    /// and for solo play. It goes to `<data dir>/roms/<crc32>/` under the host's name: a newer
+    /// build of a game the player already has is listed beside the old one, newest first.
     fn keep_received_rom(&self, name: &str, crc32: u32, rom: &[u8]) {
         if self.library.find_crc(crc32).is_some() {
             return;
         }
-        let dir = config::data_dir().join("roms");
-        let mut path = dir.join(logic::received_rom_file_name(name, None));
-        if path.exists() {
-            path = dir.join(logic::received_rom_file_name(name, Some(crc32)));
-        }
+        let path = logic::received_rom_path(&config::data_dir().join("roms"), crc32, name);
         let tmp = path.with_extension("tmp");
-        let saved = std::fs::create_dir_all(&dir)
+        let saved = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| std::fs::write(&tmp, rom))
             .and_then(|()| std::fs::rename(&tmp, &path));
         match saved {
@@ -904,12 +988,16 @@ impl App {
         }
     }
 
-    /// Leaves whatever runs (battery written, BYE sent) and goes to the no-game state.
+    /// Leaves whatever runs (battery written, online game kept as the last moment, BYE sent)
+    /// and goes to the no-game state.
     fn end_game(&mut self) {
         self.update_battery(true);
         match std::mem::replace(&mut self.state, State::Menu) {
             State::Lobby(lobby) => lobby.leave(),
-            State::Net(net) => net.session.leave(),
+            State::Net(net) => {
+                net.keep_last_moment();
+                net.session.leave();
+            }
             State::Solo(_) | State::Menu => {}
         }
         self.lobby_status = None;
@@ -971,6 +1059,8 @@ impl App {
             }
             State::Net(n) => {
                 n.session.poll();
+                // Who made the save `take_saved` holds: its `Saved` event comes with it.
+                let mut saver = None;
                 for event in n.session.events() {
                     match event {
                         NetEvent::Interrupted { peer, disconnect_in_ms } => {
@@ -992,6 +1082,17 @@ impl App {
                                 self.ui.toast(self.ui.text(Text::Desync));
                             }
                         }
+                        NetEvent::Saved { slot } => {
+                            saver = Some(slot);
+                            let text = format_text(self.ui.text(Text::NetSaved), &n.slot_name(slot), 0);
+                            self.ui.toast(&text);
+                        }
+                        NetEvent::Loaded { slot } => {
+                            println!("ebobo: net load by slot {slot}");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            let text = format_text(self.ui.text(Text::NetLoaded), &n.slot_name(slot), 0);
+                            self.ui.toast(&text);
+                        }
                         NetEvent::Synchronizing { .. } | NetEvent::Synchronized { .. } => {}
                     }
                 }
@@ -1002,22 +1103,57 @@ impl App {
                     self.ui.error(&text);
                     return;
                 }
+                // Confirmed saves and checkpoints are identical on every peer; each writes its
+                // own copy so any of them can host the game next time.
+                let mut failed = false;
+                if let (Some(slot), Some(snapshot)) = (saver, n.session.take_saved()) {
+                    match n.write_state(ResumeKind::Save, &snapshot) {
+                        Ok(sha) => println!("ebobo: net save by slot {slot} sha {sha}"),
+                        Err(()) => failed = true,
+                    }
+                }
+                if let Some(snapshot) = n.session.take_checkpoint().filter(|_| netsave::last_due(n.advanced)) {
+                    match n.write_state(ResumeKind::Last, &snapshot) {
+                        Ok(sha) => println!("ebobo: last moment sha {sha}"),
+                        Err(()) => failed = true,
+                    }
+                }
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                if failed && !std::mem::replace(&mut n.write_failed, true) {
+                    self.ui.toast(self.ui.text(Text::StateSaveFailed));
+                }
                 let mut local: u16 = 0;
                 if !ui_visible {
                     local = logic::net_input(&frame.pads, &frame.turbo);
                 }
-                if n.reset_pending {
+                // Each request goes to the session once; it keeps the bit until GGRS takes an
+                // input of this player.
+                if std::mem::take(&mut n.reset_pending) {
                     local |= INPUT_RESET;
+                }
+                if std::mem::take(&mut n.save_pending) {
+                    local |= INPUT_SAVE;
+                }
+                if std::mem::take(&mut n.load_pending) {
+                    local |= INPUT_LOAD;
                 }
                 match n.session.advance(&mut n.nes, local) {
                     Ok(outcome) => {
                         if outcome.advanced {
-                            n.reset_pending = false;
                             n.advanced += 1;
                             n.last_advance = Instant::now();
                             if n.advanced % 300 == 0 {
                                 println!("ebobo: frame {} hash {:016x}", n.advanced, n.nes.state_hash());
                                 let _ = std::io::Write::flush(&mut std::io::stdout());
+                            }
+                            while let Some(&(at, key)) = n.script.get(n.script_at) {
+                                if at > n.advanced {
+                                    break;
+                                }
+                                n.script_at += 1;
+                                if !n.press(key) {
+                                    self.ui.toast(self.ui.text(Text::NoQuickSave));
+                                }
                             }
                         }
                     }
@@ -1156,6 +1292,52 @@ impl Net {
         let names: Vec<&str> = self.slots.iter().filter(|p| **p != self.me).map(|p| self.name_of(*p)).collect();
         names.join(", ")
     }
+
+    /// Name of the player on NES controller `slot`, short enough for a toast.
+    fn slot_name(&self, slot: usize) -> String {
+        self.names.get(slot).map_or("?", String::as_str).chars().take(12).collect()
+    }
+
+    /// F5 / F7 in a netplay game (menu, hotkey or `--script`): every peer saves / loads at the
+    /// frame this player's input reaches. A load without a shared save is refused (`false`).
+    fn press(&mut self, key: ScriptKey) -> bool {
+        match key {
+            ScriptKey::Save => self.save_pending = true,
+            ScriptKey::Load if self.session.has_save() => self.load_pending = true,
+            ScriptKey::Load => return false,
+        }
+        true
+    }
+
+    /// Leaving the game: this very frame becomes the last moment, so the next session
+    /// continues here and not at a checkpoint up to 5 s old (a boss beaten in those seconds
+    /// would be alive again). The newest frames ran on predicted inputs of the others, so
+    /// unlike the checkpoints this file is this player's own view.
+    fn keep_last_moment(&self) {
+        if !netsave::last_due(self.advanced) {
+            return;
+        }
+        if let Ok(sha) = self.write_state(ResumeKind::Last, &self.nes.snapshot()) {
+            println!("ebobo: last moment on leave sha {sha}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+
+    /// Writes an online save file of this ROM; `Ok` holds the first 16 hex digits of its
+    /// SHA-256. The first failure of a session is printed (later ones every 5 s would flood).
+    fn write_state(&self, kind: ResumeKind, snapshot: &Snapshot) -> Result<String, ()> {
+        let bytes = self.nes.encode_state(snapshot);
+        let dir = netsave::dir();
+        match netsave::write(&dir, self.nes.info().crc32, kind, &bytes) {
+            Ok(()) => Ok(netsave::sha16(&bytes)),
+            Err(err) => {
+                if !self.write_failed {
+                    eprintln!("ebobo: cannot write {}: {err}", netsave::path(&dir, self.nes.info().crc32, kind).display());
+                }
+                Err(())
+            }
+        }
+    }
 }
 
 fn make_ctx<'a>(
@@ -1177,6 +1359,7 @@ fn make_ctx<'a>(
             desync: false,
             stalled: false,
             save_slot: Some((s.slot, s.slot_times[s.slot as usize])),
+            can_load: false,
         }),
         State::Net(n) => Some(GameView {
             rom_name: &n.rom_name,
@@ -1187,6 +1370,7 @@ fn make_ctx<'a>(
             desync: n.desync,
             stalled: n.last_advance.elapsed() > STALL_DIM_AFTER,
             save_slot: None,
+            can_load: n.session.has_save(),
         }),
         State::Menu | State::Lobby(_) => None,
     };

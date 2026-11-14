@@ -26,6 +26,8 @@ The host picks Create room and gets a five-letter code. Friends pick Join by cod
 
 If someone can't get in, Settings > Advanced > Network check usually tells you why.
 
+Online games can be saved too: anyone can save or load for everyone from the menu (F5, F7). Next time the host makes a room with the same game, it continues where you stopped, or from the save.
+
 ROMs are found in `~/ROMs`, `~/Downloads`, EmuDeck's folder and a few other usual places. You can also drop one on the window.
 
 On the Steam Deck everything works by touch, and text fields bring up ebobo's own keyboard (Steam's keyboard can't type into it in Game Mode). Your Steam name is the default nickname. In Desktop Mode Steam makes the Deck's buttons type keys; ebobo switches them to a gamepad while its window is in front and back when you leave.

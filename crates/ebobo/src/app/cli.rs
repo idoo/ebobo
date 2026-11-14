@@ -24,11 +24,35 @@ usage: ebobo [ROM] [options]
   --effect NAME        picture effect: off, crt, pvm, lcd
   --exit-after SECONDS quit after this many seconds
   --autostart N        host: start the game once N players are in the room
+  --resume FROM        host: start from new, last (the last moment) or save instead of the
+                       default (the last moment, else the save, else a new game); a missing
+                       file means a new game
+  --script LIST        netplay: press F5 (save) / F7 (load) for everyone at advanced frames,
+                       e.g. 600=save,900=load
   --version            print the version
   --help               show this help
 
 Automation: a host prints `ebobo: room CODE`; a netplay game prints
-`ebobo: game started ...` and `ebobo: frame N hash H` every 300 frames.";
+`ebobo: game started ...` and `ebobo: frame N hash H` every 300 frames. Online saves print
+`ebobo: resumed last|save sha S` (a game started from a state), `ebobo: net save by slot N
+sha S` (the save file written), `ebobo: net load by slot N`, `ebobo: last moment sha S`
+(the last-moment file written from a checkpoint) and `ebobo: last moment on leave sha S`
+(written when the game is left); S = first 16 hex digits of the SHA-256 of the state bytes.";
+
+/// `--resume`: what a host starts from instead of the default choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeFrom {
+    New,
+    Last,
+    Save,
+}
+
+/// A `--script` step: the hotkey pressed (F5 save / F7 load for everyone).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptKey {
+    Save,
+    Load,
+}
 
 /// What to do right after startup.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -55,6 +79,9 @@ pub struct Cli {
     pub effect: Option<Effect>,
     pub exit_after: Option<f64>,
     pub autostart: Option<usize>,
+    pub resume: Option<ResumeFrom>,
+    /// `--script` steps sorted by frame.
+    pub script: Vec<(u64, ScriptKey)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -156,6 +183,16 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                 let n = raw.parse::<usize>().ok().filter(|n| (2..=4).contains(n)).ok_or_else(|| format!("bad player count: {raw}"))?;
                 cli.autostart = Some(n);
             }
+            "--resume" => {
+                let raw = value(flag)?;
+                cli.resume = Some(match raw.as_str() {
+                    "new" => ResumeFrom::New,
+                    "last" => ResumeFrom::Last,
+                    "save" => ResumeFrom::Save,
+                    _ => return Err(format!("bad --resume: {raw} (new, last, save)")),
+                });
+            }
+            "--script" => cli.script = parse_script(&value(flag)?)?,
             _ if flag.starts_with('-') && flag.len() > 1 => return Err(format!("unknown option: {flag}")),
             _ => set_start(&mut cli, Start::Solo(arg.into()))?,
         }
@@ -175,6 +212,25 @@ fn set_start(cli: &mut Cli, start: Start) -> Result<(), String> {
     }
     cli.start = start;
     Ok(())
+}
+
+/// `600=save,900=load` into steps sorted by frame.
+fn parse_script(raw: &str) -> Result<Vec<(u64, ScriptKey)>, String> {
+    let mut steps = raw
+        .split(',')
+        .map(|step| {
+            let (frame, key) = step.trim().split_once('=').ok_or_else(|| format!("bad --script step: {step} (FRAME=save|load)"))?;
+            let frame = frame.trim().parse::<u64>().map_err(|_| format!("bad --script frame: {frame}"))?;
+            let key = match key.trim() {
+                "save" => ScriptKey::Save,
+                "load" => ScriptKey::Load,
+                other => return Err(format!("bad --script key: {other} (save, load)")),
+            };
+            Ok((frame, key))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    steps.sort_by_key(|&(frame, _)| frame);
+    Ok(steps)
 }
 
 #[cfg(test)]
@@ -258,5 +314,30 @@ mod tests {
         assert_eq!(cli.screenshot_size, Some((1280, 800)));
         assert!(p(&["--effect", "vhs"]).is_err());
         assert!(p(&["--screenshot-size", "0x5"]).is_err());
+    }
+
+    #[test]
+    fn resume_and_script() {
+        assert_eq!(run(&["--host", "a.nes"]).resume, None);
+        assert_eq!(run(&["--resume", "new"]).resume, Some(ResumeFrom::New));
+        assert_eq!(run(&["--resume=last"]).resume, Some(ResumeFrom::Last));
+        assert_eq!(run(&["--resume", "save"]).resume, Some(ResumeFrom::Save));
+        assert_eq!(
+            run(&["--script", "900=load, 600=save,1200=save"]).script,
+            [(600, ScriptKey::Save), (900, ScriptKey::Load), (1200, ScriptKey::Save)]
+        );
+        assert_eq!(run(&["--script=600=save"]).script, [(600, ScriptKey::Save)]);
+        for bad in [
+            &["--resume", "old"][..],
+            &["--resume"],
+            &["--script"],
+            &["--script", "600"],
+            &["--script", "x=save"],
+            &["--script", "600=reset"],
+            &["--script", "600=save,"],
+            &["--script", "-5=save"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
     }
 }

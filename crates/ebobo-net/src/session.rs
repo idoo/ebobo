@@ -11,10 +11,11 @@ use ggrs::{DesyncDetection, GgrsError, GgrsEvent, GgrsRequest, InputStatus, P2PS
 use crate::lobby::{auto_input_delay, RttEstimator};
 use crate::mesh::Link;
 use crate::transport::{PeerId, RouteKind};
-use crate::{NetError, INPUT_RESET, INPUT_TURBO_A, INPUT_TURBO_B};
+use crate::{NetError, INPUT_LOAD, INPUT_RESET, INPUT_SAVE, INPUT_TURBO_A, INPUT_TURBO_B};
 
 /// ggrs configuration: `Input = u16` (pad bits 0-7, `INPUT_RESET` bit 8, `INPUT_TURBO_A` bit 9,
-/// `INPUT_TURBO_B` bit 10), `State = ebobo_core::Snapshot`, `Address = PeerId`.
+/// `INPUT_TURBO_B` bit 10, `INPUT_SAVE` bit 11, `INPUT_LOAD` bit 12), `State =
+/// ebobo_core::Snapshot`, `Address = PeerId`.
 pub struct EboboConfig;
 
 impl ggrs::Config for EboboConfig {
@@ -24,13 +25,18 @@ impl ggrs::Config for EboboConfig {
     type Address = PeerId;
 }
 
-/// Repeats the last input (the GGPO standard) without the one-frame reset bit: a reset is never
-/// held, so predicting it again would always miss. Turbo bits are held bits and repeat.
+/// Bits that act on the one frame they are sent for: reset, save for everyone, load for everyone.
+const ONE_FRAME_BITS: u16 = INPUT_RESET | INPUT_SAVE | INPUT_LOAD;
+
+/// Repeats the last input (the GGPO standard) without the one-frame bits (`ONE_FRAME_BITS`):
+/// they are never held, so predicting them again would always miss. A set one-frame bit
+/// therefore always comes from an input its player really sent. Turbo bits are held bits and
+/// repeat.
 pub struct PredictHeld;
 
 impl ggrs::InputPredictor<u16> for PredictHeld {
     fn predict(previous: u16) -> u16 {
-        previous & !INPUT_RESET
+        previous & !ONE_FRAME_BITS
     }
 }
 
@@ -61,6 +67,12 @@ pub enum NetEvent {
     Disconnected { peer: PeerId },
     /// States diverged at `frame` (should never happen; shown as a warning).
     Desync { frame: i32 },
+    /// The player on NES controller `slot` saved the game for everyone (`INPUT_SAVE`). Reported
+    /// once per save, when its frame is confirmed; `take_saved` then returns the state.
+    Saved { slot: usize },
+    /// The player on NES controller `slot` loaded the shared save for everyone (`INPUT_LOAD`).
+    /// Reported once per load, never again when its frame is re-simulated.
+    Loaded { slot: usize },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -128,6 +140,17 @@ impl ggrs::NonBlockingSocket<PeerId> for SharedSocket {
 // - notify 1.5 s: no Interrupted on mobile/far/asym in any run (loss bursts last ~50 ms), so the
 //   warning only shows for real outages.
 const MAX_PREDICTION: usize = 10;
+// With more than two players GGRS (vendored, GGPO's rule) confirms a frame only once every peer
+// reports holding every player's input for it, one network hop later than local receipt, and
+// the prediction window is counted from that frame; 10 would stall 3-4 player games that the
+// same link runs smoothly with two. A 16-frame rollback costs more core time per frame, but
+// rollbacks stay as deep as the input actually late, not as deep as the window.
+const MAX_PREDICTION_MULTI: usize = 16;
+
+/// The prediction window for a game of `players`: see `MAX_PREDICTION_MULTI`.
+pub(crate) fn max_prediction(players: usize) -> usize {
+    if players > 2 { MAX_PREDICTION_MULTI } else { MAX_PREDICTION }
+}
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DISCONNECT_NOTIFY: Duration = Duration::from_millis(1500);
 
@@ -143,6 +166,18 @@ const DELAY_RAISE_AFTER: Duration = Duration::from_secs(1);
 const DELAY_LOWER_AFTER: Duration = Duration::from_secs(10);
 /// Each change shifts the input stream by a frame; space them so one settles before the next.
 const DELAY_MIN_GAP: Duration = Duration::from_secs(1);
+/// A checkpoint (the "last moment" state) is recorded on every frame that is a multiple of this:
+/// 5 s at 60 fps.
+const CHECKPOINT_EVERY: i32 = 300;
+/// Frame of the save a game was started from: before every simulated frame.
+const START_FRAME: i32 = -1;
+
+/// A shared save: the state at the start of `frame`, saved by the player on controller `slot`.
+struct SaveRecord {
+    frame: i32,
+    slot: usize,
+    state: ebobo_core::Snapshot,
+}
 
 /// Adaptive input delay: moves `delay` one frame at a time toward the target computed from the
 /// worst link (`auto_input_delay`). Pure; time comes in as `now`.
@@ -213,6 +248,38 @@ pub struct NetSession {
     gone: Vec<bool>,
     frame_ms: f64,
     delay: DelayControl,
+    /// Shared saves by frame, oldest first: the newest final one (the start save of a game
+    /// continued from a save counts as final) and every newer one that is not final yet.
+    /// `INPUT_LOAD` on frame `f` restores the newest with a frame below `f`. A rollback to
+    /// frame `r` drops the ones from `r` on; re-simulation records them again.
+    saves: Vec<SaveRecord>,
+    /// Loads that restored a save and are not final yet, as (frame, slot); dropped and made
+    /// again by rollbacks like `saves`.
+    loads: Vec<(i32, usize)>,
+    /// Every frame up to this one is final: simulated with the real inputs of all connected
+    /// players, with the rollback those inputs caused already done, and never simulated again
+    /// (GGRS rolls back only above its confirmed frame). Saves, loads and checkpoints of such
+    /// frames are the same on every peer; they are reported and handed out only then. See
+    /// `finalize`.
+    final_through: i32,
+    /// One-frame bits handed to `advance` that GGRS has not taken yet; they go out with the
+    /// next local input it takes.
+    carry: u16,
+    /// GGRS frame of the last `advance` call. GGRS takes one local input per frame: a call
+    /// repeated for the same frame (the session waits at the prediction window) is ignored.
+    submitted: Option<i32>,
+    /// Local inputs GGRS will drop: one for every frame the input delay was lowered by (it
+    /// would land on a frame that already has an input).
+    drops: u32,
+    /// The newest final `INPUT_SAVE` state `take_saved` has not handed out yet.
+    saved_ready: Option<ebobo_core::Snapshot>,
+    /// The newest checkpoint, not final yet: (frame, state at the start of it).
+    checkpoint_pending: Option<(i32, ebobo_core::Snapshot)>,
+    /// The newest final checkpoint `take_checkpoint` has not handed out yet.
+    checkpoint_ready: Option<ebobo_core::Snapshot>,
+    /// Tests: the input words of every simulated frame, as last simulated.
+    #[cfg(test)]
+    input_log: Vec<[u16; 4]>,
     /// Tests: frame whose saved state hash is recorded in `probe_hash` (last save wins).
     #[cfg(test)]
     probe: (i32, Option<u64>),
@@ -229,8 +296,20 @@ impl NetSession {
     /// Builds the GGRS P2P session: `slots.len()` players, local handle = index of
     /// `link.me()` in `slots`, others remote. `fps` = 60 NTSC / 50 PAL. `delay_auto`: the local
     /// delay adapts to the worst link during the game, starting at `input_delay`.
-    pub fn new(link: Link, slots: &[PeerId], input_delay: usize, delay_auto: bool, fps: usize) -> Result<NetSession, NetError> {
-        NetSession::with_tuning(link, slots, input_delay, delay_auto, fps, MAX_PREDICTION, DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)
+    /// `shared_save`: the state every peer loaded before the first frame (a game continued
+    /// from a save), `None` for a game from power-on; it is what `INPUT_LOAD` loads until
+    /// somebody saves.
+    pub fn new(
+        link: Link,
+        slots: &[PeerId],
+        input_delay: usize,
+        delay_auto: bool,
+        fps: usize,
+        shared_save: Option<ebobo_core::Snapshot>,
+    ) -> Result<NetSession, NetError> {
+        let mut session = NetSession::with_tuning(link, slots, input_delay, delay_auto, fps, max_prediction(slots.len()), DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)?;
+        session.saves.extend(shared_save.map(|state| SaveRecord { frame: START_FRAME, slot: 0, state }));
+        Ok(session)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -285,6 +364,17 @@ impl NetSession {
             gone: vec![false; slots.len()],
             frame_ms: 1000.0 / fps.max(1) as f64,
             delay: DelayControl::new(input_delay, delay_auto),
+            saves: Vec::new(),
+            loads: Vec::new(),
+            final_through: START_FRAME,
+            carry: 0,
+            submitted: None,
+            drops: 0,
+            saved_ready: None,
+            checkpoint_pending: None,
+            checkpoint_ready: None,
+            #[cfg(test)]
+            input_log: Vec::new(),
             #[cfg(test)]
             probe: (NO_PROBE, None),
             #[cfg(test)]
@@ -295,6 +385,64 @@ impl NetSession {
     /// NES controller index this machine plays.
     pub fn local_slot(&self) -> usize {
         self.local
+    }
+
+    /// An `INPUT_LOAD` sent now would find a save: the game started from one, or somebody saved.
+    pub fn has_save(&self) -> bool {
+        !self.saves.is_empty()
+    }
+
+    /// The newest confirmed `INPUT_SAVE` state not yet taken (identical on every peer), for
+    /// the save file. Older untaken ones are gone.
+    pub fn take_saved(&mut self) -> Option<ebobo_core::Snapshot> {
+        self.saved_ready.take()
+    }
+
+    /// The newest confirmed periodic checkpoint not yet taken (identical on every peer at the
+    /// same frame), for the "last moment" file. Older untaken ones are gone.
+    pub fn take_checkpoint(&mut self) -> Option<ebobo_core::Snapshot> {
+        self.checkpoint_ready.take()
+    }
+
+    /// Moves `final_through` forward and reports what became final: `Saved` and `Loaded` in
+    /// frame order (a save before a load of the same frame), the newest save for `take_saved`,
+    /// the checkpoint for `take_checkpoint`. Saves older than the newest final one are dropped.
+    ///
+    /// Must run right after the requests of a `ggrs.advance_frame()` call were carried out,
+    /// with no poll in between. That call polled first, then rolled back to the first frame
+    /// whose prediction a received input contradicted, and `confirmed_frame()` is the last
+    /// frame for which every connected player's input has arrived: remote ones by that poll,
+    /// the local one up to the current frame plus the input delay; with more than two players
+    /// also every peer has reported holding it, so a leaver's disconnect is never moved down to
+    /// it or below. So every frame up to `confirmed_frame()` that was simulated (`sim_frame - 1`
+    /// is the last) ran with real inputs, and a later rollback starts above it, because a new
+    /// input is always for a frame above the confirmed one.
+    fn finalize(&mut self) {
+        let through = self.ggrs.confirmed_frame().min(self.sim_frame - 1);
+        if through <= self.final_through {
+            return;
+        }
+        let from = self.final_through;
+        self.final_through = through;
+        let saved = self.saves.iter().filter(|s| s.frame > from && s.frame <= through);
+        let loaded = self.loads.iter().filter(|l| l.0 <= through);
+        let mut events: Vec<(i32, NetEvent)> = saved
+            .map(|s| (s.frame, NetEvent::Saved { slot: s.slot }))
+            .chain(loaded.map(|&(frame, slot)| (frame, NetEvent::Loaded { slot })))
+            .collect();
+        // Stable: saves were chained first, so a save stays before a load of the same frame.
+        events.sort_by_key(|e| e.0);
+        self.pending.extend(events.into_iter().map(|e| e.1));
+        self.loads.retain(|l| l.0 > through);
+        if let Some(newest) = self.saves.iter().rposition(|s| s.frame <= through) {
+            if self.saves[newest].frame > from {
+                self.saved_ready = Some(self.saves[newest].state.clone());
+            }
+            self.saves.drain(..newest);
+        }
+        if self.checkpoint_pending.as_ref().is_some_and(|c| c.0 <= through) {
+            self.checkpoint_ready = self.checkpoint_pending.take().map(|c| c.1);
+        }
     }
 
     /// True once every peer is synchronized.
@@ -348,17 +496,38 @@ impl NetSession {
     /// Adds the local input and advances one frame, handling GGRS save/load/advance requests on
     /// `nes`. Audio of re-simulated frames is dropped, only the newest frame's samples remain
     /// buffered in `nes`.
+    ///
+    /// One-frame bits (`INPUT_RESET`, `INPUT_SAVE`, `INPUT_LOAD`) are never lost: when GGRS
+    /// does not take this call's input, they are kept for the next one it takes. So pass each
+    /// request once, whatever the outcome.
     pub fn advance(&mut self, nes: &mut Nes, local_input: u16) -> Result<FrameOutcome, NetError> {
+        self.carry |= local_input & ONE_FRAME_BITS;
         if !self.is_running() {
             self.poll();
             return Ok(FrameOutcome::default());
         }
-        self.ggrs.add_local_input(self.local, local_input).map_err(io)?;
-        // GGRS 0.13 P2P never returns `PredictionThreshold`: at the window it returns no
-        // `AdvanceFrame`, which `advances` counts. After a delay decrease GGRS drops the next
-        // submitted inputs internally; `advance_frame` still succeeds.
+        let before = self.ggrs.current_frame();
+        // GGRS takes the first input submitted for a frame, except the one after each frame
+        // the input delay was lowered by.
+        let fresh = self.submitted.replace(before) != Some(before);
+        let taken = fresh && self.drops == 0;
+        if fresh {
+            self.drops = self.drops.saturating_sub(1);
+        }
+        let mut word = local_input & !ONE_FRAME_BITS;
+        if taken {
+            word |= std::mem::take(&mut self.carry);
+        }
+        self.ggrs.add_local_input(self.local, word).map_err(io)?;
+        // GGRS 0.13 P2P never returns `PredictionThreshold`: at the window it returns no new
+        // `AdvanceFrame`, but it still carries out a rollback the received inputs caused, so
+        // the requests can re-simulate frames without adding one. After a delay decrease GGRS
+        // drops the next submitted inputs internally; `advance_frame` still succeeds.
         let requests = self.ggrs.advance_frame().map_err(io)?;
+        let new_frame = self.ggrs.current_frame() > before;
         let advances = requests.iter().filter(|r| matches!(r, GgrsRequest::AdvanceFrame { .. })).count();
+        // Frames before this many were shown and heard already.
+        let resimulated = advances - new_frame as usize;
         let mut seen = 0;
         for request in requests {
             match request {
@@ -375,53 +544,92 @@ impl NetSession {
                     let snapshot = cell.load().expect("ggrs asked to load a state it never saved");
                     nes.restore(&snapshot);
                     self.sim_frame = frame;
+                    // What was recorded for the frames about to be re-simulated is void.
+                    self.saves.retain(|s| s.frame < frame);
+                    self.loads.retain(|l| l.0 < frame);
+                    self.checkpoint_pending.take_if(|c| c.0 >= frame);
                 }
                 GgrsRequest::AdvanceFrame { inputs } => {
+                    let frame = self.sim_frame;
                     let mut pads = [0u8; 4];
                     let mut reset = false;
+                    // Lowest controller that sent the bit.
+                    let (mut saver, mut loader) = (None, None);
+                    #[cfg(test)]
+                    let mut words = [0u16; 4];
                     for (slot, &(input, status)) in inputs.iter().enumerate().take(4) {
                         if status == InputStatus::Disconnected {
                             continue;
                         }
-                        pads[slot] = expand_turbo(input, self.sim_frame);
+                        pads[slot] = expand_turbo(input, frame);
                         reset |= input & INPUT_RESET != 0;
+                        if input & INPUT_SAVE != 0 {
+                            saver.get_or_insert(slot);
+                        }
+                        if input & INPUT_LOAD != 0 {
+                            loader.get_or_insert(slot);
+                        }
+                        #[cfg(test)]
+                        {
+                            words[slot] = input;
+                        }
+                    }
+                    #[cfg(test)]
+                    {
+                        self.input_log.resize(self.input_log.len().max(frame as usize + 1), [0; 4]);
+                        self.input_log[frame as usize] = words;
+                    }
+                    // In this order: a save and a load on one frame save the state the frame
+                    // starts with and load the save before it.
+                    if let Some(slot) = saver {
+                        self.saves.push(SaveRecord { frame, slot, state: nes.snapshot() });
+                    }
+                    if frame > 0 && frame % CHECKPOINT_EVERY == 0 {
+                        self.checkpoint_pending = Some((frame, nes.snapshot()));
+                    }
+                    if let Some(slot) = loader {
+                        if let Some(save) = self.saves.iter().rev().find(|s| s.frame < frame) {
+                            nes.restore(&save.state);
+                            self.loads.push((frame, slot));
+                        }
                     }
                     if reset {
                         nes.reset();
                     }
                     seen += 1;
                     // Re-simulated frames are never shown or heard: skip pixels and audio.
-                    nes.set_fast_forward(seen < advances);
+                    nes.set_fast_forward(seen <= resimulated);
                     nes.run_frame(pads);
-                    if seen < advances {
+                    if seen <= resimulated {
                         nes.clear_audio();
                     }
                     self.sim_frame += 1;
                 }
             }
         }
-        self.last_rollback = advances.saturating_sub(1) as u32;
+        self.last_rollback = resimulated as u32;
+        self.finalize();
         // Delay changes go after `advance_frame`, never between it and `add_local_input`, and
-        // only on a frame that advanced, so the input queue took a new input since the last
-        // change (two increases without one would send overlapping fill frames). A reset frame
-        // is skipped: an increase copies the last input, which would repeat the reset.
-        if advances > 0 && local_input & INPUT_RESET == 0 {
+        // only on a frame whose input GGRS took, so the input queue has a new input since the
+        // last change (two increases without one would send overlapping fill frames). An input
+        // with a one-frame bit is skipped: an increase copies the last input, which would
+        // repeat the reset, save or load.
+        if new_frame && taken && word & ONE_FRAME_BITS == 0 {
             self.adapt_delay(Instant::now())?;
         }
-        Ok(FrameOutcome { advanced: advances > 0, rollback_frames: self.last_rollback })
+        Ok(FrameOutcome { advanced: new_frame, rollback_frames: self.last_rollback })
     }
 
     fn adapt_delay(&mut self, now: Instant) -> Result<(), NetError> {
+        let old = self.delay.delay();
         #[cfg(test)]
-        if let Some(d) = self.force_delay.take() {
-            self.delay.delay = d;
-            return self.ggrs.set_input_delay(self.local, d).map_err(io);
-        }
+        let forced = self.force_delay.take().inspect(|&d| self.delay.delay = d);
+        #[cfg(not(test))]
+        let forced = None;
         let target = self.delay_target();
-        if let Some(d) = self.delay.update(target, now) {
-            self.ggrs.set_input_delay(self.local, d).map_err(io)?;
-        }
-        Ok(())
+        let Some(delay) = forced.or_else(|| self.delay.update(target, now)) else { return Ok(()) };
+        self.drops += old.saturating_sub(delay) as u32;
+        self.ggrs.set_input_delay(self.local, delay).map_err(io)
     }
 
     pub fn events(&mut self) -> Vec<NetEvent> {

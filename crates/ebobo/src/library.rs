@@ -21,6 +21,9 @@ pub struct RomEntry {
     /// Mapper is in `ebobo_core::SUPPORTED_MAPPERS`.
     pub supported: bool,
     pub region: Region,
+    /// When the file was last modified, seconds since the Unix epoch (0 = unknown). Orders
+    /// entries with the same name newest first and dates them in the picker.
+    pub mtime: u64,
 }
 
 const MAX_ROM_BYTES: u64 = 8 * 1024 * 1024;
@@ -113,7 +116,7 @@ pub fn load_rom_file(path: &Path) -> Result<Vec<u8>, String> {
     read_rom(path).map(|(bytes, _)| bytes)
 }
 
-fn make_entry(path: &Path, bytes: &[u8], inner_stem: Option<String>) -> Result<RomEntry, String> {
+fn make_entry(path: &Path, bytes: &[u8], inner_stem: Option<String>, mtime: u64) -> Result<RomEntry, String> {
     let info = ebobo_core::cart::parse(bytes).map_err(|e| format!("{}: {e:?}", path.display()))?;
     Ok(RomEntry {
         path: path.to_path_buf(),
@@ -122,14 +125,27 @@ fn make_entry(path: &Path, bytes: &[u8], inner_stem: Option<String>) -> Result<R
         mapper: info.mapper,
         supported: ebobo_core::SUPPORTED_MAPPERS.contains(&info.mapper),
         region: info.region,
+        mtime,
     })
 }
 
-fn sort_key(e: &RomEntry) -> (String, &Path) {
-    (e.name.to_lowercase(), e.path.as_path())
+/// Modification time as the cache stores it: nanoseconds since the Unix epoch, 0 = unknown.
+fn mtime_nanos(meta: &fs::Metadata) -> u128 {
+    meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())
 }
 
-/// Inserts keeping the list sorted by lower-cased name (then path).
+/// `RomEntry::mtime` from the cache's nanoseconds.
+fn mtime_secs(nanos: u128) -> u64 {
+    u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX)
+}
+
+/// Lower-cased name, then newest first, then path: two builds of one game sit together with
+/// the latest on top.
+fn sort_key(e: &RomEntry) -> (String, std::cmp::Reverse<u64>, &Path) {
+    (e.name.to_lowercase(), std::cmp::Reverse(e.mtime), e.path.as_path())
+}
+
+/// Inserts keeping the list sorted by `sort_key`.
 fn insert_sorted(list: &mut Vec<RomEntry>, entry: RomEntry) {
     let key = sort_key(&entry);
     let at = list.partition_point(|e| sort_key(e) < key);
@@ -219,7 +235,8 @@ impl Shared {
     fn read_entry(&self, path: &Path) -> Result<RomEntry, String> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         let (bytes, inner) = read_rom(path)?;
-        make_entry(path, &bytes, inner)
+        let mtime = fs::metadata(path).map_or(0, |m| mtime_secs(mtime_nanos(&m)));
+        make_entry(path, &bytes, inner, mtime)
     }
 
     fn scan_loop(self: Arc<Self>) {
@@ -267,7 +284,8 @@ impl Shared {
                 };
                 if let Some((name, crc32, mapper, region)) = row.rom.clone() {
                     let supported = ebobo_core::SUPPORTED_MAPPERS.contains(&mapper);
-                    add(RomEntry { path: path.clone(), name, crc32, mapper, supported, region }, &mut found);
+                    let entry = RomEntry { path: path.clone(), name, crc32, mapper, supported, region, mtime: mtime_secs(mtime) };
+                    add(entry, &mut found);
                 }
                 new_cache.insert(path, row);
             }
@@ -304,12 +322,7 @@ fn collect_files(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, u64, u128)>, 
             && meta.len() <= MAX_ROM_BYTES
         {
             *budget -= 1;
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_nanos());
-            out.push((path, meta.len(), mtime));
+            out.push((path, meta.len(), mtime_nanos(&meta)));
         }
     }
 }
@@ -523,6 +536,100 @@ mod tests {
         z.start_file("a.txt", zip::write::SimpleFileOptions::default()).unwrap();
         z.finish().unwrap();
         assert!(load_rom_file(&p).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn set_mtime(path: &Path, unix_secs: u64) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(unix_secs)).unwrap();
+    }
+
+    /// Two builds of one game (same file name, different CRC) in different folders, as after
+    /// receiving a newer build from a netplay host: both are listed, the newer file first,
+    /// whatever the folder order.
+    #[test]
+    fn library_same_name_builds_are_listed_newest_first() {
+        let root = temp_dir("builds");
+        let home = root.join("ROMs");
+        let received = root.join("data/roms");
+        let (old, new) = (rom(1, true, 1), rom(1, true, 2));
+        let old_path = home.join("Chip 4P (Europe).nes");
+        // Received ROMs sit one folder deep, `<data dir>/roms/<crc32>/<name>.nes`.
+        let new_path = received.join(format!("{:08x}", crc(&new))).join("Chip 4P (Europe).nes");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, &old).unwrap();
+        fs::write(&new_path, &new).unwrap();
+        fs::write(home.join("Zelda.nes"), rom(1, false, 3)).unwrap();
+        fs::write(home.join("Abc.nes"), rom(1, false, 4)).unwrap();
+        set_mtime(&old_path, 1_794_000_000);
+        set_mtime(&new_path, 1_794_600_000);
+
+        let lib = Library::with_cache(vec![home.clone(), received.clone()], root.join("cache.tsv"));
+        wait(&lib);
+        let got: Vec<(String, u32, u64)> = lib.entries().into_iter().map(|e| (e.name, e.crc32, e.mtime)).collect();
+        let name = "Chip 4P (Europe)".to_string();
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].0, "Abc");
+        assert_eq!(got[1], (name.clone(), crc(&new), 1_794_600_000));
+        assert_eq!(got[2], (name.clone(), crc(&old), 1_794_000_000));
+        assert_eq!(got[3].0, "Zelda");
+
+        // The order follows the file dates, not the folders: with the dates swapped (and the
+        // cache rows stale) the home copy comes first.
+        set_mtime(&old_path, 1_794_700_000);
+        lib.rescan();
+        wait(&lib);
+        let paths: Vec<PathBuf> = lib.entries().into_iter().filter(|e| e.name == name).map(|e| e.path).collect();
+        assert_eq!(paths, [old_path.clone(), new_path.clone()]);
+
+        // A file added by hand (drag and drop) is dated and placed the same way.
+        let dropped = root.join("dropped/Chip 4P (Europe).nes");
+        fs::create_dir_all(dropped.parent().unwrap()).unwrap();
+        fs::write(&dropped, rom(1, true, 5)).unwrap();
+        set_mtime(&dropped, 1_794_650_000);
+        assert_eq!(lib.add_file(&dropped).unwrap().mtime, 1_794_650_000);
+        let paths: Vec<PathBuf> = lib.entries().into_iter().filter(|e| e.name == name).map(|e| e.path).collect();
+        assert_eq!(paths, [old_path, dropped, new_path]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A cache file written before entries carried a date (seven tab-separated fields, mtime
+    /// in nanoseconds) is still used: its rows are trusted without reading the files, and the
+    /// entry's date comes from the file.
+    #[test]
+    fn library_cache_from_an_older_build_still_loads() {
+        let root = temp_dir("oldcache");
+        let dir = root.join("roms");
+        fs::create_dir_all(&dir).unwrap();
+        // Not a ROM at all: the entry can only come from the cache row.
+        let path = dir.join("whatever.nes");
+        fs::write(&path, b"0123456789").unwrap();
+        set_mtime(&path, 1_794_600_000);
+        let gone = dir.join("gone.nes");
+        let cache = root.join("library-cache.tsv");
+        let text = format!(
+            "{}\t10\t1794600000000000000\t0123abcd\t4\tP\tCached Game (Europe)\n{}\t5\t7\t-\t-\t-\t-\n",
+            path.display(),
+            gone.display()
+        );
+        fs::write(&cache, text).unwrap();
+
+        let lib = Library::with_cache(vec![dir], cache);
+        wait(&lib);
+        assert_eq!(lib.shared.reads.load(Ordering::Relaxed), 0, "the cache row is used, the file is not read");
+        assert_eq!(
+            lib.entries(),
+            [RomEntry {
+                path,
+                name: "Cached Game (Europe)".into(),
+                crc32: 0x0123_abcd,
+                mapper: 4,
+                supported: ebobo_core::SUPPORTED_MAPPERS.contains(&4),
+                region: Region::Pal,
+                mtime: 1_794_600_000,
+            }]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

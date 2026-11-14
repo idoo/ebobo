@@ -40,11 +40,17 @@ pub fn path(dir: &Path, stem: &str, crc32: u32, slot: u8) -> PathBuf {
 
 /// Writes the state atomically: a temp file next to it, then rename over the old one.
 pub fn save(nes: &Nes, path: &Path) -> io::Result<()> {
+    write(path, &nes.save_state())
+}
+
+/// Writes save-state bytes atomically (temp file `<path>.tmp`, then a rename over the old
+/// file), creating the directory; a crash mid-write never leaves a cut file.
+pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("state.tmp");
-    std::fs::write(&tmp, nes.save_state())?;
+    std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })

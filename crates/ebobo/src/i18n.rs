@@ -77,6 +77,10 @@ impl Lang {
                 ["ROM повреждён", "Полученный файл не совпал с ROM хоста.", "Войди в комнату ещё раз, чтобы получить ROM заново."],
                 ["ROM corrupt", "The received file differs from the host's ROM.", "Join the room again to receive it anew."],
             ),
+            NetError::SaveTransfer => pick(
+                ["Сохранение не дошло", "Сохранённая игра не дошла до одного из игроков.", "Начни ещё раз или выбери «Новая игра»."],
+                ["Save not delivered", "The saved game did not reach one of the players.", "Start again or pick New game."],
+            ),
             NetError::BadRom(_) => pick(
                 ["ROM не запускается", "Эмулятор не может загрузить эту игру.", "Выберите другой ROM."],
                 ["ROM won't load", "The emulator cannot load this game.", "Pick another ROM."],
@@ -279,6 +283,19 @@ pub(crate) enum S {
     HintRewind,
     HintFastForward,
     HintScreenshot,
+    SaveAll,
+    LoadAll,
+    LoadAllQ,
+    LoadAllLoses,
+    LoadYes,
+    Cancel,
+    ResumeNew,
+    ResumeLast,
+    ResumeSave,
+    NetSaved,
+    NetLoaded,
+    ResumedLast,
+    ResumedSave,
 }
 
 impl S {
@@ -451,6 +468,19 @@ impl S {
             HintRewind => ("Назад во времени: {keys}", "Rewind: {keys}"),
             HintFastForward => ("Ускорение: {keys}", "Fast-forward: {keys}"),
             HintScreenshot => ("Снимок экрана: {keys}", "Screenshot: {keys}"),
+            SaveAll => ("Сохранить для всех (F5)", "Save for everyone (F5)"),
+            LoadAll => ("Загрузить для всех (F7)", "Load for everyone (F7)"),
+            LoadAllQ => ("Загрузить сохранение?", "Load the save?"),
+            LoadAllLoses => ("Всё, что было после сохранения, пропадёт у всех.", "Everything since the save is lost for everyone."),
+            LoadYes => ("Загрузить", "Load"),
+            Cancel => ("Отмена", "Cancel"),
+            ResumeNew => ("Новая игра", "New game"),
+            ResumeLast => ("Прошлая игра", "Last moment"),
+            ResumeSave => ("Сохранение", "Save"),
+            NetSaved => ("{name} сохранил для всех", "{name} saved for everyone"),
+            NetLoaded => ("{name} загрузил сохранение", "{name} loaded the save"),
+            ResumedLast => ("Продолжаем прошлую игру", "Back to the last moment"),
+            ResumedSave => ("Продолжаем с сохранения", "Continuing from the save"),
         }
     }
 }

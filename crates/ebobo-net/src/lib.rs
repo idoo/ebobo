@@ -21,13 +21,13 @@ mod transport;
 use std::fmt;
 
 pub use diag::{NatKind, NetDiag, diagnose};
-pub use lobby::{GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, PlayerInfo, RomState, Stage};
+pub use lobby::{GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, PlayerInfo, Resume, ResumeInfo, ResumeKind, RomState, Stage};
 pub use session::{FrameOutcome, NetEvent, NetSession, NetStats, PeerStats};
 pub use mesh::Link;
 pub use transport::{PeerId, RouteKind};
 
 /// Lobby `proto` value; peers with a different one refuse to play together.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_PLAYERS: usize = 4;
 pub const DEFAULT_DIRECT_PORT: u16 = 7777;
 /// Netplay input bit 8: press the console's Reset button on this frame.
@@ -37,6 +37,10 @@ pub const INPUT_RESET: u16 = 0x100;
 pub const INPUT_TURBO_A: u16 = 0x200;
 /// Netplay input bit 10: turbo B is held; expanded like `INPUT_TURBO_A`.
 pub const INPUT_TURBO_B: u16 = 0x400;
+/// Netplay input bit 11: save the game for everyone on this frame (one frame, like reset).
+pub const INPUT_SAVE: u16 = 0x800;
+/// Netplay input bit 12: load the shared save for everyone on this frame (one frame).
+pub const INPUT_LOAD: u16 = 0x1000;
 /// Room code alphabet: no I, O, 0, 1.
 pub const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub const CODE_LEN: usize = 5;
@@ -59,6 +63,8 @@ pub enum NetError {
     RomCrc,
     /// The ROM could not be loaded by the emulator core.
     BadRom(String),
+    /// The host's saved game did not reach a player, or arrived damaged.
+    SaveTransfer,
     /// Direct mode: nobody answered.
     Timeout,
     /// Peer left or stopped answering.
@@ -79,6 +85,7 @@ impl fmt::Display for NetError {
             NetError::RomMissing => write!(f, "ROM missing"),
             NetError::RomCrc => write!(f, "received ROM is corrupt"),
             NetError::BadRom(detail) => write!(f, "ROM cannot be loaded: {detail}"),
+            NetError::SaveTransfer => write!(f, "saved game was not delivered"),
             NetError::Timeout => write!(f, "connection timed out"),
             NetError::Disconnected => write!(f, "peer disconnected"),
             NetError::Io(detail) => write!(f, "network error: {detail}"),

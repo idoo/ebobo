@@ -1,4 +1,4 @@
-# ebobo network protocol (v2)
+# ebobo network protocol (v3)
 
 Up to 4 players. Peer 0 is the host (NES controller 1 by default), guests get ids 1..3.
 GGRS runs as a full mesh: every peer exchanges inputs with every other peer, each pair over
@@ -9,7 +9,8 @@ Layers:
 
 1. **Rendezvous**: room on the signaling server (WebSocket), or direct IP (2 players only).
 2. **Routes**: per pair of peers, UDP hole punching, falling back to relay.
-3. **Lobby**: over routes: game info, ROM check/transfer, ready, start (reliable CTRL channel).
+3. **Lobby**: over routes: game info, ROM check/transfer, ready, saved-game transfer, start
+   (reliable CTRL channel).
 4. **Game**: GGRS messages over routes.
 
 ## 1. Signaling server (Cloudflare Worker `ebobo-signal`, one Durable Object per room)
@@ -200,6 +201,8 @@ All little-endian. Max packet 1200 bytes.
 | 0x11 | CTRL_ACK | `seq: u32` |
 | 0x20 | ROM_CHUNK | `offset: u32`, `total: u32`, data (≤ 1024 bytes) |
 | 0x21 | ROM_ACK | `next: u32` (all bytes below `next` received) |
+| 0x22 | STATE_CHUNK | `id: u32`, `total: u32`, `crc32: u32`, `index: u16`, data (1-1024 bytes) |
+| 0x23 | STATE_ACK | `id: u32`, bitmap of the chunks held (bit `i % 8` of byte `i / 8`, ≤ 128 bytes) |
 | 0x30 | GGRS | bincode 1.3 of `ggrs::Message` |
 | 0x3F | BYE | empty (peer is leaving; drop the route) |
 
@@ -215,15 +218,23 @@ ROM transfer: sender keeps up to 32 chunks in flight from `next`, retransmits fr
 acked `next` after 300 ms without progress; receiver acks the highest contiguous byte count on
 every chunk.
 
+State transfer (a game started from a save, section 4): the state is cut into 1024-byte chunks;
+chunk `index` starts at byte `index * 1024` and only the last one is shorter. Every chunk
+carries the transfer `id` (a host counter from 1, new for every attempt) and the size and
+CRC-32 of the whole state, so chunks of an abandoned attempt are ignored and order does not
+matter. The guest answers every chunk, duplicates included, with a STATE_ACK listing all chunks
+it holds. The host keeps up to 64 unacked chunks in flight per guest, lowest first, and resends
+a chunk that stays unacked for that peer's CTRL RTO. A state is at most 1 MiB.
+
 ## 4. Lobby (CTRL JSON over routes)
 
 Host → each guest, as soon as the route is up:
 
 ```json
-{"t":"game","proto":2,"core":"0.1.0","name":"Ivan","rom":{"crc32":"1a2b3c4d","size":131088,"name":"Test Game (USA).nes"},"region":"ntsc","four_score":false}
+{"t":"game","proto":3,"core":"0.1.0","name":"Ivan","rom":{"crc32":"1a2b3c4d","size":131088,"name":"Test Game (USA).nes"},"region":"ntsc","four_score":false}
 ```
 
-Guest → host: `{"t":"rom","have":true,"name":"Sasha","proto":2,"ver":"0.1.0"}` (the guest
+Guest → host: `{"t":"rom","have":true,"name":"Sasha","proto":3,"ver":"0.1.0"}` (the guest
 looked the CRC up in its library; `name` is the guest's nickname, needed in direct-IP mode where
 no server announces it; `ver` is the guest's ebobo version). If `have` is false the host streams
 the raw ROM file (header included) with ROM_CHUNK; the guest verifies the PRG+CHR CRC-32 and
@@ -247,8 +258,12 @@ estimator steady samples for the input delay.
 Host → every guest whenever anything changes (lobby UI):
 
 ```json
-{"t":"players","list":[{"id":0,"name":"Ivan","route":"self","rtt":0,"ready":true},{"id":1,"name":"Sasha","route":"direct","rtt":34,"ready":true}]}
+{"t":"players","list":[{"id":0,"name":"Ivan","route":"self","rtt":0,"ready":true},{"id":1,"name":"Sasha","route":"direct","rtt":34,"ready":true}],"resume":{"kind":"last","saved_at":1794690000}}
 ```
+
+`resume` is what the host will start from: `null` for a new game, or its saved game: `kind`
+`last` (the automatic save of the last online session of this ROM) or `save` (made with "save
+for everyone", section 5) and when it was saved in Unix seconds. Guests only show it.
 
 The host may start when ≥ 2 peers are present and every guest is ready with links to all other
 present peers. Host sends `{"t":"lock"}` to the server, then to every guest:
@@ -269,12 +284,32 @@ delay during the game (section 5); false keeps `delay` fixed for everyone. Direc
 the same rule. `four_score` = true when more than 2 slots are used or the ROM header asks for it.
 Each peer starts GGRS when it receives (guests) or sends (host) `start`.
 
+Start from a saved game: when the host's `resume` is set, pressing start first sends the state
+(an `ebobo_core::Nes::save_state` blob) to every guest with STATE_CHUNK (section 3). Until every
+present guest holds all of it nothing else changes: the room stays unlocked, and a guest that
+leaves is dropped from the transfer. Then the host locks the room and sends `start` with one
+more field, `"state":{"id":7,"size":61234,"crc32":"1a2b3c4d","kind":"last","saved_at":1794690000}`
+(`kind` and `saved_at` as in `resume`). A guest starts only if it holds exactly that state (id,
+size, CRC-32 as for ROMs), and every peer loads it into the freshly powered-on console before
+frame 0. If the state is not everywhere within 10 s, or a guest
+answers `{"t":"error","msg":"save"}` (more than 1 MiB, CRC mismatch, or a `start` naming a state
+it does not hold; that guest fails with `NetError::SaveTransfer`), the host calls the start
+off: it reports `NetError::SaveTransfer`, stays in the lobby and may start again. A `start`
+without `state` is a game from power-on.
+
 `{"t":"leave"}` (any → all) and BYE packets end the lobby/game for that peer.
 
 ## 5. Game (GGRS)
 
-GGRS is pinned to upstream revision `25bd998` (0.13.0 plus fixes; its input packets carry the
-frame they are delta-encoded against, which 0.13.0's did not, so the two do not interoperate).
+GGRS is vendored in `vendor/ggrs` from upstream revision `25bd998` (0.13.0 plus fixes; its input
+packets carry the frame they are delta-encoded against, which 0.13.0's did not, so the two do
+not interoperate) with one change for games of more than two players, as in the original GGPO:
+the confirmed frame is the lowest frame every peer reports to hold of every connected player,
+not only what arrived locally. When a player drops, the others settle on the lowest frame any
+of them holds of its input, and upstream had by then discarded inputs that frame still needed
+(a crash). For that, a peer whose connection status changed while it sends no input (it waits
+at the prediction window) sends the status alone, as a GGRS input message without input bytes,
+at most every 24 ms, and repeats it every 64 ms.
 `ggrs::Config`: `Input = u16`, `State =
 ebobo_core::Snapshot`, `Address = PeerId(u8)`. Players = `slots.len()`, local handle = own slot
 index, every other slot is `PlayerType::Remote(PeerId)`. FPS = 60 (NTSC) / 50 (PAL). The
@@ -282,18 +317,37 @@ session takes the `Link` from `GameStart.link` (the lobby's live mesh, section 2
 `Link::udp(socket, me, peers)` for fixed UDP routes without a server; every GGRS poll also
 drives its signaling, route health, punching, relay mirroring and roaming. A BYE from a peer
 disconnects its player.
-Max prediction 10, desync detection every 60 frames (checksum = `Nes::state_hash` truncated to
+Max prediction 10 with two players and 16 with more (the confirmed frame then lags one more
+network hop), desync detection every 60 frames (checksum = `Nes::state_hash` truncated to
 u128), disconnect timeout 20 s, notify after 1.5 s. A frame whose combined input has any reset
 bit runs `Nes::reset()` before `run_frame`.
 
 Input word: bits 0-7 = NES pad held, bit 8 = reset request (one frame), bit 9 = turbo A held,
-bit 10 = turbo B held. Turbo travels as a held bit; every peer expands it from the GGRS frame
-number f being simulated: the turbo phase is on when `(f / 2) % 2 == 0` (2 frames on, 2 off).
-A pad button is pressed when its bit is held, or when its turbo bit is set and the phase is on.
-Disconnected players read as all released.
+bit 10 = turbo B held, bit 11 = save for everyone (one frame), bit 12 = load for everyone (one
+frame). Turbo travels as a held bit; every peer expands it from the GGRS frame number f being
+simulated: the turbo phase is on when `(f / 2) % 2 == 0` (2 frames on, 2 off). A pad button is
+pressed when its bit is held, or when its turbo bit is set and the phase is on. Disconnected
+players read as all released.
 
-Prediction: a missing remote input is predicted as that player's last input without the reset
-bit. Held and turbo bits repeat, so a held turbo button predicts correctly.
+Prediction: a missing remote input is predicted as that player's last input without the reset,
+save and load bits. Held and turbo bits repeat, so a held turbo button predicts correctly.
+
+Shared save: every peer keeps one in memory, first the state the game started from (section 4),
+then the state of the last save bit. Frame f, with the bits OR-ed over the connected players,
+runs in this order: a save bit records the state at the start of f as the shared save; a load
+bit restores the newest shared save recorded for a frame before f (nothing when there is none);
+a reset bit resets the console; then the frame runs. The bits are real inputs, never predicted,
+so a rollback records a save again when its frame is simulated again, and every peer ends with
+the same state for it. No state travels during a game. A one-frame bit a player asks for is
+sent with the next input GGRS takes from that player (it takes none while the session waits at
+the prediction window, and drops one for every frame the input delay falls by). A save counts
+once its frame is
+confirmed, that is every input up to it has arrived and the rollback they caused is done: then
+the peer reports it and writes it to its own disk (`netplay/<crc32>.save.state`). Every 300
+frames each peer records a checkpoint the same way (`netplay/<crc32>.last.state`, written only
+after 3600 frames of a session). A player who leaves writes the frame it left on to the same
+last-moment file; that one is its own view and may differ from the others' by the last
+predicted frames. These two files are what a host can start from later.
 
 Smoothed RTT: each peer samples GGRS's ping to every remote player every 200 ms (none during the
 first second, none for players that left) into the same RFC 6298 estimator the lobby uses
@@ -304,8 +358,8 @@ target is the section 4 formula applied to the worst warm remote link. The delay
 frame after the target was above it for 1 s without a break, and falls by one after it was below
 for 10 s without a break. Two changes are at least 1 s apart, the delay stays within 1-6, and
 nothing changes while no link is warm. A change is applied after a frame advanced, never on a
-frame carrying a reset. GGRS sends copies of the last input to fill the gap on a rise and drops
-the next inputs on a fall, so peers stay in sync without extra messages.
+frame carrying a reset, save or load bit. GGRS sends copies of the last input to fill the gap
+on a rise and drops the next inputs on a fall, so peers stay in sync without extra messages.
 
 Tuning (measured with the network profiles in `crates/ebobo-net/src/session_tests.rs`, release
 build): prediction 10 instead of 8 cuts stalls on a 150 ms one-way link from 14-33 % to 4-11 % of

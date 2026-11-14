@@ -1,6 +1,6 @@
-//! Lobby on top of the mesh: game info, ROM check and transfer, ready, start
-//! (`docs/PROTOCOL.md` section 4). Runs on a background thread so the UI never blocks.
-//! Owner: lobby slice.
+//! Lobby on top of the mesh: game info, ROM check and transfer, ready, the saved game the host
+//! starts from (announce and transfer), start (`docs/PROTOCOL.md` section 4). Runs on a
+//! background thread so the UI never blocks. Owner: lobby slice.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -12,7 +12,7 @@ use ebobo_core::{cart, Region};
 use serde_json::{json, Value};
 
 use crate::mesh::{Link, Mesh, MeshConfig, MeshEvent, MeshRole};
-use crate::packet::{Packet, ROM_CHUNK_DATA};
+use crate::packet::{Packet, ROM_CHUNK_DATA, STATE_CHUNK_DATA};
 use crate::transport::{PeerId, RouteKind};
 use crate::{NetError, MAX_PLAYERS, PROTOCOL_VERSION};
 
@@ -28,6 +28,17 @@ const ROM_RETRY: Duration = Duration::from_millis(300);
 const START_ACK_WAIT: Duration = Duration::from_secs(3);
 /// Largest ROM a guest accepts over the wire.
 const MAX_ROM: usize = 8 * 1024 * 1024;
+/// Largest saved game (`Resume::state`) a host sends and a guest accepts. NES states are
+/// 20-100 KB; the cap keeps a broken peer from making a guest allocate without bound and fits
+/// the chunk index (`u16`) and the ack bitmap (128 bytes) in one packet.
+const MAX_STATE: usize = 1024 * 1024;
+/// A start from a save is called off (`NetError::SaveTransfer` on the host, the lobby stays
+/// usable) when some guest does not hold the whole state this long after the host pressed start.
+const STATE_WAIT: Duration = Duration::from_secs(10);
+/// Saved-game chunks in flight per guest (sent, not acked, not yet timed out): 64 KB, so a
+/// typical state goes out in one or two round trips without flooding a slow uplink. A chunk
+/// unacked for the peer's CTRL retransmit timeout is sent again.
+const STATE_WINDOW: usize = 64;
 
 pub struct LobbyConfig {
     /// Signaling server base URL.
@@ -69,6 +80,32 @@ pub enum RomState {
     Missing,
 }
 
+/// Which save the host starts the game from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeKind {
+    /// The automatic save of the last online session of this game.
+    Last,
+    /// The save a player made with "Save for everyone".
+    Save,
+}
+
+/// A saved game the host starts from instead of power-on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resume {
+    pub kind: ResumeKind,
+    /// When it was saved, Unix seconds; shown to every player in the lobby.
+    pub saved_at: u64,
+    /// `ebobo_core::Nes::save_state` bytes for the host's ROM.
+    pub state: Vec<u8>,
+}
+
+/// `Resume` without the bytes, for the lobby screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResumeInfo {
+    pub kind: ResumeKind,
+    pub saved_at: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerInfo {
     pub id: PeerId,
@@ -98,6 +135,8 @@ pub struct LobbyStatus {
     /// Host: `start_game` would start now.
     pub can_start: bool,
     pub error: Option<NetError>,
+    /// The save the host will start from; `None` = a new game. Guests learn it from the host.
+    pub resume: Option<ResumeInfo>,
 }
 
 /// Everything the game loop needs once the host pressed start.
@@ -119,6 +158,11 @@ pub struct GameStart {
     pub four_score: bool,
     /// Region the host announced (header region of its ROM); every peer must emulate it.
     pub region: ebobo_core::Region,
+    /// `ebobo_core::Nes::save_state` bytes every peer loads before the first frame (the host's
+    /// `Resume::state`); `None` = power-on.
+    pub state: Option<Vec<u8>>,
+    /// What `state` is (kind and age), as the host announced it with the start; `None` with it.
+    pub resume: Option<ResumeInfo>,
 }
 
 /// Handle to the lobby thread.
@@ -147,6 +191,7 @@ impl Lobby {
             rom_name,
             can_start: false,
             error: None,
+            resume: None,
         }));
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (game_tx, game_rx) = mpsc::channel();
@@ -165,6 +210,12 @@ impl Lobby {
     /// Host only; ignored unless `status().can_start`.
     pub fn start_game(&self) {
         let _ = self.cmd.send(Cmd::StartGame);
+    }
+
+    /// Host only: the next `start_game` starts from this save (`None` = a new game). May be
+    /// called any time before the start; every player sees the choice in `LobbyStatus::resume`.
+    pub fn set_resume(&self, resume: Option<Resume>) {
+        let _ = self.cmd.send(Cmd::SetResume(resume));
     }
 
     /// `Some` exactly once after the game started.
@@ -189,6 +240,7 @@ impl Drop for Lobby {
 
 enum Cmd {
     StartGame,
+    SetResume(Option<Resume>),
     Leave,
 }
 
@@ -224,6 +276,126 @@ struct Pending {
     first: Instant,
     last: Instant,
     resent: bool,
+}
+
+/// Number of `STATE_CHUNK_DATA` chunks a state of `len` bytes travels in.
+fn state_chunks(len: usize) -> usize {
+    len.div_ceil(STATE_CHUNK_DATA)
+}
+
+/// Chunk `index` of `state`: `STATE_CHUNK_DATA` bytes, the last one shorter.
+fn state_chunk(state: &[u8], index: usize) -> &[u8] {
+    let start = index * STATE_CHUNK_DATA;
+    &state[start..(start + STATE_CHUNK_DATA).min(state.len())]
+}
+
+/// Bit `i` of a `StateAck` bitmap.
+fn has_bit(bits: &[u8], i: usize) -> bool {
+    bits.get(i / 8).is_some_and(|b| b >> (i % 8) & 1 == 1)
+}
+
+/// Host: one guest's progress through a saved-game transfer (selective repeat: the guest acks
+/// every chunk it holds, the host resends only the missing ones).
+struct StateTx {
+    acked: Vec<bool>,
+    /// When each chunk was last sent.
+    sent: Vec<Option<Instant>>,
+    left: usize,
+}
+
+impl StateTx {
+    fn new(chunks: usize) -> StateTx {
+        StateTx { acked: vec![false; chunks], sent: vec![None; chunks], left: chunks }
+    }
+
+    fn done(&self) -> bool {
+        self.left == 0
+    }
+
+    /// Chunks to send now, lowest first: never sent, or unacked for `rto`; at most
+    /// `STATE_WINDOW` in flight. Marks them sent at `now`.
+    fn due(&mut self, now: Instant, rto: Duration) -> Vec<u16> {
+        let fresh = |s: Option<Instant>| s.is_some_and(|t| now.duration_since(t) < rto);
+        let mut in_flight = (0..self.acked.len()).filter(|&i| !self.acked[i] && fresh(self.sent[i])).count();
+        let mut out = Vec::new();
+        for i in 0..self.acked.len() {
+            if in_flight >= STATE_WINDOW {
+                break;
+            }
+            if self.acked[i] || fresh(self.sent[i]) {
+                continue;
+            }
+            self.sent[i] = Some(now);
+            out.push(i as u16);
+            in_flight += 1;
+        }
+        out
+    }
+
+    /// Marks the chunks set in the guest's `StateAck` bitmap.
+    fn on_ack(&mut self, have: &[u8]) {
+        for (i, acked) in self.acked.iter_mut().enumerate() {
+            if !*acked && has_bit(have, i) {
+                *acked = true;
+                self.left -= 1;
+            }
+        }
+    }
+}
+
+/// Guest: the saved game arriving from the host, transfer `id`.
+struct StateRx {
+    id: u32,
+    crc: u32,
+    buf: Vec<u8>,
+    got: Vec<bool>,
+    left: usize,
+    /// Complete and its CRC-32 matched.
+    verified: bool,
+}
+
+impl StateRx {
+    fn new(id: u32, total: usize, crc: u32) -> StateRx {
+        let chunks = state_chunks(total);
+        StateRx { id, crc, buf: vec![0; total], got: vec![false; chunks], left: chunks, verified: false }
+    }
+
+    /// Stores chunk `index`; false (nothing stored) when its index or size does not fit.
+    fn put(&mut self, index: usize, data: &[u8]) -> bool {
+        if index >= self.got.len() {
+            return false;
+        }
+        let start = index * STATE_CHUNK_DATA;
+        let end = (start + STATE_CHUNK_DATA).min(self.buf.len());
+        if data.len() != end - start {
+            return false;
+        }
+        if !self.got[index] {
+            self.buf[start..end].copy_from_slice(data);
+            self.got[index] = true;
+            self.left -= 1;
+        }
+        true
+    }
+
+    /// `StateAck` bitmap of the chunks held.
+    fn ack(&self) -> Vec<u8> {
+        let mut bits = vec![0u8; self.got.len().div_ceil(8)];
+        for (i, _) in self.got.iter().enumerate().filter(|(_, g)| **g) {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+        bits
+    }
+}
+
+/// Host: a start from a save waiting for every guest to hold the state.
+struct Offer {
+    id: u32,
+    state: Vec<u8>,
+    crc: u32,
+    /// Pressed start + `STATE_WAIT`.
+    deadline: Instant,
+    tx: BTreeMap<PeerId, StateTx>,
 }
 
 /// RFC 6298 smoothed RTT and RTT variation in ms. The lobby feeds it CTRL acks, the session
@@ -341,6 +513,8 @@ struct PendingStart {
     delay: usize,
     delay_auto: bool,
     four_score: bool,
+    state: Option<Vec<u8>>,
+    resume: Option<ResumeInfo>,
 }
 
 struct Worker {
@@ -363,6 +537,11 @@ struct Worker {
     // Host.
     host_rom: Option<HostRom>,
     pending_start: Option<PendingStart>,
+    resume: Option<Resume>,
+    /// The saved-game transfer of a start from `resume` (no start goes out before it ends).
+    offer: Option<Offer>,
+    /// Id of the next `Offer`; a called-off transfer's late packets never match a new one.
+    next_offer: u32,
     // Guest.
     game: Option<GameInfo>,
     rx: Option<RomRx>,
@@ -370,6 +549,9 @@ struct Worker {
     my_rom: RomState,
     sent_links: Option<Vec<u8>>,
     host_list: Option<Vec<ListEntry>>,
+    /// The host's resume choice from its `players` message.
+    announced: Option<ResumeInfo>,
+    state_rx: Option<StateRx>,
 }
 
 /// One-way latency, in frames, that the input delay hides outright: 3 frames (50 ms at 60 fps)
@@ -398,31 +580,7 @@ fn run(cfg: LobbyConfig, shared: Arc<Mutex<LobbyStatus>>, cmds: Receiver<Cmd>, g
         LobbyMode::HostDirect { port, rom, rom_name } => (MeshRole::HostDirect { port }, Some((rom, rom_name))),
         LobbyMode::JoinDirect { addr } => (MeshRole::JoinDirect { addr }, None),
     };
-    let mut w = Worker {
-        mesh: None,
-        shared,
-        last_status: None,
-        game_tx,
-        nickname: nickname.clone(),
-        version: local_version(&nickname),
-        input_delay,
-        rom_lookup,
-        is_host: host_rom.is_some(),
-        stage: Stage::Connecting,
-        code: None,
-        me: None,
-        error: None,
-        peers: BTreeMap::new(),
-        last_ping: Instant::now(),
-        host_rom: None,
-        pending_start: None,
-        game: None,
-        rx: None,
-        rom: None,
-        my_rom: RomState::Unknown,
-        sent_links: None,
-        host_list: None,
-    };
+    let mut w = Worker::new(shared, game_tx, nickname.clone(), input_delay, rom_lookup, host_rom.is_some());
     if let Some((bytes, name)) = host_rom {
         match cart::parse(&bytes) {
             Ok(info) => {
@@ -455,6 +613,7 @@ fn run(cfg: LobbyConfig, shared: Arc<Mutex<LobbyStatus>>, cmds: Receiver<Cmd>, g
         loop {
             match cmds.try_recv() {
                 Ok(Cmd::StartGame) => w.start_game(),
+                Ok(Cmd::SetResume(resume)) => w.set_resume(resume),
                 Ok(Cmd::Leave) | Err(TryRecvError::Disconnected) => {
                     w.leave();
                     return;
@@ -525,21 +684,91 @@ fn same_version(proto: Option<u64>, ver: Option<&str>, mine: &str) -> bool {
     proto == Some(u64::from(PROTOCOL_VERSION)) && ver == Some(mine)
 }
 
+fn resume_json(r: Option<ResumeInfo>) -> Value {
+    match r {
+        Some(r) => json!({
+            "kind": match r.kind { ResumeKind::Last => "last", ResumeKind::Save => "save" },
+            "saved_at": r.saved_at,
+        }),
+        None => Value::Null,
+    }
+}
+
+/// `resume` of a `players` message; `None` for null (a new game) or anything unknown.
+fn resume_of(v: &Value) -> Option<ResumeInfo> {
+    let kind = match v["kind"].as_str()? {
+        "last" => ResumeKind::Last,
+        "save" => ResumeKind::Save,
+        _ => return None,
+    };
+    Some(ResumeInfo { kind, saved_at: v["saved_at"].as_u64()? })
+}
+
 fn error_of(msg: &str) -> NetError {
     match msg {
         "version" => NetError::Version,
         "rom_crc" => NetError::RomCrc,
         "rom_missing" => NetError::RomMissing,
         "host_left" => NetError::HostLeft,
+        "save" => NetError::SaveTransfer,
         other => NetError::Io(other.to_string()),
     }
 }
 
 impl Worker {
+    fn new(
+        shared: Arc<Mutex<LobbyStatus>>,
+        game_tx: Sender<GameStart>,
+        nickname: String,
+        input_delay: Option<u8>,
+        rom_lookup: Box<dyn Fn(u32) -> Option<Vec<u8>> + Send>,
+        is_host: bool,
+    ) -> Worker {
+        Worker {
+            mesh: None,
+            shared,
+            last_status: None,
+            game_tx,
+            version: local_version(&nickname),
+            nickname,
+            input_delay,
+            rom_lookup,
+            is_host,
+            stage: Stage::Connecting,
+            code: None,
+            me: None,
+            error: None,
+            peers: BTreeMap::new(),
+            last_ping: Instant::now(),
+            host_rom: None,
+            pending_start: None,
+            resume: None,
+            offer: None,
+            next_offer: 1,
+            game: None,
+            rx: None,
+            rom: None,
+            my_rom: RomState::Unknown,
+            sent_links: None,
+            host_list: None,
+            announced: None,
+            state_rx: None,
+        }
+    }
+
     fn fail(&mut self, e: NetError) {
         self.stage = Stage::Failed;
         self.error = Some(e);
         self.pending_start = None;
+        self.offer = None;
+    }
+
+    /// Host: the save the next start uses. Ignored while a start is under way (its transfer or
+    /// its start acks), so every guest gets the state the start announces.
+    fn set_resume(&mut self, resume: Option<Resume>) {
+        if self.is_host && self.offer.is_none() && self.pending_start.is_none() {
+            self.resume = resume;
+        }
     }
 
     fn send_ctrl(&mut self, to: PeerId, msg: Value) -> u32 {
@@ -620,6 +849,9 @@ impl Worker {
         if let Some(ps) = &mut self.pending_start {
             ps.acks.retain(|(p, _)| *p != id);
         }
+        if let Some(o) = &mut self.offer {
+            o.tx.remove(&id);
+        }
         if !self.is_host && id == PeerId(0) && self.stage != Stage::Starting {
             self.fail(NetError::HostLeft);
         }
@@ -650,6 +882,14 @@ impl Worker {
             }
             Some(Packet::RomChunk { offset, total, data }) => self.on_chunk(from, offset, total, data),
             Some(Packet::RomAck { next }) => self.on_rom_ack(from, next),
+            Some(Packet::StateChunk { id, total, crc, index, data }) => {
+                self.on_state_chunk(from, id, total, crc, index, data)
+            }
+            Some(Packet::StateAck { id, have }) => {
+                if let Some(tx) = self.offer.as_mut().filter(|o| o.id == id).and_then(|o| o.tx.get_mut(&from)) {
+                    tx.on_ack(have);
+                }
+            }
             _ => {}
         }
     }
@@ -666,6 +906,10 @@ impl Worker {
                         p.rom = RomState::Missing;
                         p.ready = false;
                         p.xfer = None;
+                    }
+                    // A guest that cannot take the saved game calls the start off at once.
+                    if e == NetError::SaveTransfer {
+                        self.offer = None;
                     }
                     self.error = Some(e);
                 } else if from == PeerId(0) {
@@ -749,6 +993,7 @@ impl Worker {
                     })
                     .collect();
                 self.host_list = Some(list);
+                self.announced = resume_of(&v["resume"]);
             }
             "start" => {
                 if self.stage != Stage::Lobby {
@@ -766,7 +1011,23 @@ impl Worker {
                 let delay_auto = v["auto"].as_bool().unwrap_or(false);
                 let four = v["four_score"].as_bool().unwrap_or(slots.len() > 2);
                 let (rom_name, region) = (game.rom_name.clone(), game.region);
-                self.hand_over(slots, delay, delay_auto, four, rom, rom_name, region);
+                let state = match v.get("state").filter(|s| !s.is_null()) {
+                    None => {
+                        self.state_rx = None;
+                        None
+                    }
+                    Some(s) => match self.take_state(s) {
+                        Some(bytes) => Some(bytes),
+                        None => {
+                            self.refuse_state();
+                            return;
+                        }
+                    },
+                };
+                // The kind travels with the start: the `players` message that announced it may
+                // still be on its way.
+                let resume = state.as_ref().and_then(|_| resume_of(&v["state"]));
+                self.hand_over(slots, delay, delay_auto, four, rom, rom_name, region, state, resume);
             }
             _ => {}
         }
@@ -806,6 +1067,55 @@ impl Worker {
         let name = self.nickname.clone();
         let ver = self.version.clone();
         self.send_ctrl(host, json!({"t": "rom", "have": have, "name": name, "proto": PROTOCOL_VERSION, "ver": ver}));
+    }
+
+    /// Guest: the verified state the start's `state` announcement (`id`, `size`, `crc32`) names,
+    /// or `None` when it is not fully here.
+    fn take_state(&mut self, s: &Value) -> Option<Vec<u8>> {
+        let id = s["id"].as_u64()?;
+        let size = s["size"].as_u64()?;
+        let crc = s["crc32"].as_str().and_then(|c| u32::from_str_radix(c, 16).ok())?;
+        let rx = self.state_rx.take()?;
+        (rx.verified && u64::from(rx.id) == id && rx.buf.len() as u64 == size && rx.crc == crc).then_some(rx.buf)
+    }
+
+    /// Guest: the host's saved game cannot be used; the host is told (it calls the start off).
+    fn refuse_state(&mut self) {
+        self.send_ctrl(PeerId(0), json!({"t": "error", "msg": "save"}));
+        self.state_rx = None;
+        self.fail(NetError::SaveTransfer);
+    }
+
+    /// Guest: one chunk of the saved game. Every chunk is answered with the full bitmap of held
+    /// chunks (duplicates too), so a lost ack is repaired by the next one. A state over
+    /// `MAX_STATE`, or one whose CRC-32 does not match once complete, is refused.
+    fn on_state_chunk(&mut self, from: PeerId, id: u32, total: u32, crc: u32, index: u16, data: &[u8]) {
+        if self.is_host || from != PeerId(0) || self.stage != Stage::Lobby {
+            return;
+        }
+        let total = total as usize;
+        if total == 0 || total > MAX_STATE {
+            self.refuse_state();
+            return;
+        }
+        if self.state_rx.as_ref().is_none_or(|rx| rx.id != id) {
+            self.state_rx = Some(StateRx::new(id, total, crc));
+        }
+        let Some(rx) = self.state_rx.as_mut() else { return };
+        if rx.buf.len() != total || rx.crc != crc || !rx.put(index as usize, data) {
+            return;
+        }
+        if rx.left == 0 && !rx.verified {
+            if cart::crc32(&[&rx.buf]) != rx.crc {
+                self.refuse_state();
+                return;
+            }
+            rx.verified = true;
+        }
+        let ack = Packet::StateAck { id, have: &rx.ack() }.to_vec();
+        if let Some(mesh) = self.mesh.as_mut() {
+            mesh.send(from, &ack);
+        }
     }
 
     fn on_chunk(&mut self, from: PeerId, offset: u32, total: u32, data: &[u8]) {
@@ -899,6 +1209,7 @@ impl Worker {
         if self.is_host {
             self.drive_rom_transfers(now);
             self.broadcast_players();
+            self.drive_offer(now);
             self.check_start(now);
         } else if self.rom.is_some() && self.stage == Stage::Lobby {
             let links: Vec<u8> = self.routed().iter().map(|p| p.0).collect();
@@ -932,6 +1243,37 @@ impl Worker {
         }
     }
 
+    /// Host: sends the saved game to every guest (late joiners included) and starts once all
+    /// hold it and the room is still startable; calls the start off at `Offer::deadline`.
+    fn drive_offer(&mut self, now: Instant) {
+        let Some(o) = self.offer.as_mut() else { return };
+        let chunks = state_chunks(o.state.len());
+        for (id, p) in &self.peers {
+            if p.route.is_some() {
+                o.tx.entry(*id).or_insert_with(|| StateTx::new(chunks));
+            }
+        }
+        if let Some(mesh) = self.mesh.as_mut() {
+            for (id, tx) in &mut o.tx {
+                let rto = self.peers.get(id).map_or(CTRL_RETRY, |p| p.ctrl.rto());
+                for index in tx.due(now, rto) {
+                    let data = state_chunk(&o.state, index as usize);
+                    let total = o.state.len() as u32;
+                    mesh.send(*id, &Packet::StateChunk { id: o.id, total, crc: o.crc, index, data }.to_vec());
+                }
+            }
+        }
+        let (done, expired) = (o.tx.values().all(StateTx::done), now >= o.deadline);
+        if done && self.startable() {
+            if let Some(o) = self.offer.take() {
+                self.launch(Some((o.id, o.crc, o.state)));
+            }
+        } else if expired {
+            self.offer = None;
+            self.error = Some(NetError::SaveTransfer);
+        }
+    }
+
     fn rtt_ms(p: &Peer) -> Option<u32> {
         p.ctrl.rtt.srtt.map(|r| r.round() as u32)
     }
@@ -949,7 +1291,7 @@ impl Worker {
                 "ready": p.ready, "rom": rom, "pct": pct,
             }));
         }
-        let text = json!({"t": "players", "list": list});
+        let text = json!({"t": "players", "list": list, "resume": resume_json(self.resume_info())});
         let key = text.to_string();
         let targets: Vec<PeerId> = self
             .peers
@@ -966,7 +1308,12 @@ impl Worker {
     }
 
     fn can_start(&self) -> bool {
-        if !self.is_host || self.stage != Stage::Lobby || self.pending_start.is_some() || self.me.is_none() {
+        self.pending_start.is_none() && self.offer.is_none() && self.startable()
+    }
+
+    /// Host: every guest is routed, ready and linked to everyone, regardless of a start under way.
+    fn startable(&self) -> bool {
+        if !self.is_host || self.stage != Stage::Lobby || self.me.is_none() {
             return false;
         }
         let ids: Vec<u8> = self.peers.keys().map(|p| p.0).collect();
@@ -980,10 +1327,37 @@ impl Worker {
             })
     }
 
+    /// Host: starts now, or from `resume` once every guest holds the state (`drive_offer`). A
+    /// state over `MAX_STATE` is refused with `NetError::SaveTransfer` and nothing is sent.
     fn start_game(&mut self) {
         if !self.can_start() {
             return;
         }
+        if self.error == Some(NetError::SaveTransfer) {
+            self.error = None;
+        }
+        let Some(resume) = &self.resume else {
+            self.launch(None);
+            return;
+        };
+        if resume.state.is_empty() || resume.state.len() > MAX_STATE {
+            self.error = Some(NetError::SaveTransfer);
+            return;
+        }
+        let (id, chunks) = (self.next_offer, state_chunks(resume.state.len()));
+        self.next_offer = self.next_offer.wrapping_add(1);
+        self.offer = Some(Offer {
+            id,
+            crc: cart::crc32(&[&resume.state]),
+            state: resume.state.clone(),
+            deadline: Instant::now() + STATE_WAIT,
+            tx: self.peers.keys().map(|p| (*p, StateTx::new(chunks))).collect(),
+        });
+    }
+
+    /// Host: locks the room and sends `start` (with the `state` announcement `(id, crc, bytes)`
+    /// of a finished transfer); hands over once every guest acked it or `START_ACK_WAIT` passed.
+    fn launch(&mut self, state: Option<(u32, u32, Vec<u8>)>) {
         let (Some(me), Some(hr)) = (self.me, self.host_rom.as_ref()) else { return };
         let frame_ms = if hr.region == Region::Pal { 20.0 } else { 16.64 };
         let header_four = hr.four_score;
@@ -1001,11 +1375,29 @@ impl Worker {
         }
         let slot_ids: Vec<u8> = slots.iter().map(|p| p.0).collect();
         let delay_auto = self.input_delay.is_none();
-        let msg = json!({"t": "start", "slots": slot_ids, "delay": delay, "auto": delay_auto, "four_score": four_score});
+        let mut msg = json!({"t": "start", "slots": slot_ids, "delay": delay, "auto": delay_auto, "four_score": four_score});
+        let resume = state.as_ref().and_then(|_| self.resume_info());
+        if let Some((id, crc, bytes)) = &state {
+            let mut announce = json!({"id": id, "size": bytes.len(), "crc32": format!("{crc:08x}")});
+            if let Some(r) = resume {
+                announce["kind"] = resume_json(Some(r))["kind"].clone();
+                announce["saved_at"] = json!(r.saved_at);
+            }
+            msg["state"] = announce;
+        }
         let guests: Vec<PeerId> = self.peers.keys().copied().collect();
         let acks = guests.into_iter().map(|g| (g, self.send_ctrl(g, msg.clone()))).collect();
-        self.pending_start =
-            Some(PendingStart { acks, deadline: Instant::now() + START_ACK_WAIT, slots, delay, delay_auto, four_score });
+        let state = state.map(|(_, _, bytes)| bytes);
+        self.pending_start = Some(PendingStart {
+            acks,
+            deadline: Instant::now() + START_ACK_WAIT,
+            slots,
+            delay,
+            delay_auto,
+            four_score,
+            state,
+            resume,
+        });
     }
 
     fn check_start(&mut self, now: Instant) {
@@ -1020,7 +1412,7 @@ impl Worker {
         let Some(ps) = self.pending_start.take() else { return };
         let Some(hr) = self.host_rom.as_ref() else { return };
         let (rom, name, region) = (hr.bytes.clone(), hr.name.clone(), hr.region);
-        self.hand_over(ps.slots, ps.delay, ps.delay_auto, ps.four_score, rom, name, region);
+        self.hand_over(ps.slots, ps.delay, ps.delay_auto, ps.four_score, rom, name, region, ps.state, ps.resume);
     }
 
     fn name_of(&self, id: PeerId) -> String {
@@ -1033,6 +1425,7 @@ impl Worker {
         self.peers.get(&id).map(|p| p.name.clone()).unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn hand_over(
         &mut self,
         slots: Vec<PeerId>,
@@ -1042,6 +1435,8 @@ impl Worker {
         rom: Vec<u8>,
         rom_name: String,
         region: Region,
+        state: Option<Vec<u8>>,
+        resume: Option<ResumeInfo>,
     ) {
         let (Some(me), Some(mesh)) = (self.me, self.mesh.take()) else { return };
         let names = slots.iter().map(|id| self.name_of(*id)).collect();
@@ -1056,6 +1451,8 @@ impl Worker {
             delay_auto,
             four_score,
             region,
+            state,
+            resume,
         };
         let _ = self.game_tx.send(game);
         self.stage = Stage::Starting;
@@ -1132,6 +1529,16 @@ impl Worker {
             },
             can_start: self.can_start(),
             error: self.error.clone(),
+            resume: self.resume_info(),
+        }
+    }
+
+    /// The save the game will start from: the host's own choice, or the one it announced.
+    fn resume_info(&self) -> Option<ResumeInfo> {
+        if self.is_host {
+            self.resume.as_ref().map(|r| ResumeInfo { kind: r.kind, saved_at: r.saved_at })
+        } else {
+            self.announced
         }
     }
 
