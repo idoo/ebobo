@@ -10,8 +10,6 @@ use sdl2::keyboard::{Mod, Scancode};
 use sdl2::mouse::MouseButton;
 use sdl2::{GameControllerSubsystem, JoystickSubsystem};
 
-use crate::config::ButtonLayout;
-
 /// Menu navigation, edge-triggered. Directions auto-repeat while held (400 ms delay, then
 /// every 80 ms). Keyboard: arrows, Enter = confirm, Esc/Backspace = back. Gamepad: D-pad or
 /// left stick, South (A on Xbox/Deck, Cross on PlayStation) = confirm, East (B / Circle) = back.
@@ -48,13 +46,15 @@ pub enum PointerEvent {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputFrame {
-    /// NES pad bits per local device: [0] = keyboard merged with the first gamepad,
-    /// [1..4] = second..fourth gamepad. Gamepad face buttons are positional and follow the
-    /// "Buttons" setting: by default West = NES B, South = NES A, North = turbo B, East =
-    /// turbo A; with `ButtonLayout::BottomRight` South = NES B, East = NES A, West = turbo B,
-    /// North = turbo A. Back/Share = Select, Start/Options = Start, D-pad and left stick =
-    /// D-pad. Keyboard: arrows, X = A, Z = B, Enter = Start, Right Shift = Select,
-    /// S = turbo A, A = turbo B. Turbo toggles every 2 frames of `poll`.
+    /// NES pad bits per seat: [0] = keyboard merged with the gamepad in seat 1, [1..4] = the
+    /// gamepads in seats 2-4. A gamepad without a seat feeds nothing; it takes the lowest free
+    /// seat the first time it presses a game button while seating is on (`set_seating`).
+    /// Opposite face buttons do the same: South and North = NES A, West and East = NES B
+    /// (Nintendo pads: East and West = A, South and North = B, so the printed A and B match).
+    /// Left shoulder = turbo B, right shoulder = turbo A, Back/Share = Select,
+    /// Start/Options = Start, D-pad and left stick = D-pad. Keyboard: arrows, X = A, Z = B,
+    /// Enter = Start, Right Shift = Select, S = turbo A, A = turbo B. Turbo toggles every
+    /// 2 frames of `poll`.
     pub pads: [u8; 4],
     /// A keyboard key went down (auto-repeat not counted).
     pub key_used: bool,
@@ -65,7 +65,8 @@ pub struct InputFrame {
     pub backspace: bool,
     /// Cmd+V / Ctrl+V clipboard text.
     pub paste: Option<String>,
-    /// Open/close the menu: Esc, gamepad Guide/PS button, or Back+Start held for 0.6 s.
+    /// Open/close the menu: Esc, gamepad Guide/PS button, PlayStation touchpad click, or
+    /// Back+Start held for 0.6 s.
     pub menu: bool,
     /// 0.0-1.0 progress of the Back+Start hold (for an on-screen hint), 0 when not held.
     pub menu_hold: f32,
@@ -78,7 +79,8 @@ pub struct InputFrame {
     pub rewind: bool,
     /// Fast-forward held: Tab or Right Trigger / R2.
     pub fast_forward: bool,
-    /// Screenshot pressed: F12 or gamepad Back+North (Share+Triangle on PlayStation).
+    /// Screenshot pressed: F12, gamepad Back+North (Share+Triangle on PlayStation) or Misc1
+    /// (Xbox Share, Switch Capture).
     pub screenshot: bool,
     /// Window closed or Cmd+Q.
     pub quit: bool,
@@ -86,6 +88,11 @@ pub struct InputFrame {
     pub dropped_file: Option<PathBuf>,
     /// Connected gamepads.
     pub gamepads: usize,
+    /// Gamepads that hold a seat.
+    pub seated: usize,
+    /// Kind of the gamepad used last, for button labels in hints; `None` after a keyboard key
+    /// or with no gamepad.
+    pub hint_kind: Option<PadKind>,
     /// Hot-plug notices since the last poll (UI shows a toast).
     pub pad_events: Vec<PadEvent>,
     /// Pointer events since the last poll, in order (touch-synthesised mouse events dropped).
@@ -122,18 +129,21 @@ pub enum PadKind {
 pub struct PadInfo {
     pub name: String,
     pub kind: PadKind,
-    /// Index into `InputFrame::pads` this controller feeds.
-    pub slot: usize,
+    /// Seat: index into `InputFrame::pads` this controller feeds; `None` = no seat yet.
+    pub slot: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PadEvent {
+    /// Plugged in; `slot` is `Some` only when it got its old seat back.
     Connected(PadInfo),
+    /// Took a seat by pressing a game button; `slot` is `Some`.
+    Seated(PadInfo),
     Disconnected(PadInfo),
 }
 
 // ---------------------------------------------------------------------------------------------
-// Pure parts (no SDL state): mapping, timers, slot assignment.
+// Pure parts (no SDL state): mapping, timers, seats.
 
 const STICK_THRESHOLD: f32 = 0.5;
 /// Analog triggers count as pressed past this (0.0-1.0).
@@ -151,6 +161,8 @@ const SLOT_RGB: [(u8, u8, u8); 4] = [
     (0x4C, 0xC6, 0x6A),
     (0xE4, 0x6A, 0xB4),
 ];
+/// Light of a gamepad without a seat: dim white.
+const NO_SEAT_RGB: (u8, u8, u8) = (0x20, 0x20, 0x20);
 
 /// Positional button state of one gamepad. Stick axes are -1.0..1.0 (negative = up/left).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -165,6 +177,9 @@ struct PadButtons {
     north: bool,
     back: bool,
     start: bool,
+    /// Left and right shoulder (L1/LB, R1/RB).
+    l1: bool,
+    r1: bool,
     lx: f32,
     ly: f32,
     /// Analog triggers, 0.0 (released) - 1.0.
@@ -181,6 +196,24 @@ impl PadButtons {
             self.left || self.lx <= -STICK_THRESHOLD,
             self.right || self.lx >= STICK_THRESHOLD,
         )
+    }
+
+    /// Anything held: a button, a direction or a trigger.
+    fn active(&self) -> bool {
+        let (up, down, left, right) = self.dirs();
+        up || down
+            || left
+            || right
+            || self.south
+            || self.east
+            || self.west
+            || self.north
+            || self.back
+            || self.start
+            || self.l1
+            || self.r1
+            || self.lt >= TRIGGER_THRESHOLD
+            || self.rt >= TRIGGER_THRESHOLD
     }
 }
 
@@ -199,12 +232,14 @@ fn mask_shot_combo(b: &PadButtons) -> PadButtons {
     }
 }
 
-/// Positional gamepad → NES bits; `layout` picks the face buttons of NES B and A and of their
-/// turbo versions. `turbo_on` = current turbo phase.
-fn pad_bits(b: &PadButtons, layout: ButtonLayout, turbo_on: bool) -> u8 {
-    let (nes_b, nes_a, turbo_b, turbo_a) = match layout {
-        ButtonLayout::LeftBottom => (b.west, b.south, b.north, b.east),
-        ButtonLayout::BottomRight => (b.south, b.east, b.west, b.north),
+/// Positional gamepad → NES bits. Opposite face buttons do the same, so any two neighbouring
+/// ones are B + A: South and North = A, West and East = B; on Nintendo pads East and West = A,
+/// South and North = B (the printed A and B). Shoulders are turbo B (left) and turbo A (right);
+/// `turbo_on` = current turbo phase.
+fn pad_bits(b: &PadButtons, kind: PadKind, turbo_on: bool) -> u8 {
+    let (nes_a, nes_b) = match kind {
+        PadKind::Nintendo => (b.east || b.west, b.south || b.north),
+        _ => (b.south || b.north, b.west || b.east),
     };
     let (up, down, left, right) = b.dirs();
     let mut bits = 0;
@@ -215,8 +250,8 @@ fn pad_bits(b: &PadButtons, layout: ButtonLayout, turbo_on: bool) -> u8 {
     };
     set(nes_b, pad::B);
     set(nes_a, pad::A);
-    set(turbo_b && turbo_on, pad::B);
-    set(turbo_a && turbo_on, pad::A);
+    set(b.l1 && turbo_on, pad::B);
+    set(b.r1 && turbo_on, pad::A);
     set(b.back, pad::SELECT);
     set(b.start, pad::START);
     set(up, pad::UP);
@@ -337,31 +372,47 @@ fn mask_combo(bits: u8) -> u8 {
     }
 }
 
-/// Slot assignment: a reconnecting pad (same key = GUID + name) gets its old slot back when it
-/// is free; any other pad takes the lowest free slot (a pad that reconnects with a new GUID,
-/// e.g. USB vs Bluetooth, or a replacement pad becomes player 1 again).
+/// Player seats. A pad takes a seat with `sit` (its first game button): the free seat it held
+/// before (same key = GUID + name), else the lowest free one. A pad that drops out keeps its
+/// key on the seat, so `rejoin` gives the seat back when it reconnects.
 #[derive(Default)]
-struct Slots {
+struct Seats {
     owner: [Option<u32>; 4],
     last_key: [Option<String>; 4],
 }
 
-impl Slots {
-    fn assign(&mut self, id: u32, key: &str) -> Option<usize> {
-        let free = |s: &usize| self.owner[*s].is_none();
-        let slot = (0..4)
-            .filter(free)
-            .find(|&s| self.last_key[s].as_deref() == Some(key))
-            .or_else(|| (0..4).find(free))?;
-        self.owner[slot] = Some(id);
-        self.last_key[slot] = Some(key.to_owned());
-        Some(slot)
+impl Seats {
+    fn free_with_key(&self, key: &str) -> Option<usize> {
+        (0..4).find(|&s| self.owner[s].is_none() && self.last_key[s].as_deref() == Some(key))
     }
 
+    /// The free seat this key held last, if any.
+    fn rejoin(&mut self, id: u32, key: &str) -> Option<usize> {
+        let seat = self.free_with_key(key)?;
+        self.owner[seat] = Some(id);
+        Some(seat)
+    }
+
+    /// The free seat this key held last, else the lowest free seat; `None` when all are taken.
+    fn sit(&mut self, id: u32, key: &str) -> Option<usize> {
+        let seat = self
+            .free_with_key(key)
+            .or_else(|| self.owner.iter().position(Option::is_none))?;
+        self.owner[seat] = Some(id);
+        self.last_key[seat] = Some(key.to_owned());
+        Some(seat)
+    }
+
+    /// Frees the seat of `id`; its key stays for `rejoin`.
     fn release(&mut self, id: u32) -> Option<usize> {
-        let slot = self.owner.iter().position(|o| *o == Some(id))?;
-        self.owner[slot] = None;
-        Some(slot)
+        let seat = self.owner.iter().position(|o| *o == Some(id))?;
+        self.owner[seat] = None;
+        Some(seat)
+    }
+
+    /// Frees every seat and forgets every key.
+    fn clear(&mut self) {
+        *self = Seats::default();
     }
 }
 
@@ -382,6 +433,8 @@ struct Pad {
     hold: Hold,
     /// Screenshot combo held at the previous poll (edge detection).
     shot: bool,
+    /// GUID + name: tells a reconnecting pad from a new one.
+    key: String,
 }
 
 impl Pad {
@@ -403,6 +456,8 @@ impl Pad {
             north: c.button(Button::Y),
             back: c.button(Button::Back),
             start: c.button(Button::Start),
+            l1: c.button(Button::LeftShoulder),
+            r1: c.button(Button::RightShoulder),
             lx: axis(Axis::LeftX),
             ly: axis(Axis::LeftY),
             lt: axis(Axis::TriggerLeft),
@@ -429,11 +484,25 @@ fn sdl_kind(ctrl: &GameController) -> Option<PadKind> {
     }
 }
 
-/// PlayStation pads (DualShock 4, DualSense, USB or Bluetooth) must work out of the box:
-/// SDL's HIDAPI PS4/PS5 drivers are enabled via hints before the controller subsystem starts,
-/// pads are hot-plugged at any time, and each pad's light bar / player LEDs show its slot
-/// (1 blue, 2 red, 3 green, 4 pink) via `set_led` / `set_player_index`. A reconnecting pad gets
-/// its old slot back when it is free; other pads take the lowest free slot.
+/// Light bar / player LEDs of a pad: its seat colour and number, or dim white and no number
+/// without a seat.
+fn show_seat(ctrl: &mut GameController, slot: Option<usize>) {
+    let (r, g, b) = slot.map_or(NO_SEAT_RGB, |s| SLOT_RGB[s]);
+    let _ = ctrl.set_led(r, g, b);
+    let raw = unsafe { sdl2::sys::SDL_GameControllerFromInstanceID(ctrl.instance_id() as i32) };
+    if !raw.is_null() {
+        unsafe { sdl2::sys::SDL_GameControllerSetPlayerIndex(raw, slot.map_or(-1, |s| s as i32)) };
+    }
+}
+
+/// PlayStation, Xbox and Switch pads work out of the box, USB or Bluetooth, hot-plugged at any
+/// time (SDL's HIDAPI PS4/PS5 drivers are enabled via hints before the controller subsystem
+/// starts). One fixed layout, see `InputFrame::pads`. A connected pad has no seat: it takes the
+/// lowest free one with its first game button while seating is on, so the pad in the player's
+/// hands is player 1 and idle pads (the Deck's own controls next to an external pad) take
+/// none. `reset_seats` empties the seats when a game starts; a pad that reconnects during the
+/// game gets its seat back at once. The light bar / player LEDs show the seat (1 blue, 2 red,
+/// 3 green, 4 pink; dim white without one). Hotkeys and menu navigation work on every pad.
 pub struct Input {
     gc: GameControllerSubsystem,
     joy: JoystickSubsystem,
@@ -441,14 +510,16 @@ pub struct Input {
     text_input: sdl2::keyboard::TextInputUtil,
     text_on: bool,
     pads: Vec<Pad>,
-    slots: Slots,
+    seats: Seats,
+    /// Pads may take seats (a game runs, menu hidden).
+    seating: bool,
+    /// Gamepad used last (instance id, kind); `None` after a keyboard key.
+    hint: Option<(u32, PadKind)>,
     turbo: Turbo,
     repeat: [Repeat; 4],
     events: Vec<PadEvent>,
     /// The finger being tracked (`touch_id`, `finger_id`); other fingers are ignored.
     finger: Option<(i64, i64)>,
-    /// Which face buttons are NES B and A.
-    buttons: ButtonLayout,
 }
 
 impl Input {
@@ -483,12 +554,13 @@ impl Input {
             text_input,
             text_on: false,
             pads: Vec::new(),
-            slots: Slots::default(),
+            seats: Seats::default(),
+            seating: false,
+            hint: None,
             turbo: Turbo::default(),
             repeat: Default::default(),
             events: Vec::new(),
             finger: None,
-            buttons: ButtonLayout::default(),
         };
         let n = input.joy.num_joysticks().unwrap_or(0);
         for i in 0..n {
@@ -496,6 +568,7 @@ impl Input {
         }
         // Start-up pads are not hot-plug news.
         input.events.clear();
+        input.hint = input.pads.first().map(|p| (p.id(), p.info.kind));
         Ok(input)
     }
 
@@ -515,20 +588,16 @@ impl Input {
             .map(|g| g.string())
             .unwrap_or_default();
         let key = format!("{guid}|{name}");
-        let Some(slot) = self.slots.assign(id, &key) else { return };
+        let slot = self.seats.rejoin(id, &key);
         let kind = kind_from(&name, sdl_kind(&ctrl), crate::config::is_steam_deck());
-        let (r, g, b) = SLOT_RGB[slot];
         let mut ctrl = ctrl;
-        let _ = ctrl.set_led(r, g, b);
-        let raw = unsafe { sdl2::sys::SDL_GameControllerFromInstanceID(id as i32) };
-        if !raw.is_null() {
-            unsafe { sdl2::sys::SDL_GameControllerSetPlayerIndex(raw, slot as i32) };
-        }
+        show_seat(&mut ctrl, slot);
         let info = PadInfo { name, kind, slot };
         self.events.push(PadEvent::Connected(info.clone()));
         self.pads.push(Pad {
             ctrl,
             info,
+            key,
             hold: Hold::default(),
             shot: false,
         });
@@ -537,14 +606,26 @@ impl Input {
     fn close(&mut self, id: u32) {
         if let Some(i) = self.pads.iter().position(|p| p.id() == id) {
             let pad = self.pads.remove(i);
-            self.slots.release(id);
+            self.seats.release(id);
+            if self.hint.is_some_and(|(shown, _)| shown == id) {
+                self.hint = self.pads.first().map(|p| (p.id(), p.info.kind));
+            }
             self.events.push(PadEvent::Disconnected(pad.info));
         }
     }
 
-    /// Applies the "Buttons" setting to every gamepad from the next `poll`.
-    pub fn set_buttons(&mut self, layout: ButtonLayout) {
-        self.buttons = layout;
+    /// Lets gamepads take seats: on while a game runs with the menu hidden.
+    pub fn set_seating(&mut self, on: bool) {
+        self.seating = on;
+    }
+
+    /// Every gamepad loses its seat (a game starts); the next one to press a button is player 1.
+    pub fn reset_seats(&mut self) {
+        self.seats.clear();
+        for p in &mut self.pads {
+            p.info.slot = None;
+            show_seat(&mut p.ctrl, None);
+        }
     }
 
     /// Drains SDL events. `dt` = time since the previous call (auto-repeat, hold timers);
@@ -567,7 +648,7 @@ impl Input {
                 Event::TextInput { text, .. } if self.text_on => f.text.push_str(&text),
                 Event::ControllerDeviceAdded { which, .. } => self.open(which),
                 Event::ControllerDeviceRemoved { which, .. } => self.close(which),
-                Event::ControllerButtonDown { button, .. } => {
+                Event::ControllerButtonDown { which, button, .. } => {
                     f.pad.used = true;
                     match button {
                         Button::A => f.nav.confirm = true,
@@ -576,6 +657,13 @@ impl Input {
                         Button::X => f.pad.layout = true,
                         Button::Start => f.pad.start = true,
                         Button::Guide => f.menu = true,
+                        Button::Touchpad => f.menu = true,
+                        // Misc1 is Share on Xbox and Capture on Switch pads, but the
+                        // microphone mute on a DualSense.
+                        Button::Misc1 => {
+                            let mute = self.pads.iter().any(|p| p.id() == which && p.info.kind == PadKind::PlayStation);
+                            f.screenshot |= !mute;
+                        }
                         _ => {}
                     }
                 }
@@ -590,6 +678,7 @@ impl Input {
                     let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
                     if !repeat {
                         f.key_used = true;
+                        self.hint = None;
                     }
                     match sc {
                         Scancode::F11 if !repeat => f.fullscreen = true,
@@ -675,6 +764,9 @@ impl Input {
 
         for p in &mut self.pads {
             let b = p.buttons();
+            if b.active() {
+                self.hint = Some((p.ctrl.instance_id(), p.info.kind));
+            }
             let (u, d, l, r) = b.dirs();
             for (acc, v) in dirs.iter_mut().zip([u, d, l, r]) {
                 *acc |= v;
@@ -687,8 +779,17 @@ impl Input {
             f.fast_forward |= fast_forward;
             f.screenshot |= shot && !p.shot;
             p.shot = shot;
-            f.pads[p.info.slot] |=
-                mask_combo(pad_bits(&mask_shot_combo(&b), self.buttons, turbo_on));
+            let game = mask_shot_combo(&b);
+            if p.info.slot.is_none() && self.seating && mask_combo(pad_bits(&game, p.info.kind, true)) != 0 {
+                if let Some(slot) = self.seats.sit(p.ctrl.instance_id(), &p.key) {
+                    p.info.slot = Some(slot);
+                    show_seat(&mut p.ctrl, Some(slot));
+                    self.events.push(PadEvent::Seated(p.info.clone()));
+                }
+            }
+            if let Some(slot) = p.info.slot {
+                f.pads[slot] |= mask_combo(pad_bits(&game, p.info.kind, turbo_on));
+            }
         }
 
         let [up, down, left, right] = dirs;
@@ -698,6 +799,8 @@ impl Input {
         f.nav.right = self.repeat[3].update(right, dt);
 
         f.gamepads = self.pads.len();
+        f.seated = self.pads.iter().filter(|p| p.info.slot.is_some()).count();
+        f.hint_kind = self.hint.map(|(_, kind)| kind);
         f.pad_events = std::mem::take(&mut self.events);
         f
     }
@@ -716,10 +819,10 @@ impl Input {
         }
     }
 
-    /// Connected controllers in slot order.
+    /// Connected controllers: seated ones in seat order, then the rest in connect order.
     pub fn pads(&self) -> Vec<PadInfo> {
         let mut v: Vec<PadInfo> = self.pads.iter().map(|p| p.info.clone()).collect();
-        v.sort_by_key(|p| p.slot);
+        v.sort_by_key(|p| p.slot.unwrap_or(usize::MAX));
         v
     }
 }
@@ -732,7 +835,6 @@ mod tests {
 
     #[test]
     fn input_positional_mapping() {
-        use ButtonLayout::{BottomRight, LeftBottom};
         let one = |f: fn(&mut PadButtons)| {
             let mut b = PadButtons::default();
             f(&mut b);
@@ -741,32 +843,39 @@ mod tests {
         let (south, east) = (one(|b| b.south = true), one(|b| b.east = true));
         let (west, north) = (one(|b| b.west = true), one(|b| b.north = true));
 
-        // Default: left = B, bottom = A, top = turbo B, right = turbo A.
         for turbo_on in [true, false] {
-            assert_eq!(pad_bits(&west, LeftBottom, turbo_on), pad::B);
-            assert_eq!(pad_bits(&south, LeftBottom, turbo_on), pad::A);
+            // Bottom and top = A, left and right = B.
+            for kind in [PadKind::Xbox, PadKind::PlayStation, PadKind::SteamDeck, PadKind::Generic] {
+                assert_eq!(pad_bits(&south, kind, turbo_on), pad::A);
+                assert_eq!(pad_bits(&north, kind, turbo_on), pad::A);
+                assert_eq!(pad_bits(&west, kind, turbo_on), pad::B);
+                assert_eq!(pad_bits(&east, kind, turbo_on), pad::B);
+            }
+            // Nintendo: the printed A (right) and Y (left) = A, B (bottom) and X (top) = B.
+            assert_eq!(pad_bits(&east, PadKind::Nintendo, turbo_on), pad::A);
+            assert_eq!(pad_bits(&west, PadKind::Nintendo, turbo_on), pad::A);
+            assert_eq!(pad_bits(&south, PadKind::Nintendo, turbo_on), pad::B);
+            assert_eq!(pad_bits(&north, PadKind::Nintendo, turbo_on), pad::B);
         }
-        assert_eq!(pad_bits(&north, LeftBottom, true), pad::B);
-        assert_eq!(pad_bits(&north, LeftBottom, false), 0);
-        assert_eq!(pad_bits(&east, LeftBottom, true), pad::A);
-        assert_eq!(pad_bits(&east, LeftBottom, false), 0);
 
-        // Bottom = B, right = A, left = turbo B, top = turbo A.
-        for turbo_on in [true, false] {
-            assert_eq!(pad_bits(&south, BottomRight, turbo_on), pad::B);
-            assert_eq!(pad_bits(&east, BottomRight, turbo_on), pad::A);
-        }
-        assert_eq!(pad_bits(&west, BottomRight, true), pad::B);
-        assert_eq!(pad_bits(&west, BottomRight, false), 0);
-        assert_eq!(pad_bits(&north, BottomRight, true), pad::A);
-        assert_eq!(pad_bits(&north, BottomRight, false), 0);
+        // Shoulders are turbo: pressed only on the turbo phase.
+        let (l1, r1) = (one(|b| b.l1 = true), one(|b| b.r1 = true));
+        for kind in [PadKind::Xbox, PadKind::Nintendo] {
+            assert_eq!(pad_bits(&l1, kind, true), pad::B);
+            assert_eq!(pad_bits(&l1, kind, false), 0);
+            assert_eq!(pad_bits(&r1, kind, true), pad::A);
+            assert_eq!(pad_bits(&r1, kind, false), 0);
 
-        for layout in [LeftBottom, BottomRight] {
             let b = PadButtons { back: true, start: true, ..Default::default() };
-            assert_eq!(pad_bits(&b, layout, false), pad::SELECT | pad::START);
+            assert_eq!(pad_bits(&b, kind, false), pad::SELECT | pad::START);
             let b = PadButtons { lx: -0.6, ly: 0.4, up: true, ..Default::default() };
-            assert_eq!(pad_bits(&b, layout, false), pad::LEFT | pad::UP);
+            assert_eq!(pad_bits(&b, kind, false), pad::LEFT | pad::UP);
         }
+
+        assert!(!PadButtons::default().active());
+        assert!(l1.active() && south.active());
+        assert!(PadButtons { lx: 0.6, ..Default::default() }.active());
+        assert!(PadButtons { rt: 0.9, ..Default::default() }.active());
     }
 
     #[test]
@@ -779,16 +888,17 @@ mod tests {
         let b = PadButtons { back: true, north: true, south: true, ..Default::default() };
         assert_eq!(pad_hotkeys(&b), (false, false, true));
         // The combo is hidden from the game; other buttons pass through.
-        let layout = ButtonLayout::default();
-        assert_eq!(pad_bits(&mask_shot_combo(&b), layout, true), pad::A);
-        // Without Back, North is turbo B.
-        let b = PadButtons { north: true, south: true, ..Default::default() };
-        assert_eq!(pad_bits(&mask_shot_combo(&b), layout, true), pad::A | pad::B);
+        let kind = PadKind::Xbox;
+        let b = PadButtons { back: true, north: true, west: true, ..Default::default() };
+        assert_eq!(pad_bits(&mask_shot_combo(&b), kind, true), pad::B);
+        // Without Back, North is A.
+        let b = PadButtons { north: true, west: true, ..Default::default() };
+        assert_eq!(pad_bits(&mask_shot_combo(&b), kind, true), pad::A | pad::B);
         let b = PadButtons { back: true, ..Default::default() };
-        assert_eq!(pad_bits(&mask_shot_combo(&b), layout, true), pad::SELECT);
+        assert_eq!(pad_bits(&mask_shot_combo(&b), kind, true), pad::SELECT);
         // Triggers never reach the NES pad.
         let b = PadButtons { lt: 1.0, rt: 1.0, ..Default::default() };
-        assert_eq!(pad_bits(&b, layout, true), 0);
+        assert_eq!(pad_bits(&b, kind, true), 0);
     }
 
     #[test]
@@ -854,40 +964,100 @@ mod tests {
         );
         assert_eq!(mask_combo(pad::START), pad::START);
         let b = PadButtons { back: true, start: true, south: true, ..Default::default() };
-        assert_eq!(mask_combo(pad_bits(&b, ButtonLayout::default(), true)), pad::A);
+        assert_eq!(mask_combo(pad_bits(&b, PadKind::Xbox, true)), pad::A);
     }
 
     #[test]
-    fn input_slot_reuse_on_reconnect() {
-        let mut s = Slots::default();
-        assert_eq!(s.assign(10, "ps5"), Some(0));
-        assert_eq!(s.assign(11, "xbox"), Some(1));
-        assert_eq!(s.assign(12, "deck"), Some(2));
-        assert_eq!(s.release(10), Some(0));
-        // The same pad reconnecting gets its old slot back.
-        assert_eq!(s.assign(14, "ps5"), Some(0));
-        assert_eq!(s.assign(13, "switch"), Some(3));
-        assert_eq!(s.assign(15, "other"), None);
-        assert_eq!(s.release(11), Some(1));
-        assert_eq!(s.assign(15, "other"), Some(1));
-        // Its old slot taken meanwhile: a reconnecting pad takes the lowest free one.
-        assert_eq!(s.release(13), Some(3));
-        assert_eq!(s.release(12), Some(2));
-        assert_eq!(s.assign(16, "deck2"), Some(2));
-        assert_eq!(s.assign(17, "deck"), Some(3));
+    fn input_seats_go_in_order_of_first_press() {
+        let mut s = Seats::default();
+        // Nothing to get back before anyone sat.
+        assert_eq!(s.rejoin(10, "deck"), None);
+        assert_eq!(s.sit(11, "ps5"), Some(0));
+        assert_eq!(s.sit(10, "deck"), Some(1));
+        assert_eq!(s.sit(12, "xbox"), Some(2));
+        assert_eq!(s.sit(13, "switch"), Some(3));
+        assert_eq!(s.sit(14, "other"), None);
+        assert_eq!(s.release(10), Some(1));
+        assert_eq!(s.sit(14, "other"), Some(1));
+        assert_eq!(s.release(99), None);
     }
 
     #[test]
-    fn input_slot_new_guid_takes_lowest_free() {
-        let mut s = Slots::default();
-        assert_eq!(s.assign(10, "ps5-usb"), Some(0));
-        assert_eq!(s.assign(11, "xbox"), Some(1));
-        assert_eq!(s.release(10), Some(0));
-        // Same pad back over Bluetooth (new GUID): player 1 again, not a never-used slot.
-        assert_eq!(s.assign(12, "ps5-bt"), Some(0));
-        // A replacement pad also fills the lowest free slot.
+    fn input_seat_back_on_reconnect() {
+        let mut s = Seats::default();
+        assert_eq!(s.sit(10, "ps5"), Some(0));
+        assert_eq!(s.sit(11, "xbox"), Some(1));
         assert_eq!(s.release(11), Some(1));
-        assert_eq!(s.assign(13, "switch"), Some(1));
+        // Another pad gets no seat by plugging in; the same pad gets its own back.
+        assert_eq!(s.rejoin(12, "switch"), None);
+        assert_eq!(s.rejoin(13, "xbox"), Some(1));
+        // Its seat is taken: nothing to rejoin.
+        assert_eq!(s.rejoin(14, "xbox"), None);
+        // `sit` prefers the old seat over a lower free one.
+        assert_eq!(s.release(10), Some(0));
+        assert_eq!(s.release(13), Some(1));
+        assert_eq!(s.sit(15, "xbox"), Some(1));
+        assert_eq!(s.sit(16, "switch"), Some(0));
+        // `clear` forgets the keys: the former seat-2 pad sits first and is player 1.
+        s.clear();
+        assert_eq!(s.rejoin(17, "xbox"), None);
+        assert_eq!(s.sit(17, "xbox"), Some(0));
+    }
+
+    /// Needs SDL: run with `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy` and `--ignored`.
+    #[test]
+    #[ignore]
+    fn input_virtual_pads_sit_by_first_press() {
+        use sdl2::sys;
+        let sdl = sdl2::init().unwrap();
+        let mut input = Input::new(&sdl).unwrap();
+        let mut pump = sdl.event_pump().unwrap();
+        let ids: Vec<i32> = (0..2)
+            .map(|_| unsafe {
+                let index = sys::SDL_JoystickAttachVirtual(sys::SDL_JoystickType::SDL_JOYSTICK_TYPE_GAMECONTROLLER, 6, 15, 0);
+                assert!(index >= 0);
+                sys::SDL_JoystickGetDeviceInstanceID(index)
+            })
+            .collect();
+        let mut poll = |input: &mut Input| input.poll(&mut pump, MS(16), |_| None);
+        let press = |id: i32, button: Button, down: bool| unsafe {
+            let joy = sys::SDL_JoystickFromInstanceID(id);
+            assert!(!joy.is_null());
+            assert_eq!(sys::SDL_JoystickSetVirtualButton(joy, button as i32, down as u8), 0);
+        };
+        let opened = |input: &Input| ids.iter().all(|id| input.pads.iter().any(|p| p.id() as i32 == *id));
+        for _ in 0..20 {
+            if opened(&input) {
+                break;
+            }
+            poll(&mut input);
+        }
+        assert!(opened(&input));
+        let (first, second) = (ids[0], ids[1]);
+
+        // Seating off (menu): a press seats nobody.
+        press(second, Button::A, true);
+        let f = poll(&mut input);
+        assert_eq!((f.pads, f.seated), ([0; 4], 0));
+
+        input.set_seating(true);
+        let f = poll(&mut input);
+        assert_eq!((f.pads[0], f.seated), (pad::A, 1));
+        assert!(f.pad_events.iter().any(|e| matches!(e, PadEvent::Seated(p) if p.slot == Some(0))));
+
+        press(first, Button::X, true);
+        let f = poll(&mut input);
+        assert_ne!(f.pads[1] & pad::B, 0);
+        assert_eq!(f.seated, 2);
+
+        press(first, Button::X, false);
+        press(second, Button::A, false);
+        poll(&mut input);
+        input.reset_seats();
+        assert!(input.pads().iter().all(|p| p.slot.is_none()));
+        press(first, Button::A, true);
+        let f = poll(&mut input);
+        assert_eq!((f.pads[0], f.seated), (pad::A, 1));
     }
 
     #[test]

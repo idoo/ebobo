@@ -28,7 +28,7 @@ use crate::audio::Audio;
 use crate::canvas::{self, Canvas, Font};
 use crate::config::{self, Config};
 use crate::i18n::Lang;
-use crate::input::{Input, InputFrame, PadInfo};
+use crate::input::{Input, InputFrame, PadEvent, PadInfo};
 use crate::library::{self, Library, RomEntry};
 use crate::ui::{GameView, Text, Ui, UiAction, UiCtx};
 use crate::video::Video;
@@ -244,8 +244,7 @@ impl App {
 
         let sdl = sdl2::init()?;
         // Input sets the controller hints; it must open the game-controller subsystem first.
-        let mut input = Input::new(&sdl)?;
-        input.set_buttons(config.buttons);
+        let input = Input::new(&sdl)?;
         let pump = sdl.event_pump()?;
         let mut video = Video::new(&sdl, config.fullscreen, config.scale, config.screen)?;
         video.set_effect(config.effect);
@@ -368,11 +367,19 @@ impl App {
         self.poll_net_check();
         self.poll_update();
         self.input.set_text_input(self.ui.wants_text_input());
+        self.input.set_seating(self.in_game() && !self.ui.is_visible());
         if !frame.pad_events.is_empty() {
             self.pads = self.input.pads();
             if let State::Solo(s) = &mut self.state {
-                if frame.gamepads >= 3 {
+                if frame.seated >= 3 {
                     s.nes.set_four_score(true);
+                }
+                if frame.gamepads >= 2 {
+                    for event in &frame.pad_events {
+                        if let PadEvent::Seated(pad) = event {
+                            self.ui.toast_seated(pad);
+                        }
+                    }
                 }
             }
             self.apply_sprite_limit();
@@ -684,7 +691,6 @@ impl App {
         }
         self.video.set_screen_mode(self.config.screen);
         self.video.set_effect(self.config.effect);
-        self.input.set_buttons(self.config.buttons);
         if let Some(audio) = &mut self.audio {
             audio.set_volume(self.config.volume);
         }
@@ -722,7 +728,7 @@ impl App {
             Ok(nes) => nes,
             Err(err) => return self.fail(&format!("{}: {err}", entry.name)),
         };
-        let four_score = self.input.pads().len() >= 3 || nes.info().four_score;
+        let four_score = nes.info().four_score;
         nes.set_four_score(four_score);
         nes.set_sprite_limit(self.config.sprite_limit.applies(four_score));
         let mut save_path = None;
@@ -752,6 +758,8 @@ impl App {
         for slot in 0..slots::SLOTS {
             solo.slot_times[slot as usize] = slots::saved_at(&solo.slot_path(slot));
         }
+        self.input.reset_seats();
+        self.pads = self.input.pads();
         self.state = State::Solo(Box::new(solo));
         self.ui.hide();
         self.video.power_on();
@@ -816,6 +824,8 @@ impl App {
                 return self.net_error(&err);
             }
         };
+        self.input.reset_seats();
+        self.pads = self.input.pads();
         self.state = State::Net(Box::new(Net {
             nes,
             stats: session.stats(),

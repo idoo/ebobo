@@ -8,7 +8,7 @@ use ebobo_net::{
 };
 
 use crate::canvas::{Canvas, Color, Font};
-use crate::config::{is_steam_deck, ButtonLayout, Config, ScreenMode, SpriteLimit};
+use crate::config::{is_steam_deck, Config, ScreenMode, SpriteLimit};
 use crate::crt::Effect;
 use crate::i18n::{Lang, S};
 use crate::input::{InputFrame, Nav, PadEvent, PadInfo, PadKind, PointerEvent};
@@ -652,11 +652,11 @@ impl Ui {
             Some(Screen::Code) => self.draw_code(canvas, font, &mut h),
             Some(Screen::ByIp) => self.draw_by_ip(canvas, font, ctx, &mut h),
             Some(Screen::Field(f)) => self.draw_field(canvas, font, f),
-            Some(Screen::Settings) => self.draw_settings(canvas, font, ctx, &mut h),
+            Some(Screen::Settings) => self.draw_settings(canvas, font, ctx, input.hint_kind, &mut h),
             Some(Screen::Advanced) => self.draw_advanced(canvas, font, ctx, &mut h),
             Some(Screen::NetCheck) => self.draw_net_check(canvas, font),
             Some(Screen::Lobby) => self.draw_lobby(canvas, font, ctx, &mut h),
-            Some(Screen::Pause) => self.draw_pause(canvas, font, ctx, &mut h),
+            Some(Screen::Pause) => self.draw_pause(canvas, font, ctx, input.hint_kind, &mut h),
             None => {
                 if let Some(game) = &ctx.game {
                     self.draw_osd(canvas, font, game);
@@ -679,7 +679,7 @@ impl Ui {
         // The keyboard covers the hint bar (its keys say the same) and the toast line.
         self.draw_toasts(canvas, font, if osk_shown { osk::TOP - 16 } else if visible { 214 } else { 224 });
         if visible && !osk_shown {
-            self.draw_hints(canvas, font, ctx, top, &mut h);
+            self.draw_hints(canvas, font, ctx, input.hint_kind, top, &mut h);
         }
         self.regions = h;
     }
@@ -1083,20 +1083,7 @@ impl Ui {
         }
     }
 
-    /// "<pad button>=<NES button>" for B and A, in the lettering of the pad `kind`
-    /// (PlayStation in ASCII: the font has no square or circle).
-    fn buttons_value(layout: ButtonLayout, kind: Option<PadKind>) -> &'static str {
-        match (kind, layout) {
-            (Some(PadKind::Nintendo), ButtonLayout::LeftBottom) => "Y=B B=A",
-            (Some(PadKind::Nintendo), ButtonLayout::BottomRight) => "B=B A=A",
-            (Some(PadKind::PlayStation), ButtonLayout::LeftBottom) => "Sq=B X=A",
-            (Some(PadKind::PlayStation), ButtonLayout::BottomRight) => "X=B O=A",
-            (_, ButtonLayout::LeftBottom) => "X=B A=A",
-            (_, ButtonLayout::BottomRight) => "A=B B=A",
-        }
-    }
-
-    fn settings_items(&self, cfg: &Config, kind: Option<PadKind>) -> Vec<Item> {
+    fn settings_items(&self, cfg: &Config) -> Vec<Item> {
         let onoff = |b: bool| self.t(if b { S::On } else { S::Off }).to_string();
         vec![
             Item::value(self.t(S::Nick), trunc(&cfg.nickname, 11), false),
@@ -1124,7 +1111,6 @@ impl Ui {
                 true,
             ),
             Item::value(self.t(S::Volume), format!("{}%", (cfg.volume * 100.0).round() as u32), true),
-            Item::value(self.t(S::Buttons), Self::buttons_value(cfg.buttons, kind).to_string(), true),
             Item::value(self.t(S::Language), if self.lang == Lang::Ru { "Русский" } else { "English" }.to_string(), true),
             Item::new(self.t(S::Advanced)),
         ]
@@ -1171,7 +1157,7 @@ impl Ui {
             self.pop();
             return None;
         }
-        let confirm = self.menu_step(Screen::Settings, 9, nav);
+        let confirm = self.menu_step(Screen::Settings, 8, nav);
         let row = self.sel[Screen::Settings.slot()];
         let delta: i32 = if nav.right || confirm.is_some() { 1 } else if nav.left { -1 } else { 0 };
         let cfg = &mut *ctx.config;
@@ -1181,12 +1167,12 @@ impl Ui {
                 self.open_field(Field::Nick, nick);
                 None
             }
-            8 if confirm.is_some() => {
+            7 if confirm.is_some() => {
                 self.sel[Screen::Advanced.slot()] = 0;
                 self.push(Screen::Advanced);
                 None
             }
-            0 | 8 => None,
+            0 | 7 => None,
             _ if delta == 0 => None,
             1 => {
                 cfg.fullscreen = !cfg.fullscreen;
@@ -1214,13 +1200,6 @@ impl Ui {
                 let changed = volume != cfg.volume;
                 cfg.volume = volume;
                 changed.then_some(UiAction::ConfigChanged)
-            }
-            6 => {
-                cfg.buttons = match cfg.buttons {
-                    ButtonLayout::LeftBottom => ButtonLayout::BottomRight,
-                    ButtonLayout::BottomRight => ButtonLayout::LeftBottom,
-                };
-                Some(UiAction::ConfigChanged)
             }
             _ => {
                 self.lang = if self.lang == Lang::Ru { Lang::En } else { Lang::Ru };
@@ -1503,20 +1482,62 @@ impl Ui {
         f.draw(c, 16 + f.width(&shown, 1), 76, "_", ACCENT, 1);
     }
 
-    fn draw_settings(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
+    fn draw_settings(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 8, self.t(S::Settings), WHITE, 1);
-        let items = self.settings_items(ctx.config, ctx.pads.first().map(|p| p.kind));
+        let items = self.settings_items(ctx.config);
         Self::draw_rows(c, f, &items, self.sel[Screen::Settings.slot()], 28, 14, h);
-        f.draw(c, 16, 162, self.t(S::Gamepads), SEC, 1);
+        f.draw(c, 16, 146, self.t(S::Gamepads), SEC, 1);
         if ctx.pads.is_empty() {
-            f.draw(c, 24, 174, self.t(S::NoPads), DIS, 1);
+            f.draw(c, 24, 157, self.t(S::NoPads), DIS, 1);
+            return;
         }
-        for (i, pad) in ctx.pads.iter().take(4).enumerate() {
-            let y = 174 + i as i32 * 10;
-            let col = SLOT[pad.slot.min(3)];
-            f.draw(c, 24, y, &(pad.slot + 1).to_string(), col, 1);
+        let shown = ctx.pads.len().min(4);
+        for (i, pad) in ctx.pads.iter().take(shown).enumerate() {
+            let y = 157 + i as i32 * 10;
+            match pad.slot {
+                Some(s) => f.draw(c, 24, y, &(s + 1).to_string(), SLOT[s.min(3)], 1),
+                None => f.draw(c, 24, y, "-", DIS, 1),
+            }
             f.draw(c, 40, y, &trunc(&pad.name, 25), WHITE, 1);
         }
+        let mut y = 157 + shown as i32 * 10 + 3;
+        self.draw_pad_legend(c, f, kind.unwrap_or(ctx.pads[0].kind), &mut y);
+        if ctx.pads.len() >= 2 {
+            f.draw(c, 16, y, self.t(S::PlayerOrder), SEC, 1);
+        }
+    }
+
+    /// The fixed gamepad layout in `kind`'s labels at (16, `*y`): face buttons, then
+    /// shoulders (turbo) on the same line when they fit, else on the next. Advances `*y`
+    /// past the drawn lines.
+    fn draw_pad_legend(&self, c: &mut Canvas, f: &mut Font, kind: PadKind, y: &mut i32) {
+        let gap = f.width("   ", 1);
+        let mut x = 16;
+        if kind == PadKind::PlayStation {
+            for (a, b, col_a, col_b, label) in [(&PS_CROSS, &PS_TRIANGLE, PS_BLUE, PS_GREEN, " = A"), (&PS_CIRCLE, &PS_SQUARE, PS_RED, PS_PINK, " = B")] {
+                bitmap(c, x, *y, a, 8, col_a);
+                bitmap(c, x + 10, *y, b, 8, col_b);
+                x += 18;
+                f.draw(c, x, *y, label, SEC, 1);
+                x += f.width(label, 1) + gap;
+            }
+        } else {
+            let face = "A, Y = A   B, X = B";
+            f.draw(c, x, *y, face, SEC, 1);
+            x += f.width(face, 1) + gap;
+        }
+        let shoulders = match kind {
+            PadKind::Xbox => "LB RB",
+            PadKind::Nintendo => "L R",
+            _ => "L1 R1",
+        };
+        let turbo = format!("{shoulders} = {}", self.t(S::Turbo));
+        if x + f.width(&turbo, 1) > 248 {
+            x = 16;
+            *y += 10;
+        }
+        f.draw(c, x, *y, &turbo, SEC, 1);
+        *y += 10;
     }
 
     fn draw_advanced(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
@@ -1595,7 +1616,7 @@ impl Ui {
         }
     }
 
-    fn draw_pause(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
+    fn draw_pause(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 32, self.t(S::Paused), WHITE, 2);
         let netplay = ctx.game.as_ref().is_some_and(|g| g.netplay);
         if let Some(g) = &ctx.game {
@@ -1618,7 +1639,6 @@ impl Ui {
         let y0 = if netplay { 96 } else { 84 };
         Self::draw_rows(c, f, &items, self.sel[Screen::Pause.slot()].min(items.len() - 1), y0, 16, h);
         if !netplay {
-            let kind = ctx.pads.first().map(|p| p.kind);
             let (lt, rt, shot) = match kind {
                 Some(PadKind::PlayStation) => ("L2", "R2", "Share+Triangle"),
                 Some(PadKind::Nintendo) => ("ZL", "ZR", "-+X"),
@@ -1784,7 +1804,7 @@ impl Ui {
         }
     }
 
-    fn draw_hints(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, top: Option<Screen>, h: &mut Vec<(Area, Hit)>) {
+    fn draw_hints(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, top: Option<Screen>, h: &mut Vec<(Area, Hit)>) {
         let entries: Vec<(Glyph, S)> = if self.modal.is_some() {
             vec![(Glyph::Confirm, S::Ok)]
         } else {
@@ -1794,7 +1814,7 @@ impl Ui {
                 Some(Screen::Picker(_)) => vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back), (Glyph::LeftRight, S::Page)],
                 Some(Screen::Code) => vec![(Glyph::Confirm, S::Join), (Glyph::Back, S::Back)],
                 Some(Screen::Field(_)) => vec![(Glyph::Confirm, S::Ok), (Glyph::Back, S::Back)],
-                Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 8 => {
+                Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 7 => {
                     vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)]
                 }
                 Some(Screen::Advanced) if self.sel[Screen::Advanced.slot()] == 2 => {
@@ -1818,7 +1838,6 @@ impl Ui {
                 Some(Screen::ByIp) => vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)],
             }
         };
-        let kind = ctx.pads.first().map(|p| p.kind);
         let y = 231;
         let mut x = 8;
         for (glyph, s) in entries {
@@ -1861,15 +1880,29 @@ impl Ui {
         self.toasts.retain(|t| t.1 > 0.0);
         for ev in &input.pad_events {
             let msg = match ev {
-                PadEvent::Connected(p) => {
-                    format!("{} {} → {} {}", self.t(S::PadConnected), trunc(&p.name, 12), self.t(S::PlayerN), p.slot + 1)
-                }
+                PadEvent::Connected(p) => match p.slot {
+                    Some(seat) => self.seat_text(&p.name, seat),
+                    None => format!("{} {} {}", self.t(S::PadConnected), trunc(&p.name, 12), self.t(S::PadPlugged)),
+                },
+                PadEvent::Seated(_) => continue,
                 PadEvent::Disconnected(p) => {
                     format!("{} {} {}", self.t(S::PadConnected), trunc(&p.name, 12), self.t(S::PadDisconnected))
                 }
             };
             self.toast(&msg);
         }
+    }
+
+    /// Toast that `pad` took a seat ("Gamepad NAME → player N"); nothing without a seat.
+    pub fn toast_seated(&mut self, pad: &PadInfo) {
+        if let Some(seat) = pad.slot {
+            let msg = self.seat_text(&pad.name, seat);
+            self.toast(&msg);
+        }
+    }
+
+    fn seat_text(&self, name: &str, seat: usize) -> String {
+        format!("{} {} → {} {}", self.t(S::PadConnected), trunc(name, 12), self.t(S::PlayerN), seat + 1)
     }
 }
 
@@ -1928,6 +1961,12 @@ fn net_advice(d: &NetDiag) -> S {
 
 const PS_CROSS: [u8; 8] = [0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81];
 const PS_CIRCLE: [u8; 8] = [0x3C, 0x42, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3C];
+const PS_TRIANGLE: [u8; 8] = [0x18, 0x18, 0x24, 0x24, 0x42, 0x42, 0x81, 0xFF];
+const PS_SQUARE: [u8; 8] = [0xFF, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0xFF];
+const PS_BLUE: Color = rgb(0x7C, 0xA8, 0xF0);
+const PS_RED: Color = rgb(0xF0, 0x6E, 0x6E);
+const PS_GREEN: Color = rgb(0x4C, 0xC6, 0x9A);
+const PS_PINK: Color = rgb(0xE8, 0x8C, 0xC8);
 const LETTER_A: [u8; 5] = [0b010, 0b101, 0b111, 0b101, 0b101];
 const LETTER_B: [u8; 5] = [0b110, 0b101, 0b110, 0b101, 0b110];
 
@@ -1955,9 +1994,9 @@ fn draw_glyph(c: &mut Canvas, f: &mut Font, x: i32, y: i32, kind: Option<PadKind
         }
         (Some(PadKind::PlayStation), _) => {
             if confirm {
-                bitmap(c, x, y, &PS_CROSS, 8, rgb(0x7C, 0xA8, 0xF0));
+                bitmap(c, x, y, &PS_CROSS, 8, PS_BLUE);
             } else {
-                bitmap(c, x, y, &PS_CIRCLE, 8, rgb(0xF0, 0x6E, 0x6E));
+                bitmap(c, x, y, &PS_CIRCLE, 8, PS_RED);
             }
         }
         (Some(kind), _) => {
@@ -2023,6 +2062,11 @@ mod tests {
 
     fn tap(x: i32, y: i32) -> InputFrame {
         pointer(&[PointerEvent::Down(Some((x, y))), PointerEvent::Up(Some((x, y)))])
+    }
+
+    /// An idle frame whose last-used device is a gamepad of `kind` (hint glyphs follow it).
+    fn hint(kind: PadKind) -> InputFrame {
+        InputFrame { hint_kind: Some(kind), ..InputFrame::default() }
     }
 
     /// Draws a frame so the hit regions exist, as the app does every frame.
@@ -2193,7 +2237,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 7;
+        ui.sel[Screen::Settings.slot()] = 6;
         let mut c = ctx(&mut cfg, &[], None);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(ui.lang, Lang::En);
@@ -2323,11 +2367,11 @@ mod tests {
     fn ui_settings_top_level_fits() {
         let cfg = Config::default();
         let ui = Ui::new(Lang::Ru);
-        assert!(ui.settings_items(&cfg, None).len() <= 9);
+        assert_eq!(ui.settings_items(&cfg).len(), 8);
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 8;
+        ui.sel[Screen::Settings.slot()] = 7;
         let mut c = ctx(&mut cfg, &[], None);
         ui.update(&nav(|n| n.confirm = true), &mut c, DT);
         assert_eq!(ui.stack.last(), Some(&Screen::Advanced));
@@ -2340,51 +2384,54 @@ mod tests {
     }
 
     #[test]
-    fn ui_settings_buttons_row_toggles() {
+    fn ui_settings_rows_after_volume() {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        assert_eq!(ui.settings_items(&cfg, None).len(), 9);
-        assert_eq!(cfg.buttons, ButtonLayout::LeftBottom);
         let mut c = ctx(&mut cfg, &[], None);
         for _ in 0..6 {
             assert_eq!(ui.update(&nav(|n| n.down = true), &mut c, DT), None);
         }
         assert_eq!(ui.sel[Screen::Settings.slot()], 6);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
-        assert_eq!(c.config.buttons, ButtonLayout::BottomRight);
-        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::ConfigChanged));
-        assert_eq!(c.config.buttons, ButtonLayout::LeftBottom);
-        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::ConfigChanged));
-        assert_eq!(c.config.buttons, ButtonLayout::BottomRight);
-        assert_eq!(ui.lang, Lang::Ru, "the Buttons row leaves the language alone");
+        assert_eq!(ui.lang, Lang::En, "row 6 is Language");
         ui.update(&nav(|n| n.down = true), &mut c, DT);
         assert_eq!(ui.sel[Screen::Settings.slot()], 7);
-        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
-        assert_eq!(ui.lang, Lang::En);
-        assert_eq!(c.config.buttons, ButtonLayout::BottomRight);
-        ui.update(&nav(|n| n.down = true), &mut c, DT);
-        assert_eq!(ui.sel[Screen::Settings.slot()], 8);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
         assert_eq!(ui.stack.last(), Some(&Screen::Advanced));
+        ui.pop();
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 0, "8 rows wrap");
     }
 
     #[test]
-    fn ui_buttons_value_per_pad_kind() {
-        use ButtonLayout::{BottomRight, LeftBottom};
-        for kind in [None, Some(PadKind::Xbox), Some(PadKind::SteamDeck)] {
-            assert_eq!(Ui::buttons_value(LeftBottom, kind), "X=B A=A");
-            assert_eq!(Ui::buttons_value(BottomRight, kind), "A=B B=A");
-        }
-        assert_eq!(Ui::buttons_value(LeftBottom, Some(PadKind::Nintendo)), "Y=B B=A");
-        assert_eq!(Ui::buttons_value(BottomRight, Some(PadKind::Nintendo)), "B=B A=A");
-        assert_eq!(Ui::buttons_value(LeftBottom, Some(PadKind::PlayStation)), "Sq=B X=A");
-        assert_eq!(Ui::buttons_value(BottomRight, Some(PadKind::PlayStation)), "X=B O=A");
+    fn ui_deck_keys_toasts_fit() {
         for s in [S::DeckKeys, S::DeckKeysFix] {
             for lang in [Lang::Ru, Lang::En] {
                 assert!(lang.tr(s).chars().count() <= 30, "toasts are cut at 30");
             }
         }
+    }
+
+    #[test]
+    fn ui_pad_toasts() {
+        let pad = |slot| PadInfo { name: "DualSense".into(), kind: PadKind::PlayStation, slot };
+        let mut ui = Ui::new(Lang::En);
+        let mut f = InputFrame::default();
+        f.pad_events = vec![PadEvent::Connected(pad(None))];
+        ui.tick(&f, DT);
+        assert_eq!(ui.toasts.len(), 1);
+        assert_eq!(ui.toasts[0].0, format!("Gamepad DualSense {}", Lang::En.tr(S::PadPlugged)));
+        f.pad_events = vec![PadEvent::Seated(pad(Some(1)))];
+        ui.tick(&f, DT);
+        assert_eq!(ui.toasts.len(), 1, "the app toasts seating itself");
+        ui.toast_seated(&pad(None));
+        assert_eq!(ui.toasts.len(), 1, "no seat, no toast");
+        ui.toast_seated(&pad(Some(1)));
+        assert_eq!(ui.toasts.last().unwrap().0, "Gamepad DualSense → player 2");
+        f.pad_events = vec![PadEvent::Connected(pad(Some(0)))];
+        ui.tick(&f, DT);
+        assert_eq!(ui.toasts.last().unwrap().0, "Gamepad DualSense → player 1", "a returning pad gets its seat back");
     }
 
     #[test]
@@ -2547,7 +2594,7 @@ mod tests {
     fn ui_render_snapshots() {
         let mut font = Font::new();
         let mut cfg = Config::default();
-        let pads = [PadInfo { name: "DualSense".into(), kind: PadKind::PlayStation, slot: 0 }];
+        let pads = [PadInfo { name: "DualSense".into(), kind: PadKind::PlayStation, slot: Some(0) }];
         let lob = lobby(3, true, false);
         let names = vec!["Ваня".to_string(), "Саша".to_string()];
         let stats = NetStats::default();
@@ -2563,7 +2610,7 @@ mod tests {
                 canvas.clear(rgb(0x5C, 0x94, 0xFC));
             }
             let c = UiCtx { library: &[], scanning: false, lobby: Some(&lob), game, pads: &pads, config: &mut cfg, version: "0.1.0" };
-            ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
+            ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
             write_png(&format!("/tmp/ebobo-ui-{name}.png"), &canvas.px, 256, 240);
         }
     }
@@ -2613,7 +2660,7 @@ mod tests {
     fn ui_render_net_snapshots() {
         let mut font = Font::new();
         let mut cfg = Config::default();
-        let pads = [PadInfo { name: "DualSense".into(), kind: PadKind::PlayStation, slot: 0 }];
+        let pads = [PadInfo { name: "DualSense".into(), kind: PadKind::PlayStation, slot: Some(0) }];
         let shots = [
             ("netcheck-running", None),
             ("netcheck", Some(diag(true, NatKind::Symmetric))),
@@ -2630,7 +2677,7 @@ mod tests {
                 }
                 let mut canvas = Canvas::new();
                 let c = UiCtx { library: &[], scanning: false, lobby: None, game: None, pads: &pads, config: &mut cfg, version: "0.1.0" };
-                ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
+                ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
                 write_png(&format!("/tmp/ebobo-ui-{name}{suffix}.png"), &canvas.px, 256, 240);
             }
         }
@@ -2645,7 +2692,7 @@ mod tests {
         let notice = Some("Ждём Саша... 7 с".to_string());
         let game = GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice, desync: false, stalled: true, save_slot: None };
         let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
-        ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
+        ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
         write_png("/tmp/ebobo-ui-game-wait.png", &canvas.px, 256, 240);
     }
 
@@ -2758,7 +2805,7 @@ mod tests {
     #[ignore]
     fn ui_osk_snapshots() {
         let mut font = Font::new();
-        let pads = [PadInfo { name: "Steam Deck".into(), kind: PadKind::SteamDeck, slot: 0 }];
+        let pads = [PadInfo { name: "Steam Deck".into(), kind: PadKind::SteamDeck, slot: Some(0) }];
         for name in ["nick-latin", "nick-cyr", "code"] {
             let mut cfg = Config::default();
             cfg.nickname = if name == "nick-cyr" { "Ваня".into() } else { "ivan".into() };
@@ -2781,7 +2828,7 @@ mod tests {
             }
             ui.toast("Геймпад подключён");
             let mut canvas = Canvas::new();
-            ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
+            ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::SteamDeck));
             let k = 4;
             let mut big = vec![0u8; 256 * k * 240 * k * 4];
             for y in 0..240 * k {
@@ -2800,7 +2847,7 @@ mod tests {
     #[ignore]
     fn ui_settings_effect_snapshots() {
         let mut font = Font::new();
-        let pads = [PadInfo { name: "Steam Deck".into(), kind: PadKind::SteamDeck, slot: 0 }];
+        let pads = [PadInfo { name: "Steam Deck".into(), kind: PadKind::SteamDeck, slot: Some(0) }];
         for (lang, name) in [(Lang::Ru, "ru"), (Lang::En, "en")] {
             let mut cfg = Config::default();
             cfg.nickname = "Ваня".into();
@@ -2810,7 +2857,7 @@ mod tests {
             ui.sel[Screen::Settings.slot()] = 4;
             let c = UiCtx { library: &[], scanning: false, lobby: None, game: None, pads: &pads, config: &mut cfg, version: "0.1.0" };
             let mut canvas = Canvas::new();
-            ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
+            ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::SteamDeck));
             let k = 4;
             let mut big = vec![0u8; 256 * k * 240 * k * 4];
             for y in 0..240 * k {
@@ -2823,43 +2870,40 @@ mod tests {
         }
     }
 
-    /// Renders Settings with four pads and the Buttons row selected, in Russian and English
-    /// (`/tmp/padwire-settings-{ru,en}.png`), with a PlayStation pad first
-    /// (`/tmp/padwire-settings-ps-{ru,en}.png`) and the two Deck toasts stacked
-    /// (`/tmp/padwire-toasts-{ru,en}.png`), all at 4x.
+    /// Renders Settings with the gamepad list and button legend, in Russian and English, to
+    /// `/tmp/ebobo-pads-<case>-<ru|en>.png` at 4x: `deck`, `ps` (DualSense seated, Deck idle),
+    /// `four`, `nintendo` (Switch Pro without a seat) and `none`.
     #[test]
     #[ignore]
-    fn ui_settings_buttons_snapshots() {
+    fn ui_settings_pads_snapshots() {
         let mut font = Font::new();
         let pad = |name: &str, kind, slot| PadInfo { name: name.into(), kind, slot };
-        let deck_first = [
-            pad("Steam Deck", PadKind::SteamDeck, 0),
-            pad("DualSense Wireless Controller", PadKind::PlayStation, 1),
-            pad("Nintendo Switch Pro Controller", PadKind::Nintendo, 2),
-            pad("Xbox Series X Controller", PadKind::Xbox, 3),
+        let deck = [pad("Steam Deck", PadKind::SteamDeck, Some(0))];
+        let ps = [pad("DualSense Wireless Controller", PadKind::PlayStation, Some(0)), pad("Steam Deck", PadKind::SteamDeck, None)];
+        let four = [
+            pad("Xbox Series X Controller", PadKind::Xbox, Some(0)),
+            pad("DualSense Wireless Controller", PadKind::PlayStation, Some(1)),
+            pad("Nintendo Switch Pro Controller", PadKind::Nintendo, None),
+            pad("Steam Deck", PadKind::SteamDeck, None),
         ];
-        let ps_first = [
-            pad("DualSense Wireless Controller", PadKind::PlayStation, 0),
-            pad("Steam Deck", PadKind::SteamDeck, 1),
-            pad("Nintendo Switch Pro Controller", PadKind::Nintendo, 2),
-            pad("Xbox Series X Controller", PadKind::Xbox, 3),
+        let nintendo = [pad("Nintendo Switch Pro Controller", PadKind::Nintendo, None)];
+        let cases: [(&str, &[PadInfo], Option<PadKind>); 5] = [
+            ("deck", &deck, Some(PadKind::SteamDeck)),
+            ("ps", &ps, Some(PadKind::PlayStation)),
+            ("four", &four, Some(PadKind::Xbox)),
+            ("nintendo", &nintendo, Some(PadKind::Nintendo)),
+            ("none", &[], None),
         ];
         for (lang, name) in [(Lang::Ru, "ru"), (Lang::En, "en")] {
-            for (shot, pads, toasts) in
-                [("settings", &deck_first, false), ("settings-ps", &ps_first, false), ("toasts", &deck_first, true)]
-            {
+            for (case, pads, kind) in cases {
                 let mut cfg = Config::default();
                 cfg.nickname = "Ваня".into();
                 let mut ui = Ui::new(lang);
                 ui.stack = vec![Screen::Main, Screen::Settings];
-                ui.sel[Screen::Settings.slot()] = 6;
-                if toasts {
-                    ui.toast_secs(ui.text(Text::DeckKeys), 6.0);
-                    ui.toast_secs(ui.text(Text::DeckKeysFix), 6.0);
-                }
+                ui.sel[Screen::Settings.slot()] = 0;
                 let c = UiCtx { library: &[], scanning: false, lobby: None, game: None, pads, config: &mut cfg, version: "0.1.0" };
                 let mut canvas = Canvas::new();
-                ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
+                ui.draw(&mut canvas, &mut font, &c, &InputFrame { hint_kind: kind, ..InputFrame::default() });
                 let k = 4;
                 let mut big = vec![0u8; 256 * k * 240 * k * 4];
                 for y in 0..240 * k {
@@ -2868,7 +2912,7 @@ mod tests {
                         big[(y * 256 * k + x) * 4..][..4].copy_from_slice(&canvas.px[s..s + 4]);
                     }
                 }
-                write_png(&format!("/tmp/padwire-{shot}-{name}.png"), &big, 256 * k, 240 * k);
+                write_png(&format!("/tmp/ebobo-pads-{case}-{name}.png"), &big, 256 * k, 240 * k);
             }
         }
     }

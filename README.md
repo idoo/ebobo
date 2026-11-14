@@ -36,7 +36,7 @@ Settings > Effect turns the picture into an old CRT TV (curved glass, scanlines,
 
 Arrows to move, X is A, Z is B, Enter is Start, right Shift is Select, Esc opens the menu. Hold Tab to fast-forward and Backspace to rewind. F5 and F7 save and load.
 
-On a gamepad the left face button is B and the bottom one is A (X and A on a Steam Deck or Xbox pad). The other two are turbo B and turbo A. `Settings > Buttons` switches to bottom = B, right = A. L2 rewinds, R2 fast-forwards, holding Select+Start opens the menu.
+On a gamepad A and Y are A, B and X are B (PlayStation: Cross and Triangle, Circle and Square), so any two neighbouring buttons work. L1 and R1 are turbo B and turbo A, L2 rewinds, R2 fast-forwards, holding Select+Start opens the menu. PlayStation, Xbox and Switch pads work over USB or Bluetooth; player 1 is whoever presses a button first after the game starts.
 
 ## Building
 
