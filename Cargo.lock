@@ -230,10 +230,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "ebobo-console"
+version = "0.3.6"
+dependencies = [
+ "ebobo-core",
+ "ebobo-md",
+ "serde",
+]
+
+[[package]]
 name = "ebobo-core"
 version = "0.3.6"
 dependencies = [
  "bincode",
+ "serde",
+]
+
+[[package]]
+name = "ebobo-m68k"
+version = "0.3.6"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "ebobo-md"
+version = "0.3.6"
+dependencies = [
+ "bincode",
+ "ebobo-m68k",
+ "ebobo-z80",
  "serde",
 ]
 
@@ -251,6 +277,13 @@ dependencies = [
  "socket2",
  "tungstenite",
  "webpki-roots 1.0.12",
+]
+
+[[package]]
+name = "ebobo-z80"
+version = "0.3.6"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

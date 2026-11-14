@@ -1,6 +1,14 @@
 [workspace]
 resolver = "3"
-members = ["crates/ebobo-core", "crates/ebobo-net", "crates/ebobo"]
+members = [
+    "crates/ebobo-core",
+    "crates/ebobo-m68k",
+    "crates/ebobo-z80",
+    "crates/ebobo-md",
+    "crates/ebobo-console",
+    "crates/ebobo-net",
+    "crates/ebobo",
+]
 exclude = ["vendor/ggrs"]
 
 [workspace.package]
@@ -13,6 +21,15 @@ license = "MIT"
 opt-level = 1
 
 [profile.dev.package.ebobo-core]
+opt-level = 3
+
+[profile.dev.package.ebobo-m68k]
+opt-level = 3
+
+[profile.dev.package.ebobo-z80]
+opt-level = 3
+
+[profile.dev.package.ebobo-md]
 opt-level = 3
 
 [profile.dev.package."*"]

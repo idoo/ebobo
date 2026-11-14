@@ -4,6 +4,12 @@
 *.nes
 # Test ROMs: fetched by scripts/fetch-test-roms.sh, not kept in git.
 crates/ebobo-core/tests/roms/
+# CPU single-step cases and Mega Drive test ROMs: fetched by scripts, not kept in git.
+crates/ebobo-m68k/tests/data/
+crates/ebobo-z80/tests/data/
+crates/ebobo-md/tests/roms/
+*.gen
+*.smd
 *.sav
 .DS_Store
 node_modules/

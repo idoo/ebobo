@@ -1,0 +1,21 @@
+[package]
+name = "ebobo-md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic Sega Mega Drive / Genesis emulator core for rollback netplay"
+
+# One feature per module group, so each can be built and tested alone while it is written:
+#   cargo test -p ebobo-md --no-default-features --features vdp
+[features]
+default = ["system"]
+vdp = []
+sound = []
+periph = []
+system = ["vdp", "sound", "periph"]
+
+[dependencies]
+ebobo-m68k = { path = "../ebobo-m68k" }
+ebobo-z80 = { path = "../ebobo-z80" }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+bincode = "1.3"

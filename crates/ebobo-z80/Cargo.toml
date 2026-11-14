@@ -1,0 +1,9 @@
+[package]
+name = "ebobo-z80"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zilog Z80 CPU core"
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
