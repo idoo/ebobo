@@ -2,7 +2,7 @@
 
 A NES emulator for playing with friends over the internet, on a Mac or a Steam Deck. Up to four players.
 
-It uses rollback netcode, like fighting games do. A bad connection makes a sprite jump now and then, and the game never slows down.
+It uses rollback netcode, like fighting games do. A bad connection makes a sprite jump now and then, and the game never slows down. If the Wi-Fi drops or a phone hotspot switches networks mid-game, ebobo reroutes through the server within a few seconds and waits up to 20 seconds for a player to come back. IPv6 is used when both sides have it, which gets many mobile connections a direct link.
 
 No games included. Bring your own ROMs.
 
@@ -27,6 +27,10 @@ The host picks Create room and gets a five-letter code. Friends pick Join by cod
 If someone can't get in, Settings > Advanced > Network check usually tells you why.
 
 ROMs are found in `~/ROMs`, `~/Downloads`, EmuDeck's folder and a few other usual places. You can also drop one on the window.
+
+On the Steam Deck everything works by touch, and text fields bring up ebobo's own keyboard (Steam's keyboard can't type into it in Game Mode). Your Steam name is the default nickname.
+
+Settings > Effect turns the picture into an old CRT TV (curved glass, scanlines, glow), a flat studio monitor, or a handheld LCD.
 
 ## Keys
 

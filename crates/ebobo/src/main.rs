@@ -4,9 +4,11 @@ mod app;
 mod audio;
 mod canvas;
 mod config;
+mod crt;
 mod i18n;
 mod input;
 mod library;
+mod osk;
 mod ui;
 mod video;
 

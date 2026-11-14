@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::crt::Effect;
 
 pub const USAGE: &str = "\
 usage: ebobo [ROM] [options]
@@ -18,7 +19,9 @@ usage: ebobo [ROM] [options]
   --name NICK          nickname shown to other players
   --fullscreen         start fullscreen
   --windowed           start in a window
-  --screenshot PATH    write a PNG of the screen when the app exits
+  --screenshot PATH    write a PNG of the screen (effects included) when the app exits
+  --screenshot-size WxH  size of that PNG (default: the window's drawable size)
+  --effect NAME        picture effect: off, crt, pvm, lcd
   --exit-after SECONDS quit after this many seconds
   --autostart N        host: start the game once N players are in the room
   --version            print the version
@@ -48,6 +51,8 @@ pub struct Cli {
     pub name: Option<String>,
     pub fullscreen: Option<bool>,
     pub screenshot: Option<PathBuf>,
+    pub screenshot_size: Option<(u32, u32)>,
+    pub effect: Option<Effect>,
     pub exit_after: Option<f64>,
     pub autostart: Option<usize>,
 }
@@ -76,6 +81,9 @@ impl Cli {
         }
         if let Some(fullscreen) = self.fullscreen {
             config.fullscreen = fullscreen;
+        }
+        if let Some(effect) = self.effect {
+            config.effect = effect;
         }
     }
 }
@@ -121,6 +129,19 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             "--fullscreen" => cli.fullscreen = Some(true),
             "--windowed" => cli.fullscreen = Some(false),
             "--screenshot" => cli.screenshot = Some(value(flag)?.into()),
+            "--screenshot-size" => {
+                let raw = value(flag)?;
+                let size = raw
+                    .split_once(['x', 'X'])
+                    .and_then(|(w, h)| Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?)))
+                    .filter(|&(w, h)| (1..=8192).contains(&w) && (1..=8192).contains(&h))
+                    .ok_or_else(|| format!("bad size: {raw}"))?;
+                cli.screenshot_size = Some(size);
+            }
+            "--effect" => {
+                let raw = value(flag)?;
+                cli.effect = Some(Effect::parse(&raw).ok_or_else(|| format!("bad effect: {raw} (off, crt, pvm, lcd)"))?);
+            }
             "--exit-after" => {
                 let raw = value(flag)?;
                 let secs = raw
@@ -230,5 +251,12 @@ mod tests {
         assert_eq!(config.direct_port, 9001);
         assert!(config.force_relay && config.fullscreen);
         assert_eq!(config.nickname, "N");
+        assert_eq!(config.effect, Effect::Off);
+        let cli = run(&["--effect", "CRT", "--screenshot-size", "1280x800"]);
+        cli.apply(&mut config);
+        assert_eq!(config.effect, Effect::CrtTv);
+        assert_eq!(cli.screenshot_size, Some((1280, 800)));
+        assert!(p(&["--effect", "vhs"]).is_err());
+        assert!(p(&["--screenshot-size", "0x5"]).is_err());
     }
 }

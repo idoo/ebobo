@@ -44,6 +44,8 @@ const STATS_EVERY: u32 = 10;
 const STALL_DIM_AFTER: Duration = Duration::from_millis(500);
 /// A gap this long between two loop iterations in netplay means the machine slept.
 const SLEEP_GAP: Duration = Duration::from_secs(2);
+/// The mouse cursor hides this long after the mouse last moved.
+const CURSOR_IDLE: Duration = Duration::from_secs(2);
 
 struct Solo {
     nes: Nes,
@@ -133,6 +135,8 @@ struct App {
     net_check: Option<mpsc::Receiver<NetDiag>>,
     /// Self-update from GitHub releases (checked on start unless `config.auto_update` is off).
     updater: update::Updater,
+    /// When the real mouse last moved (cursor visibility).
+    mouse_at: Option<Instant>,
 }
 
 /// Runs the app; returns the process exit code.
@@ -183,7 +187,15 @@ pub fn run(args: Vec<String>) -> i32 {
     // Quitting with a downloaded update: install it (no relaunch) so the next start is current.
     app.updater.install_on_quit();
     if let Some(path) = &cli.screenshot {
-        let png = png::encode_rgba(canvas::W as u32, canvas::H as u32, &app.canvas.px);
+        // What the screen shows (effects included), else the plain canvas.
+        let (w, h, px) = match app.video.capture(&app.canvas.px, cli.screenshot_size) {
+            Ok(shot) => shot,
+            Err(err) => {
+                eprintln!("ebobo: screenshot read-back failed ({err}), writing the 256x240 canvas");
+                (canvas::W as u32, canvas::H as u32, app.canvas.px.clone())
+            }
+        };
+        let png = png::encode_rgba(w, h, &px);
         if let Err(err) = std::fs::write(path, png) {
             eprintln!("ebobo: cannot write {}: {err}", path.display());
             return 1;
@@ -228,7 +240,8 @@ impl App {
         // Input sets the controller hints; it must open the game-controller subsystem first.
         let input = Input::new(&sdl)?;
         let pump = sdl.event_pump()?;
-        let video = Video::new(&sdl, config.fullscreen, config.scale, config.screen)?;
+        let mut video = Video::new(&sdl, config.fullscreen, config.scale, config.screen)?;
+        video.set_effect(config.effect);
         let lang = Lang::resolve(config.lang.as_deref());
         let mut ui = Ui::new(lang);
         let audio = match Audio::new(&sdl) {
@@ -279,6 +292,7 @@ impl App {
             room_printed: false,
             net_check: None,
             updater,
+            mouse_at: None,
         })
     }
 
@@ -327,7 +341,8 @@ impl App {
     }
 
     fn tick(&mut self, dt: Duration) {
-        let frame = self.input.poll(&mut self.pump, dt);
+        let video = &self.video;
+        let frame = self.input.poll(&mut self.pump, dt, |pos| video.to_canvas(pos));
         self.ui.tick(&frame, dt);
         if dt > SLEEP_GAP && matches!(self.state, State::Net(_)) {
             // Sleep/suspend: GGRS resyncs or times peers out by itself; the frame debt cap in
@@ -413,6 +428,12 @@ impl App {
         self.advance(&frame);
         self.update_battery(false);
         self.compose(&frame);
+        if frame.mouse_moved {
+            self.mouse_at = Some(Instant::now());
+        }
+        // Hidden during play (menus over a game keep it, they take clicks).
+        let playing = self.in_game() && !self.ui.is_visible();
+        self.video.set_cursor_visible(!playing && self.mouse_at.is_some_and(|t| t.elapsed() < CURSOR_IDLE));
         if let Err(err) = self.video.present(&self.canvas.px) {
             eprintln!("ebobo: present: {err}");
         }
@@ -647,6 +668,7 @@ impl App {
             self.video.set_scale(self.config.scale);
         }
         self.video.set_screen_mode(self.config.screen);
+        self.video.set_effect(self.config.effect);
         if let Some(audio) = &mut self.audio {
             audio.set_volume(self.config.volume);
         }
@@ -716,6 +738,7 @@ impl App {
         }
         self.state = State::Solo(Box::new(solo));
         self.ui.hide();
+        self.video.power_on();
     }
 
     fn fail(&mut self, message: &str) {
@@ -794,6 +817,7 @@ impl App {
             last_advance: Instant::now(),
         }));
         self.ui.hide();
+        self.video.power_on();
     }
 
     /// Keeps a ROM the host sent in this player's own library, so the game is there next time

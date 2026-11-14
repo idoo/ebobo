@@ -7,6 +7,7 @@ use ebobo_core::pad;
 use sdl2::controller::{Axis, Button, GameController};
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::{Mod, Scancode};
+use sdl2::mouse::MouseButton;
 use sdl2::{GameControllerSubsystem, JoystickSubsystem};
 
 /// Menu navigation, edge-triggered. Directions auto-repeat while held (400 ms delay, then
@@ -20,6 +21,27 @@ pub struct Nav {
     pub right: bool,
     pub confirm: bool,
     pub back: bool,
+}
+
+/// A spot in the window, before mapping to the UI canvas (`Video::to_canvas`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WindowPos {
+    /// Mouse, in window points.
+    Point(f32, f32),
+    /// Touchscreen finger, normalised 0..1 of the window.
+    Touch(f32, f32),
+}
+
+/// Mouse (left button) or first finger, in 256x240 canvas pixels; `None` = outside the
+/// picture (letterbox bars).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerEvent {
+    Down(Option<(i32, i32)>),
+    /// Movement while pressed.
+    Move(Option<(i32, i32)>),
+    Up(Option<(i32, i32)>),
+    /// Mouse wheel, positive = away from the user (scroll up).
+    Wheel(i32),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -60,6 +82,24 @@ pub struct InputFrame {
     pub gamepads: usize,
     /// Hot-plug notices since the last poll (UI shows a toast).
     pub pad_events: Vec<PadEvent>,
+    /// Pointer events since the last poll, in order (touch-synthesised mouse events dropped).
+    pub pointer: Vec<PointerEvent>,
+    /// The real mouse moved or clicked (show the cursor).
+    pub mouse_moved: bool,
+    /// Gamepad buttons the on-screen keyboard uses.
+    pub pad: PadPress,
+}
+
+/// Gamepad presses this frame beyond `Nav`, for the on-screen keyboard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PadPress {
+    /// Any gamepad button went down.
+    pub used: bool,
+    /// Y / Triangle.
+    pub shift: bool,
+    /// X / Square.
+    pub layout: bool,
+    pub start: bool,
 }
 
 /// Controller family, for button labels in UI hints (Cross/Circle vs A/B).
@@ -95,6 +135,8 @@ const TRIGGER_THRESHOLD: f32 = 0.5;
 const REPEAT_DELAY: Duration = Duration::from_millis(400);
 const REPEAT_EVERY: Duration = Duration::from_millis(80);
 const HOLD_TIME: Duration = Duration::from_millis(600);
+/// `SDL_TOUCH_MOUSEID`: `which` of mouse events SDL synthesises from touches.
+const TOUCH_MOUSE_ID: u32 = u32::MAX;
 
 /// Slot colours: 1 blue, 2 red, 3 green, 4 pink.
 const SLOT_RGB: [(u8, u8, u8); 4] = [
@@ -392,6 +434,8 @@ pub struct Input {
     turbo: Turbo,
     repeat: [Repeat; 4],
     events: Vec<PadEvent>,
+    /// The finger being tracked (`touch_id`, `finger_id`); other fingers are ignored.
+    finger: Option<(i64, i64)>,
 }
 
 impl Input {
@@ -407,6 +451,11 @@ impl Input {
             ("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0"),
         ] {
             sdl2::hint::set(k, v);
+        }
+        // On the Deck SDL_StartTextInput would open Steam's keyboard, whose keys never reach
+        // us; the built-in keyboard (osk.rs) takes its place. Physical keyboards still type.
+        if crate::config::is_steam_deck() {
+            sdl2::hint::set("SDL_ENABLE_SCREEN_KEYBOARD", "0");
         }
         let video = sdl.video()?;
         let joy = sdl.joystick()?;
@@ -425,6 +474,7 @@ impl Input {
             turbo: Turbo::default(),
             repeat: Default::default(),
             events: Vec::new(),
+            finger: None,
         };
         let n = input.joy.num_joysticks().unwrap_or(0);
         for i in 0..n {
@@ -478,8 +528,14 @@ impl Input {
         }
     }
 
-    /// Drains SDL events. `dt` = time since the previous call (auto-repeat, hold timers).
-    pub fn poll(&mut self, events: &mut sdl2::EventPump, dt: Duration) -> InputFrame {
+    /// Drains SDL events. `dt` = time since the previous call (auto-repeat, hold timers);
+    /// `to_canvas` maps mouse and touch positions to UI canvas pixels.
+    pub fn poll(
+        &mut self,
+        events: &mut sdl2::EventPump,
+        dt: Duration,
+        to_canvas: impl Fn(WindowPos) -> Option<(i32, i32)>,
+    ) -> InputFrame {
         let mut f = InputFrame::default();
         for ev in events.poll_iter() {
             match ev {
@@ -492,12 +548,18 @@ impl Input {
                 Event::TextInput { text, .. } if self.text_on => f.text.push_str(&text),
                 Event::ControllerDeviceAdded { which, .. } => self.open(which),
                 Event::ControllerDeviceRemoved { which, .. } => self.close(which),
-                Event::ControllerButtonDown { button, .. } => match button {
-                    Button::A => f.nav.confirm = true,
-                    Button::B => f.nav.back = true,
-                    Button::Guide => f.menu = true,
-                    _ => {}
-                },
+                Event::ControllerButtonDown { button, .. } => {
+                    f.pad.used = true;
+                    match button {
+                        Button::A => f.nav.confirm = true,
+                        Button::B => f.nav.back = true,
+                        Button::Y => f.pad.shift = true,
+                        Button::X => f.pad.layout = true,
+                        Button::Start => f.pad.start = true,
+                        Button::Guide => f.menu = true,
+                        _ => {}
+                    }
+                }
                 Event::KeyDown {
                     scancode: Some(sc),
                     keymod,
@@ -539,6 +601,39 @@ impl Input {
                         Scancode::Return | Scancode::KpEnter if !repeat => f.nav.confirm = true,
                         _ => {}
                     }
+                }
+                // Touches also arrive as synthesised mouse events (`which` = SDL_TOUCH_MOUSEID);
+                // the finger events below already count them.
+                Event::MouseButtonDown { which, .. } | Event::MouseButtonUp { which, .. } | Event::MouseMotion { which, .. }
+                    if which == TOUCH_MOUSE_ID => {}
+                Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
+                    f.mouse_moved = true;
+                    f.pointer.push(PointerEvent::Down(to_canvas(WindowPos::Point(x as f32, y as f32))));
+                }
+                Event::MouseButtonUp { mouse_btn: MouseButton::Left, x, y, .. } => {
+                    f.mouse_moved = true;
+                    f.pointer.push(PointerEvent::Up(to_canvas(WindowPos::Point(x as f32, y as f32))));
+                }
+                Event::MouseMotion { mousestate, x, y, .. } => {
+                    f.mouse_moved = true;
+                    if mousestate.left() {
+                        f.pointer.push(PointerEvent::Move(to_canvas(WindowPos::Point(x as f32, y as f32))));
+                    }
+                }
+                Event::MouseWheel { which, y, direction, .. } if which != TOUCH_MOUSE_ID && y != 0 => {
+                    let y = if direction == sdl2::mouse::MouseWheelDirection::Flipped { -y } else { y };
+                    f.pointer.push(PointerEvent::Wheel(y));
+                }
+                Event::FingerDown { touch_id, finger_id, x, y, .. } if self.finger.is_none() => {
+                    self.finger = Some((touch_id, finger_id));
+                    f.pointer.push(PointerEvent::Down(to_canvas(WindowPos::Touch(x, y))));
+                }
+                Event::FingerMotion { touch_id, finger_id, x, y, .. } if self.finger == Some((touch_id, finger_id)) => {
+                    f.pointer.push(PointerEvent::Move(to_canvas(WindowPos::Touch(x, y))));
+                }
+                Event::FingerUp { touch_id, finger_id, x, y, .. } if self.finger == Some((touch_id, finger_id)) => {
+                    self.finger = None;
+                    f.pointer.push(PointerEvent::Up(to_canvas(WindowPos::Touch(x, y))));
                 }
                 _ => {}
             }

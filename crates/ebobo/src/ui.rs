@@ -9,8 +9,10 @@ use ebobo_net::{
 
 use crate::canvas::{Canvas, Color, Font};
 use crate::config::{is_steam_deck, Config, ScreenMode, SpriteLimit};
+use crate::crt::Effect;
 use crate::i18n::{Lang, S};
-use crate::input::{InputFrame, Nav, PadEvent, PadInfo, PadKind};
+use crate::input::{InputFrame, Nav, PadEvent, PadInfo, PadKind, PointerEvent};
+use crate::osk::{self, Charset, Osk, OskNav, OskOutput};
 use crate::library::RomEntry;
 
 /// What the user asked for; the app performs it.
@@ -118,7 +120,13 @@ const ERR: Color = rgb(0xE4, 0x50, 0x50);
 const SHADE: Color = [0, 0, 0, 170];
 const SLOT: [Color; 4] = [rgb(0x3B, 0x7B, 0xE4), rgb(0xE4, 0x3B, 0x2C), rgb(0x4C, 0xC6, 0x6A), rgb(0xE4, 0x6A, 0xB4)];
 
-const PICKER_ROWS: usize = 22;
+const PICKER_ROWS: usize = 13;
+/// ROM picker row pitch: 14 canvas px ≈ 44 pt on the Deck's 1280x800 screen.
+const PICKER_STEP: i32 = 14;
+/// Smallest tap target height, canvas px (≈ 44 pt on the Deck).
+const MIN_TAP: i32 = 14;
+/// A press that moves this far (canvas px) on a list becomes a scroll drag, not a tap.
+const DRAG_START: i32 = 6;
 const TOAST_SECS: f32 = 2.5;
 const NICK_MAX: usize = 16;
 
@@ -161,6 +169,13 @@ fn wrap(text: &str, cols: usize) -> Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+/// Full-width hit region of a row whose text sits at `y`, `step` px pitch, at least `MIN_TAP`
+/// tall and centred on the text like the accent bar.
+fn row_area(y: i32, step: i32) -> Area {
+    let h = step.max(MIN_TAP);
+    Area { x: 0, y: y + 4 - h / 2, w: 256, h }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -254,6 +269,75 @@ enum Glyph {
     LeftRight,
 }
 
+/// A rectangle on the canvas that takes taps and clicks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Area {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl Area {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+}
+
+/// A button of the gamepad/keyboard a tap stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key {
+    Confirm,
+    Back,
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Key {
+    fn nav(self) -> Nav {
+        let mut n = Nav::default();
+        match self {
+            Key::Confirm => n.confirm = true,
+            Key::Back => n.back = true,
+            Key::Left => n.left = true,
+            Key::Right => n.right = true,
+            Key::Up => n.up = true,
+            Key::Down => n.down = true,
+        }
+        n
+    }
+}
+
+/// What a hit region does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hit {
+    /// Row `i` of the top screen's list (picker: library index). Press selects it, release
+    /// confirms; on a row that cycles a value, a release in `back` (x from..to, the left third of
+    /// the value area) goes left, anywhere else right.
+    Row { i: usize, back: Option<(i32, i32)>, enabled: bool },
+    /// Modal button (0 = OK / Leave, 1 = Stay).
+    Modal(usize),
+    /// Room-code cell: press moves the cursor to it.
+    Cell(usize),
+    /// Hint-bar button or arrow: release acts as that button.
+    Key(Key),
+    /// On-screen keyboard key: press holds it, release on it types.
+    Osk(usize),
+}
+
+/// A press in progress (mouse button or finger down).
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    hit: Hit,
+    y0: i32,
+    /// Moved far enough on the ROM list to scroll it; the release then does not activate.
+    dragging: bool,
+    /// Rows already scrolled by this drag.
+    scrolled: i32,
+}
+
 pub struct Ui {
     lang: Lang,
     stack: Vec<Screen>,
@@ -273,6 +357,15 @@ pub struct Ui {
     diag_running: bool,
     /// "vX.Y.Z" being installed by the self-updater (main-menu status line).
     update: Option<String>,
+    /// Hit regions of the last drawn frame (topmost last).
+    regions: Vec<(Area, Hit)>,
+    press: Option<Press>,
+    /// Built-in keyboard of the open text field; `None` = hidden.
+    osk: Option<Osk>,
+    /// Keyboard key released under the finger, typed by the next `update`.
+    osk_tap: Option<usize>,
+    /// The last confirm came from a gamepad or a tap: the next field opens with the keyboard.
+    osk_wanted: bool,
 }
 
 impl Ui {
@@ -292,6 +385,11 @@ impl Ui {
             diag: None,
             diag_running: false,
             update: None,
+            regions: Vec::new(),
+            press: None,
+            osk: None,
+            osk_tap: None,
+            osk_wanted: false,
         }
     }
 
@@ -302,6 +400,7 @@ impl Ui {
     /// Main menu (no game running).
     pub fn show_main(&mut self) {
         self.stack = vec![Screen::Main];
+        self.press = None;
     }
 
     /// Main menu on top (no game, lobby or submenu): the self-updater may relaunch now.
@@ -318,17 +417,20 @@ impl Ui {
     pub fn show_lobby(&mut self) {
         self.stack = vec![Screen::Lobby];
         self.sel[Screen::Lobby.slot()] = 0;
+        self.press = None;
     }
 
     /// Pause menu over the running game (solo pauses; netplay keeps running underneath).
     pub fn show_pause(&mut self) {
         self.stack = vec![Screen::Pause];
         self.sel[Screen::Pause.slot()] = 0;
+        self.press = None;
     }
 
     /// Hides menus (game view: only OSD and toasts are drawn).
     pub fn hide(&mut self) {
         self.stack.clear();
+        self.press = None;
     }
 
     pub fn is_visible(&self) -> bool {
@@ -393,6 +495,40 @@ impl Ui {
 
     pub fn update(&mut self, input: &InputFrame, ctx: &mut UiCtx, dt: Duration) -> Option<UiAction> {
         self.clock += dt.as_secs_f32();
+        // A gamepad press or a tap opens the next text field with the built-in keyboard,
+        // Enter on a physical keyboard without it.
+        if input.pad.used || input.pointer.iter().any(|e| matches!(e, PointerEvent::Up(_))) {
+            self.osk_wanted = true;
+        } else if input.nav.confirm {
+            self.osk_wanted = false;
+        }
+        // Taps and clicks become the button they stand for, so every screen handles them
+        // exactly like the keyboard/gamepad.
+        let tapped = self.pointer(input, ctx);
+        let synth;
+        let input = if tapped == Nav::default() {
+            input
+        } else {
+            let n = input.nav;
+            let nav = Nav {
+                up: n.up || tapped.up,
+                down: n.down || tapped.down,
+                left: n.left || tapped.left,
+                right: n.right || tapped.right,
+                confirm: n.confirm || tapped.confirm,
+                back: n.back || tapped.back,
+            };
+            synth = InputFrame { nav, ..input.clone() };
+            &synth
+        };
+        let typed;
+        let input = match self.osk_frame(input) {
+            Some(f) => {
+                typed = f;
+                &typed
+            }
+            None => input,
+        };
         let nav = input.nav;
         if let Some(modal) = &mut self.modal {
             if modal.confirm.is_some() {
@@ -499,17 +635,20 @@ impl Ui {
             // Waiting for a peer: a light dim so the frozen picture reads as "paused by the net".
             canvas.dim(0.3);
         }
+        // Rebuilt every frame (the buffer is reused); pointer input reads the last frame's.
+        let mut h = std::mem::take(&mut self.regions);
+        h.clear();
         match top {
-            Some(Screen::Main) => self.draw_main(canvas, font, ctx),
-            Some(Screen::Picker(p)) => self.draw_picker(canvas, font, ctx, p),
-            Some(Screen::Code) => self.draw_code(canvas, font),
-            Some(Screen::ByIp) => self.draw_by_ip(canvas, font, ctx),
+            Some(Screen::Main) => self.draw_main(canvas, font, ctx, &mut h),
+            Some(Screen::Picker(p)) => self.draw_picker(canvas, font, ctx, p, &mut h),
+            Some(Screen::Code) => self.draw_code(canvas, font, &mut h),
+            Some(Screen::ByIp) => self.draw_by_ip(canvas, font, ctx, &mut h),
             Some(Screen::Field(f)) => self.draw_field(canvas, font, f),
-            Some(Screen::Settings) => self.draw_settings(canvas, font, ctx),
-            Some(Screen::Advanced) => self.draw_advanced(canvas, font, ctx),
+            Some(Screen::Settings) => self.draw_settings(canvas, font, ctx, &mut h),
+            Some(Screen::Advanced) => self.draw_advanced(canvas, font, ctx, &mut h),
             Some(Screen::NetCheck) => self.draw_net_check(canvas, font),
-            Some(Screen::Lobby) => self.draw_lobby(canvas, font, ctx),
-            Some(Screen::Pause) => self.draw_pause(canvas, font, ctx),
+            Some(Screen::Lobby) => self.draw_lobby(canvas, font, ctx, &mut h),
+            Some(Screen::Pause) => self.draw_pause(canvas, font, ctx, &mut h),
             None => {
                 if let Some(game) = &ctx.game {
                     self.draw_osd(canvas, font, game);
@@ -519,13 +658,22 @@ impl Ui {
                 }
             }
         }
+        let osk_shown = visible && self.osk_shown();
+        if let (true, Some(k)) = (osk_shown, &self.osk) {
+            k.draw(canvas, font);
+            h.extend(k.key_rects().map(|(i, r)| (Area { x: r.x, y: r.y, w: r.w, h: r.h }, Hit::Osk(i))));
+        }
         if let Some(modal) = &self.modal {
-            self.draw_modal(canvas, font, modal);
+            // Only the modal takes taps while it is open.
+            h.clear();
+            self.draw_modal(canvas, font, modal, &mut h);
         }
-        self.draw_toasts(canvas, font, visible);
-        if visible {
-            self.draw_hints(canvas, font, ctx, top);
+        // The keyboard covers the hint bar (its keys say the same) and the toast line.
+        self.draw_toasts(canvas, font, if osk_shown { osk::TOP - 16 } else if visible { 214 } else { 224 });
+        if visible && !osk_shown {
+            self.draw_hints(canvas, font, ctx, top, &mut h);
         }
+        self.regions = h;
     }
 
     // -----------------------------------------------------------------------------------------
@@ -548,12 +696,117 @@ impl Ui {
 
     fn push(&mut self, screen: Screen) {
         self.stack.push(screen);
+        self.press = None;
     }
 
     fn pop(&mut self) {
         if self.stack.len() > 1 {
             self.stack.pop();
+            self.press = None;
         }
+    }
+
+    /// Topmost hit region of the last drawn frame under (x, y).
+    fn hit_at(&self, x: i32, y: i32) -> Option<Hit> {
+        self.regions.iter().rev().find(|(a, _)| a.contains(x, y)).map(|(_, hit)| *hit)
+    }
+
+    /// Mouse/touch on the regions of the last drawn frame: a press selects what it lands on,
+    /// a release on the same region returns the button it stands for, a release elsewhere
+    /// cancels. On the ROM list a drag or the wheel scrolls.
+    fn pointer(&mut self, input: &InputFrame, ctx: &UiCtx) -> Nav {
+        let picker = match self.stack.last() {
+            Some(&Screen::Picker(p)) if self.modal.is_none() => Some(p),
+            _ => None,
+        };
+        let mut scroll = 0;
+        let mut out = Nav::default();
+        for ev in &input.pointer {
+            match *ev {
+                PointerEvent::Down(Some((x, y))) => {
+                    self.press = self.hit_at(x, y).map(|hit| Press { hit, y0: y, dragging: false, scrolled: 0 });
+                    if let Some(p) = self.press {
+                        self.select(p.hit);
+                    }
+                }
+                PointerEvent::Down(None) => {
+                    self.press = None;
+                    self.release_osk();
+                }
+                PointerEvent::Move(Some((_, y))) => {
+                    let Some(p) = self.press.as_mut().filter(|_| picker.is_some()) else { continue };
+                    if !p.dragging && (y - p.y0).abs() >= DRAG_START {
+                        p.dragging = true;
+                    }
+                    if p.dragging {
+                        // Content follows the finger: dragging up shows later rows.
+                        let rows = (p.y0 - y) / PICKER_STEP;
+                        scroll += rows - p.scrolled;
+                        p.scrolled = rows;
+                    }
+                }
+                PointerEvent::Move(None) => {}
+                PointerEvent::Up(pos) => {
+                    self.release_osk();
+                    let Some(p) = self.press.take() else { continue };
+                    let Some((x, y)) = pos.filter(|_| !p.dragging) else { continue };
+                    if self.hit_at(x, y) == Some(p.hit) {
+                        if let Hit::Osk(i) = p.hit {
+                            self.osk_tap = Some(i);
+                        }
+                        out = self.activate(p.hit, x);
+                        // The screen may change; later events would hit stale regions.
+                        break;
+                    }
+                }
+                PointerEvent::Wheel(dy) => scroll -= dy,
+            }
+        }
+        if let (Some(purpose), true) = (picker, scroll != 0) {
+            self.scroll_picker(purpose, scroll, ctx.library.len());
+        }
+        out
+    }
+
+    /// Press feedback: the pressed row or cell becomes the selection right away.
+    fn select(&mut self, hit: Hit) {
+        match hit {
+            Hit::Row { i, enabled: true, .. } => {
+                if let Some(top) = self.stack.last() {
+                    self.sel[top.slot()] = i;
+                }
+            }
+            Hit::Modal(i) => {
+                if let Some(m) = &mut self.modal {
+                    m.sel = i;
+                }
+            }
+            Hit::Cell(i) => self.code_cur = i,
+            Hit::Osk(i) => {
+                if let Some(k) = &mut self.osk {
+                    k.set_pressed(Some(i));
+                }
+            }
+            Hit::Row { .. } | Hit::Key(_) => {}
+        }
+    }
+
+    /// The button a completed tap at column `x` stands for.
+    fn activate(&self, hit: Hit, x: i32) -> Nav {
+        match hit {
+            Hit::Row { enabled: false, .. } | Hit::Cell(_) | Hit::Osk(_) => Nav::default(),
+            Hit::Row { back: Some((from, to)), .. } => (if (from..to).contains(&x) { Key::Left } else { Key::Right }).nav(),
+            Hit::Row { .. } | Hit::Modal(_) => Key::Confirm.nav(),
+            Hit::Key(k) => k.nav(),
+        }
+    }
+
+    /// Scrolls the ROM list by `rows` (positive = later rows), keeping the selection on screen.
+    fn scroll_picker(&mut self, purpose: Purpose, rows: i32, n: usize) {
+        let max_top = (n + 1).saturating_sub(PICKER_ROWS) as i32;
+        self.picker_top = (self.picker_top as i32 + rows).clamp(0, max_top) as usize;
+        let sel = &mut self.sel[Screen::Picker(purpose).slot()];
+        *sel = (*sel).clamp(self.picker_top, self.picker_top + PICKER_ROWS - 1).min(n);
     }
 
     /// Up/down with wrap on the remembered selection; `Some(index)` on confirm.
@@ -584,11 +837,87 @@ impl Ui {
             self.code_cur = CODE_LEN - 1;
         }
         self.push(Screen::Code);
+        self.open_osk(Charset::RoomCode);
     }
 
     fn open_field(&mut self, field: Field, prefill: String) {
         self.field = prefill;
         self.push(Screen::Field(field));
+        self.open_osk(match field {
+            Field::Addr => Charset::Address,
+            Field::Nick => Charset::Nickname,
+            Field::Server => Charset::Url,
+        });
+    }
+
+    /// The built-in keyboard shows on the Deck always, elsewhere when the field was opened
+    /// with a gamepad or a tap.
+    fn open_osk(&mut self, charset: Charset) {
+        self.osk_tap = None;
+        self.osk = (is_steam_deck() || self.osk_wanted).then(|| Osk::new(charset));
+    }
+
+    fn osk_shown(&self) -> bool {
+        self.osk.is_some() && self.wants_text_input()
+    }
+
+    fn release_osk(&mut self) {
+        if let Some(k) = &mut self.osk {
+            k.set_pressed(None);
+        }
+    }
+
+    /// While the keyboard shows, turns gamepad and tap input into the text-field input the
+    /// field screens already take: d-pad moves on the keyboard, A presses, B deletes (leaves
+    /// an empty field), Y shift, X layout, Start OK. Physical keys keep working; typing on a
+    /// physical keyboard hides the built-in one for this field.
+    fn osk_frame(&mut self, input: &InputFrame) -> Option<InputFrame> {
+        let tap = self.osk_tap.take();
+        if !self.osk_shown() || self.modal.is_some() {
+            return None;
+        }
+        if !input.text.is_empty() && !input.pad.used {
+            self.osk = None;
+            return None;
+        }
+        let empty = match self.stack.last() {
+            Some(Screen::Code) => self.code.iter().all(Option::is_none),
+            _ => self.field.is_empty(),
+        };
+        let k = self.osk.as_mut()?;
+        let (n, pad) = (input.nav, input.pad);
+        let mut out = Vec::new();
+        let moves = [
+            (n.up, OskNav::Up),
+            (n.down, OskNav::Down),
+            (n.left, OskNav::Left),
+            (n.right, OskNav::Right),
+            (pad.used && n.confirm, OskNav::Press),
+            (pad.shift, OskNav::Shift),
+            (pad.layout, OskNav::Layout),
+            (pad.start, OskNav::Done),
+        ];
+        for (on, m) in moves {
+            if on {
+                out.extend(k.nav(m));
+            }
+        }
+        if let Some(i) = tap {
+            out.extend(k.press_key(i));
+        }
+        let mut f = InputFrame { nav: Nav { back: n.back, confirm: n.confirm && !pad.used, ..Nav::default() }, ..input.clone() };
+        if pad.used && n.back && !input.backspace && !empty {
+            f.nav.back = false;
+            out.extend(k.nav(OskNav::Backspace));
+        }
+        for o in out {
+            match o {
+                OskOutput::Char(c) => f.text.push(c),
+                OskOutput::Backspace => f.backspace = true,
+                OskOutput::Done => f.nav.confirm = true,
+            }
+        }
+        Some(f)
     }
 
     fn update_picker(&mut self, purpose: Purpose, input: &InputFrame, ctx: &UiCtx) -> Option<UiAction> {
@@ -748,10 +1077,6 @@ impl Ui {
 
     fn settings_items(&self, cfg: &Config) -> Vec<Item> {
         let onoff = |b: bool| self.t(if b { S::On } else { S::Off }).to_string();
-        let delay = match cfg.input_delay {
-            None => self.t(S::Auto).to_string(),
-            Some(d) => d.to_string(),
-        };
         vec![
             Item::value(self.t(S::Nick), trunc(&cfg.nickname, 11), false),
             Item::value(self.t(S::Fullscreen), onoff(cfg.fullscreen), true),
@@ -766,8 +1091,18 @@ impl Ui {
                 .to_string(),
                 true,
             ),
+            Item::value(
+                self.t(S::Effect),
+                self.t(match cfg.effect {
+                    Effect::Off => S::EffectOff,
+                    Effect::CrtTv => S::EffectCrtTv,
+                    Effect::Pvm => S::EffectPvm,
+                    Effect::Lcd => S::EffectLcd,
+                })
+                .to_string(),
+                true,
+            ),
             Item::value(self.t(S::Volume), format!("{}%", (cfg.volume * 100.0).round() as u32), true),
-            Item::value(self.t(S::InputDelay), delay, true),
             Item::value(self.t(S::Language), if self.lang == Lang::Ru { "Русский" } else { "English" }.to_string(), true),
             Item::new(self.t(S::Advanced)),
         ]
@@ -775,6 +1110,10 @@ impl Ui {
 
     fn advanced_items(&self, cfg: &Config) -> Vec<Item> {
         let server = cfg.server.trim_start_matches("https://").trim_start_matches("http://");
+        let delay = match cfg.input_delay {
+            None => self.t(S::Auto).to_string(),
+            Some(d) => d.to_string(),
+        };
         vec![
             Item::value(self.t(S::Server), trunc(server, 11), false),
             Item::value(self.t(S::ForceRelay), self.t(if cfg.force_relay { S::On } else { S::Off }).to_string(), true),
@@ -791,6 +1130,7 @@ impl Ui {
                 true,
             ),
             Item::value(self.t(S::AutoUpdate), self.t(if cfg.auto_update { S::On } else { S::Off }).to_string(), true),
+            Item::value(self.t(S::InputDelay), delay, true),
         ]
     }
 
@@ -843,17 +1183,15 @@ impl Ui {
                 Some(UiAction::ConfigChanged)
             }
             4 => {
+                cfg.effect = if delta > 0 { cfg.effect.next() } else { cfg.effect.prev() };
+                Some(UiAction::ConfigChanged)
+            }
+            5 => {
                 let steps = ((cfg.volume * 10.0).round() as i32 + delta).clamp(0, 10);
                 let volume = steps as f32 / 10.0;
                 let changed = volume != cfg.volume;
                 cfg.volume = volume;
                 changed.then_some(UiAction::ConfigChanged)
-            }
-            5 => {
-                let i = DELAYS.iter().position(|d| *d == cfg.input_delay).unwrap_or(0) as i32;
-                let next = DELAYS[(i + delta).rem_euclid(DELAYS.len() as i32) as usize];
-                cfg.input_delay = next;
-                Some(UiAction::ConfigChanged)
             }
             _ => {
                 self.lang = if self.lang == Lang::Ru { Lang::En } else { Lang::Ru };
@@ -868,7 +1206,7 @@ impl Ui {
             self.pop();
             return None;
         }
-        let confirm = self.menu_step(Screen::Advanced, 6, nav);
+        let confirm = self.menu_step(Screen::Advanced, 7, nav);
         let cfg = &mut *ctx.config;
         match self.sel[Screen::Advanced.slot()] {
             0 => {
@@ -899,6 +1237,12 @@ impl Ui {
             }
             5 if confirm.is_some() || nav.left || nav.right => {
                 cfg.auto_update = !cfg.auto_update;
+                Some(UiAction::ConfigChanged)
+            }
+            6 if confirm.is_some() || nav.left || nav.right => {
+                let i = DELAYS.iter().position(|d| *d == cfg.input_delay).unwrap_or(0) as i32;
+                let delta = if nav.left { -1 } else { 1 };
+                cfg.input_delay = DELAYS[(i + delta).rem_euclid(DELAYS.len() as i32) as usize];
                 Some(UiAction::ConfigChanged)
             }
             _ => None,
@@ -944,8 +1288,9 @@ impl Ui {
         ["", ".", "..", "..."][(self.clock * 3.0) as usize % 4]
     }
 
-    /// Menu rows from `y0`, `step` px apart; selected row gets the accent bar and `>`.
-    fn draw_rows(c: &mut Canvas, f: &mut Font, items: &[Item], sel: usize, y0: i32, step: i32) {
+    /// Menu rows from `y0`, `step` px apart; selected row gets the accent bar and `>`. Each row
+    /// becomes a full-width hit region at least `MIN_TAP` tall.
+    fn draw_rows(c: &mut Canvas, f: &mut Font, items: &[Item], sel: usize, y0: i32, step: i32, h: &mut Vec<(Area, Hit)>) {
         for (i, it) in items.iter().enumerate() {
             let y = y0 + i as i32 * step;
             let selected = i == sel;
@@ -959,6 +1304,7 @@ impl Ui {
                 _ => WHITE,
             };
             f.draw(c, 24, y, &it.label, col, 1);
+            let mut back = None;
             if let Some(v) = &it.value {
                 let vx = 236 - f.width(v, 1);
                 f.draw(c, vx, y, v, if selected { WHITE } else { SEC }, 1);
@@ -966,21 +1312,28 @@ impl Ui {
                     tri(c, vx - 7, y, WHITE, false);
                     tri(c, 240, y, WHITE, true);
                 }
+                if it.arrows {
+                    // Value area ◀ value ▶: its left third (at least MIN_TAP wide) steps back,
+                    // the rest of the row forward.
+                    let left = vx - 8;
+                    back = Some((left, left + ((248 - left) / 3).max(MIN_TAP)));
+                }
             }
+            h.push((row_area(y, step), Hit::Row { i, back, enabled: !it.disabled }));
         }
     }
 
-    fn draw_main(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx) {
+    fn draw_main(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 32, "EBOBO", ACCENT, 2);
         f.draw_centered(c, 56, &format!("v{}", ctx.version), SEC, 1);
         if let Some(v) = &self.update {
             f.draw_centered(c, 70, &self.t(S::UpdatingTo).replace("{name}", v), ACCENT, 1);
         }
         let items: Vec<Item> = MAIN_ITEMS.iter().map(|s| Item::new(self.t(*s))).collect();
-        Self::draw_rows(c, f, &items, self.sel[Screen::Main.slot()], 88, 16);
+        Self::draw_rows(c, f, &items, self.sel[Screen::Main.slot()], 88, 16, h);
     }
 
-    fn draw_picker(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, purpose: Purpose) {
+    fn draw_picker(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, purpose: Purpose, h: &mut Vec<(Area, Hit)>) {
         let title = self.t(match purpose {
             Purpose::Solo => S::PickRomSolo,
             Purpose::Host => S::PickRomHost,
@@ -1008,7 +1361,7 @@ impl Ui {
                 let base = self.t(S::Scanning);
                 f.draw(c, 16, 112, &format!("{base}{}", self.ticker()), WARN, 1);
             }
-            Self::draw_rows(c, f, &[Item::new(self.t(S::Rescan))], 0, 136, 16);
+            Self::draw_rows(c, f, &[Item::new(self.t(S::Rescan))], 0, 136, 16, h);
             return;
         }
         let top = self.picker_top.min(n);
@@ -1017,12 +1370,14 @@ impl Ui {
             if i > n {
                 break;
             }
-            let y = 24 + row as i32 * 9;
+            let y = 26 + row as i32 * PICKER_STEP;
             let selected = i == sel;
             if selected {
-                c.fill_rect(8, y - 1, 240, 9, ACCENT);
+                c.fill_rect(8, y - 3, 240, PICKER_STEP, ACCENT);
                 f.draw(c, 10, y, ">", WHITE, 1);
             }
+            let enabled = i == n || lib[i].supported;
+            h.push((row_area(y, PICKER_STEP), Hit::Row { i, back: None, enabled }));
             if i == n {
                 f.draw(c, 20, y, self.t(S::Rescan), if selected { WHITE } else { SEC }, 1);
                 continue;
@@ -1045,28 +1400,36 @@ impl Ui {
         }
         if n + 1 > PICKER_ROWS {
             // Scroll position, 1 px track on the right edge.
-            let track = PICKER_ROWS as i32 * 9;
-            let h = (track * PICKER_ROWS as i32 / (n as i32 + 1)).max(4);
-            let y = 24 + (track - h) * top as i32 / (n + 1 - PICKER_ROWS) as i32;
+            let track = PICKER_ROWS as i32 * PICKER_STEP;
+            let thumb = (track * PICKER_ROWS as i32 / (n as i32 + 1)).max(4);
+            let y = 24 + (track - thumb) * top as i32 / (n + 1 - PICKER_ROWS) as i32;
             c.fill_rect(250, 23, 1, track, DIS_BAR);
-            c.fill_rect(250, y - 1, 1, h, SEC);
+            c.fill_rect(250, y - 1, 1, thumb, SEC);
         }
     }
 
-    fn draw_code(&self, c: &mut Canvas, f: &mut Font) {
+    fn draw_code(&self, c: &mut Canvas, f: &mut Font, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 32, self.t(S::EnterCode), WHITE, 1);
         f.draw_centered(c, 48, self.t(S::CodeHint), SEC, 1);
+        let osk = self.osk_shown();
         let (bw, gap) = (28, 8);
         let x0 = (256 - (bw * CODE_LEN as i32 + gap * (CODE_LEN as i32 - 1))) / 2;
-        let y = 84;
+        // With the keyboard the strip moves up clear of it and the letter arrows go.
+        let y = if osk { 76 } else { 84 };
         for i in 0..CODE_LEN {
             let x = x0 + i as i32 * (bw + gap);
+            // Cells grow into the gaps so the whole strip takes taps.
+            h.push((Area { x: x - gap / 2, y, w: bw + gap, h: 32 }, Hit::Cell(i)));
             c.fill_rect(x, y, bw, 32, PANEL);
             if i == self.code_cur {
                 c.rect(x, y, bw, 32, ACCENT);
                 c.rect(x + 1, y + 1, bw - 2, 30, ACCENT);
-                up_tri(c, x + bw / 2 - 3, y - 8, SEC, true);
-                up_tri(c, x + bw / 2 - 3, y + 36, SEC, false);
+                if !osk {
+                    up_tri(c, x + bw / 2 - 3, y - 8, SEC, true);
+                    up_tri(c, x + bw / 2 - 3, y + 36, SEC, false);
+                    h.push((Area { x: x - gap / 2, y: y - 16, w: bw + gap, h: 16 }, Hit::Key(Key::Up)));
+                    h.push((Area { x: x - gap / 2, y: y + 32, w: bw + gap, h: 16 }, Hit::Key(Key::Down)));
+                }
             } else {
                 c.rect(x, y, bw, 32, DIS);
             }
@@ -1075,22 +1438,21 @@ impl Ui {
                 f.draw(c, x + (bw - 16) / 2, y + 8, &s, WHITE, 2);
             }
         }
-        let complete = self.code.iter().all(Option::is_some);
-        let mut join = Item::new(self.t(S::Join));
-        join.disabled = !complete;
-        Self::draw_rows(c, f, &[join], 0, 144, 16);
-        if is_steam_deck() {
-            f.draw_centered(c, 176, self.t(S::DeckKeyboard), SEC, 1);
+        if !osk {
+            let complete = self.code.iter().all(Option::is_some);
+            let mut join = Item::new(self.t(S::Join));
+            join.disabled = !complete;
+            Self::draw_rows(c, f, &[join], 0, 144, 16, h);
         }
     }
 
-    fn draw_by_ip(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx) {
+    fn draw_by_ip(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 32, self.t(S::ByIp), WHITE, 1);
         let items = [
             Item::new(&format!("{} ({})", self.t(S::WaitForPlayers), ctx.config.direct_port)),
             Item::new(self.t(S::ConnectTo)),
         ];
-        Self::draw_rows(c, f, &items, self.sel[Screen::ByIp.slot()], 72, 16);
+        Self::draw_rows(c, f, &items, self.sel[Screen::ByIp.slot()], 72, 16, h);
         for (i, line) in wrap(self.t(S::DirectHint), 28).iter().enumerate() {
             f.draw_centered(c, 120 + i as i32 * 10, line, SEC, 1);
         }
@@ -1110,15 +1472,12 @@ impl Ui {
         let shown: String = chars[chars.len().saturating_sub(27)..].iter().collect();
         f.draw(c, 16, 76, &shown, WHITE, 1);
         f.draw(c, 16 + f.width(&shown, 1), 76, "_", ACCENT, 1);
-        if is_steam_deck() {
-            f.draw_centered(c, 104, self.t(S::DeckKeyboard), SEC, 1);
-        }
     }
 
-    fn draw_settings(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx) {
+    fn draw_settings(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 8, self.t(S::Settings), WHITE, 1);
         let items = self.settings_items(ctx.config);
-        Self::draw_rows(c, f, &items, self.sel[Screen::Settings.slot()], 28, 14);
+        Self::draw_rows(c, f, &items, self.sel[Screen::Settings.slot()], 28, 14, h);
         f.draw(c, 16, 148, self.t(S::Gamepads), SEC, 1);
         if ctx.pads.is_empty() {
             f.draw(c, 24, 160, self.t(S::NoPads), DIS, 1);
@@ -1131,13 +1490,13 @@ impl Ui {
         }
     }
 
-    fn draw_advanced(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx) {
+    fn draw_advanced(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 8, self.t(S::Advanced), WHITE, 1);
         let items = self.advanced_items(ctx.config);
-        Self::draw_rows(c, f, &items, self.sel[Screen::Advanced.slot()], 28, 14);
+        Self::draw_rows(c, f, &items, self.sel[Screen::Advanced.slot()], 28, 14, h);
     }
 
-    fn draw_lobby(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx) {
+    fn draw_lobby(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
         let lobby = ctx.lobby.filter(|l| l.stage != Stage::Connecting);
         let Some(lobby) = lobby else {
             let base = self.t(S::Connecting);
@@ -1198,7 +1557,7 @@ impl Ui {
             let block = self.lobby_block(lobby);
             let mut start = Item::new(self.t(S::Start));
             start.disabled = block.is_some();
-            Self::draw_rows(c, f, &[start], 0, 172, 16);
+            Self::draw_rows(c, f, &[start], 0, 172, 16, h);
             if let Some(reason) = block {
                 f.draw_centered(c, 192, self.t(reason), WARN, 1);
             }
@@ -1207,7 +1566,7 @@ impl Ui {
         }
     }
 
-    fn draw_pause(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx) {
+    fn draw_pause(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 32, self.t(S::Paused), WHITE, 2);
         let netplay = ctx.game.as_ref().is_some_and(|g| g.netplay);
         if let Some(g) = &ctx.game {
@@ -1228,7 +1587,7 @@ impl Ui {
             })
             .collect();
         let y0 = if netplay { 96 } else { 84 };
-        Self::draw_rows(c, f, &items, self.sel[Screen::Pause.slot()].min(items.len() - 1), y0, 16);
+        Self::draw_rows(c, f, &items, self.sel[Screen::Pause.slot()].min(items.len() - 1), y0, 16, h);
         if !netplay {
             let kind = ctx.pads.first().map(|p| p.kind);
             let (lt, rt, shot) = match kind {
@@ -1358,7 +1717,7 @@ impl Ui {
         c.fill_rect(x + 1, y + 1, ((w - 2) as f32 * progress.clamp(0.0, 1.0)) as i32, 6, ACCENT);
     }
 
-    fn draw_modal(&self, c: &mut Canvas, f: &mut Font, m: &Modal) {
+    fn draw_modal(&self, c: &mut Canvas, f: &mut Font, m: &Modal, hits: &mut Vec<(Area, Hit)>) {
         let leave = m.confirm.is_some();
         let buttons = if leave { 2 } else { 1 };
         let h = 16 + 10 + m.lines.len() as i32 * 10 + 8 + buttons * 16 + 4;
@@ -1382,11 +1741,11 @@ impl Ui {
                 f.draw(c, 20, y, ">", WHITE, 1);
             }
             f.draw(c, 32, y, &it.label, WHITE, 1);
+            hits.push((row_area(y, 16), Hit::Modal(i)));
         }
     }
 
-    fn draw_toasts(&self, c: &mut Canvas, f: &mut Font, menus: bool) {
-        let base = if menus { 214 } else { 224 };
+    fn draw_toasts(&self, c: &mut Canvas, f: &mut Font, base: i32) {
         for (i, (msg, _)) in self.toasts.iter().rev().enumerate() {
             let line = trunc(msg, 30);
             let w = f.width(&line, 1);
@@ -1396,7 +1755,7 @@ impl Ui {
         }
     }
 
-    fn draw_hints(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, top: Option<Screen>) {
+    fn draw_hints(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, top: Option<Screen>, h: &mut Vec<(Area, Hit)>) {
         let entries: Vec<(Glyph, S)> = if self.modal.is_some() {
             vec![(Glyph::Confirm, S::Ok)]
         } else {
@@ -1438,6 +1797,23 @@ impl Ui {
             let gw = glyph_width(f, kind, glyph);
             if x + gw + 4 + f.width(label, 1) > 250 {
                 break;
+            }
+            // The whole entry (glyph + label, padded into the gaps, down to the bottom edge)
+            // is a button; LeftRight splits into a left and a right half.
+            let w = gw + 4 + f.width(label, 1) + 12;
+            let area = Area { x: x - 6, y: 224, w, h: 16 };
+            let keys: &[Key] = match glyph {
+                Glyph::Confirm => &[Key::Confirm],
+                Glyph::Back => &[Key::Back],
+                Glyph::LeftRight => &[Key::Left, Key::Right],
+            };
+            let part = area.w / keys.len() as i32;
+            for (k, key) in keys.iter().enumerate() {
+                let a = Area { x: area.x + k as i32 * part, w: part, ..area };
+                if self.press.is_some_and(|p| p.hit == Hit::Key(*key)) {
+                    c.fill_rect(a.x, a.y, a.w, a.h, PANEL);
+                }
+                h.push((a, Hit::Key(*key)));
             }
             draw_glyph(c, f, x, y, kind, glyph);
             x += gw + 4;
@@ -1612,6 +1988,126 @@ mod tests {
         LobbyStatus { stage: Stage::Lobby, code: Some("K7QPA".into()), me: Some(PeerId(0)), is_host: host, players, rom_name: Some("Super Mario Bros. 3 (USA)".into()), can_start, error: None }
     }
 
+    fn pointer(events: &[PointerEvent]) -> InputFrame {
+        InputFrame { pointer: events.to_vec(), ..InputFrame::default() }
+    }
+
+    fn tap(x: i32, y: i32) -> InputFrame {
+        pointer(&[PointerEvent::Down(Some((x, y))), PointerEvent::Up(Some((x, y)))])
+    }
+
+    /// Draws a frame so the hit regions exist, as the app does every frame.
+    fn redraw(ui: &mut Ui, c: &UiCtx) {
+        ui.draw(&mut Canvas::new(), &mut Font::new(), c, &InputFrame::default());
+    }
+
+    #[test]
+    fn ui_tap_activates_main_row() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.show_main();
+        let mut c = ctx(&mut cfg, &[], None);
+        redraw(&mut ui, &c);
+        // Rows from y = 88, 16 px apart, full width: "Play solo" is row 2.
+        assert_eq!(ui.update(&tap(4, 2 * 16 + 88 + 2), &mut c, DT), None);
+        assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
+        ui.show_main();
+        redraw(&mut ui, &c);
+        // The Quit row's band starts 4 px above its text; its top edge at the far right fires.
+        assert_eq!(ui.update(&tap(250, 5 * 16 + 88 - 4), &mut c, DT), Some(UiAction::Quit));
+        // Every row is at least MIN_TAP tall.
+        assert!(ui.regions.iter().all(|(a, _)| a.h >= MIN_TAP));
+    }
+
+    #[test]
+    fn ui_release_outside_cancels() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.show_main();
+        let mut c = ctx(&mut cfg, &[], None);
+        redraw(&mut ui, &c);
+        let quit = (128, 5 * 16 + 88);
+        // Press selects the row at once; release on the title cancels.
+        assert_eq!(ui.update(&pointer(&[PointerEvent::Down(Some(quit))]), &mut c, DT), None);
+        assert_eq!(ui.sel[Screen::Main.slot()], 5);
+        assert_eq!(ui.update(&pointer(&[PointerEvent::Up(Some((128, 20)))]), &mut c, DT), None);
+        // Release in the letterbox (outside the picture) cancels too.
+        let press_out = [PointerEvent::Down(Some(quit)), PointerEvent::Up(None)];
+        assert_eq!(ui.update(&pointer(&press_out), &mut c, DT), None);
+        // Release on another row cancels as well.
+        let other = [PointerEvent::Down(Some(quit)), PointerEvent::Up(Some((128, 88)))];
+        assert_eq!(ui.update(&pointer(&other), &mut c, DT), None);
+        assert_eq!(ui.stack, vec![Screen::Main]);
+        // A plain release with no press does nothing.
+        assert_eq!(ui.update(&pointer(&[PointerEvent::Up(Some(quit))]), &mut c, DT), None);
+    }
+
+    #[test]
+    fn ui_settings_cycle_by_tap() {
+        let mut cfg = Config::default();
+        cfg.volume = 0.5;
+        let mut ui = Ui::new(Lang::Ru);
+        ui.stack = vec![Screen::Main, Screen::Settings];
+        let volume_y = 28 + 5 * 14;
+        let back = |ui: &Ui| {
+            ui.regions
+                .iter()
+                .find_map(|(_, hit)| match hit {
+                    Hit::Row { i: 5, back, .. } => *back,
+                    _ => None,
+                })
+                .expect("volume row cycles")
+        };
+        let mut c = ctx(&mut cfg, &[], None);
+        redraw(&mut ui, &c);
+        let (from, to) = back(&ui);
+        assert_eq!(ui.update(&tap(from, volume_y), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.volume, 0.4);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 5);
+        redraw(&mut ui, &c);
+        let (_, to2) = back(&ui);
+        assert_eq!(ui.update(&tap(to2, volume_y), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.volume, 0.5);
+        assert_eq!(ui.update(&tap(30, volume_y), &mut c, DT), Some(UiAction::ConfigChanged), "label area goes right");
+        assert_eq!(c.config.volume, 0.6);
+        assert!(to - from >= 8);
+        // The Back button of the hint bar goes back.
+        redraw(&mut ui, &c);
+        let back = ui.regions.iter().find(|(_, hit)| *hit == Hit::Key(Key::Back)).map(|(a, _)| *a).expect("back hint");
+        ui.update(&tap(back.x + 1, back.y + back.h - 1), &mut c, DT);
+        assert_eq!(ui.stack, vec![Screen::Main]);
+    }
+
+    #[test]
+    fn ui_picker_scrolls_by_drag_and_wheel() {
+        let mut cfg = Config::default();
+        let lib: Vec<RomEntry> = (0..40).map(|i| entry(&format!("Game {i}"), true, Region::Ntsc)).collect();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.stack = vec![Screen::Main, Screen::Picker(Purpose::Solo)];
+        let mut c = ctx(&mut cfg, &lib, None);
+        redraw(&mut ui, &c);
+        // Drag up by 5 rows: later games come into view, and the release starts nothing.
+        let y = 26 + 8 * PICKER_STEP;
+        let drag = [
+            PointerEvent::Down(Some((128, y))),
+            PointerEvent::Move(Some((128, y - 2 * PICKER_STEP))),
+            PointerEvent::Move(Some((128, y - 5 * PICKER_STEP))),
+            PointerEvent::Up(Some((128, y - 5 * PICKER_STEP))),
+        ];
+        assert_eq!(ui.update(&pointer(&drag), &mut c, DT), None);
+        assert_eq!(ui.picker_top, 5);
+        assert!(ui.sel[Screen::Picker(Purpose::Solo).slot()] >= 5);
+        // Wheel towards the user scrolls further down; past the end it stops.
+        ui.update(&pointer(&[PointerEvent::Wheel(-3)]), &mut c, DT);
+        assert_eq!(ui.picker_top, 8);
+        ui.update(&pointer(&[PointerEvent::Wheel(-100)]), &mut c, DT);
+        assert_eq!(ui.picker_top, 41 - PICKER_ROWS);
+        // A tap on the first visible row plays the game shown there.
+        redraw(&mut ui, &c);
+        let first = ui.picker_top;
+        assert_eq!(ui.update(&tap(128, 26), &mut c, DT), Some(UiAction::PlaySolo(lib[first].clone())));
+    }
+
     #[test]
     fn ui_join_by_typed_code() {
         let mut cfg = Config::default();
@@ -1655,7 +2151,7 @@ mod tests {
                 ui.update(&nav(|n| n.down = true), &mut c, DT);
             }
             ui.update(&nav(|n| n.confirm = true), &mut c, DT);
-            for _ in 0..4 {
+            for _ in 0..5 {
                 ui.update(&nav(|n| n.down = true), &mut c, DT);
             }
             assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
@@ -1821,7 +2317,7 @@ mod tests {
         ui.stack = vec![Screen::Settings, Screen::Advanced];
         ui.sel[Screen::Advanced.slot()] = 4;
         let items = ui.advanced_items(&cfg);
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), 7);
         let mut c = ctx(&mut cfg, &[], None);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(c.config.sprite_limit, SpriteLimit::Hardware);
@@ -1836,6 +2332,46 @@ mod tests {
         ui.sel[Screen::Advanced.slot()] = 4;
         ui.update(&nav(|n| n.left = true), &mut c, DT);
         assert_eq!(c.config.sprite_limit, SpriteLimit::Off);
+        ui.sel[Screen::Advanced.slot()] = 6;
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.input_delay, Some(1), "input delay moved to Advanced");
+        ui.update(&nav(|n| n.left = true), &mut c, DT);
+        ui.update(&nav(|n| n.left = true), &mut c, DT);
+        assert_eq!(c.config.input_delay, Some(6));
+    }
+
+    #[test]
+    fn ui_effect_cycles_both_ways() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.stack = vec![Screen::Main, Screen::Settings];
+        ui.sel[Screen::Settings.slot()] = 4;
+        let mut c = ctx(&mut cfg, &[], None);
+        assert_eq!(c.config.effect, Effect::Off);
+        for want in [Effect::CrtTv, Effect::Pvm, Effect::Lcd, Effect::Off] {
+            assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
+            assert_eq!(c.config.effect, want);
+        }
+        for want in [Effect::Lcd, Effect::Pvm, Effect::CrtTv, Effect::Off] {
+            assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::ConfigChanged));
+            assert_eq!(c.config.effect, want);
+        }
+        // Taps: the left part of the value steps back, the label area forward.
+        redraw(&mut ui, &c);
+        let y = 28 + 4 * 14;
+        let (from, _) = ui
+            .regions
+            .iter()
+            .find_map(|(_, hit)| match hit {
+                Hit::Row { i: 4, back, .. } => *back,
+                _ => None,
+            })
+            .expect("effect row cycles");
+        assert_eq!(ui.update(&tap(from, y), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.effect, Effect::Lcd);
+        redraw(&mut ui, &c);
+        assert_eq!(ui.update(&tap(30, y), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.effect, Effect::Off);
     }
 
     #[test]
@@ -2034,5 +2570,179 @@ mod tests {
         let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
         ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
         write_png("/tmp/ebobo-ui-game-wait.png", &canvas.px, 256, 240);
+    }
+
+    fn pad(f: impl FnOnce(&mut Nav)) -> InputFrame {
+        let mut i = nav(f);
+        i.pad.used = true;
+        i
+    }
+
+    fn key_tap(ui: &Ui, c: char) -> InputFrame {
+        let k = ui.osk.as_ref().expect("keyboard shown");
+        let i = k.key_of(c).expect("key");
+        let r = k.key_rects().find(|(j, _)| *j == i).expect("enabled").1;
+        tap(r.x + r.w / 2, r.y + r.h / 2)
+    }
+
+    fn open_nick_by_pad(ui: &mut Ui, c: &mut UiCtx) {
+        ui.stack = vec![Screen::Main, Screen::Settings];
+        ui.update(&pad(|n| n.confirm = true), c, DT);
+        assert_eq!(ui.stack.last(), Some(&Screen::Field(Field::Nick)));
+    }
+
+    #[test]
+    fn ui_osk_nick_by_gamepad() {
+        let mut cfg = Config::default();
+        cfg.nickname = "Ab".into();
+        let mut ui = Ui::new(Lang::Ru);
+        let mut c = ctx(&mut cfg, &[], None);
+        open_nick_by_pad(&mut ui, &mut c);
+        redraw(&mut ui, &c);
+        assert!(ui.regions.iter().any(|(_, h)| matches!(h, Hit::Osk(_))), "keyboard drawn");
+        assert!(ui.regions.iter().all(|(a, h)| !matches!(h, Hit::Key(_)) && (a.y >= osk::TOP || matches!(h, Hit::Cell(_)) || a.y + a.h <= osk::TOP)));
+        // Cursor starts on q; right moves to w, A types it.
+        ui.update(&pad(|n| n.right = true), &mut c, DT);
+        ui.update(&pad(|n| n.confirm = true), &mut c, DT);
+        assert_eq!(ui.field, "Abw");
+        // B deletes, Start confirms.
+        ui.update(&pad(|n| n.back = true), &mut c, DT);
+        assert_eq!(ui.field, "Ab");
+        let mut start = pad(|_| {});
+        start.pad.start = true;
+        assert_eq!(ui.update(&start, &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.nickname, "Ab");
+    }
+
+    #[test]
+    fn ui_osk_tap_types_and_b_leaves_empty() {
+        let mut cfg = Config::default();
+        cfg.nickname = String::new();
+        let mut ui = Ui::new(Lang::Ru);
+        let mut c = ctx(&mut cfg, &[], None);
+        open_nick_by_pad(&mut ui, &mut c);
+        redraw(&mut ui, &c);
+        ui.update(&key_tap(&ui, 'z'), &mut c, DT);
+        assert_eq!(ui.field, "z");
+        assert_eq!(ui.osk.as_ref().map(|k| k.cursor()), ui.osk.as_ref().and_then(|k| k.key_of('z')));
+        ui.update(&pad(|n| n.back = true), &mut c, DT);
+        assert_eq!(ui.field, "");
+        assert!(ui.wants_text_input(), "B with text only deletes");
+        ui.update(&pad(|n| n.back = true), &mut c, DT);
+        assert_eq!(ui.stack.last(), Some(&Screen::Settings), "B on an empty field leaves");
+    }
+
+    #[test]
+    fn ui_osk_room_code_joins_like_typing() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.show_main();
+        let mut c = ctx(&mut cfg, &[], None);
+        ui.update(&pad(|n| n.down = true), &mut c, DT);
+        ui.update(&pad(|n| n.confirm = true), &mut c, DT);
+        assert_eq!(ui.stack.last(), Some(&Screen::Code));
+        assert!(ui.osk.is_some());
+        for ch in "k7qpa".chars() {
+            redraw(&mut ui, &c);
+            ui.update(&key_tap(&ui, ch), &mut c, DT);
+        }
+        assert_eq!(ui.code_string(), "K7QPA");
+        let mut start = pad(|_| {});
+        start.pad.start = true;
+        assert_eq!(ui.update(&start, &mut c, DT), Some(UiAction::JoinRoom("K7QPA".into())));
+    }
+
+    #[test]
+    fn ui_osk_physical_typing_hides_it() {
+        let mut cfg = Config::default();
+        cfg.nickname = String::new();
+        let mut ui = Ui::new(Lang::Ru);
+        let mut c = ctx(&mut cfg, &[], None);
+        open_nick_by_pad(&mut ui, &mut c);
+        let mut typed = InputFrame::default();
+        typed.text = "Ivan".into();
+        ui.update(&typed, &mut c, DT);
+        assert!(ui.osk.is_none());
+        assert_eq!(ui.field, "Ivan");
+        redraw(&mut ui, &c);
+        assert!(ui.regions.iter().any(|(_, h)| *h == Hit::Key(Key::Back)), "hint bar back");
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.nickname, "Ivan");
+        // Enter on a physical keyboard opens the field without the built-in keyboard.
+        ui.stack = vec![Screen::Main, Screen::Settings];
+        ui.update(&nav(|n| n.confirm = true), &mut c, DT);
+        assert!(ui.wants_text_input());
+        assert!(ui.osk.is_none());
+    }
+
+    /// Renders the nickname field with the keyboard (Latin, Cyrillic) and the room-code
+    /// screen to /tmp/oskwire-*.png for a visual check.
+    #[test]
+    #[ignore]
+    fn ui_osk_snapshots() {
+        let mut font = Font::new();
+        let pads = [PadInfo { name: "Steam Deck".into(), kind: PadKind::SteamDeck, slot: 0 }];
+        for name in ["nick-latin", "nick-cyr", "code"] {
+            let mut cfg = Config::default();
+            cfg.nickname = if name == "nick-cyr" { "Ваня".into() } else { "ivan".into() };
+            let mut ui = Ui::new(Lang::Ru);
+            let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: None, pads: &pads, config: &mut cfg, version: "0.1.0" };
+            if name == "code" {
+                ui.show_main();
+                ui.update(&pad(|n| n.down = true), &mut c, DT);
+                ui.update(&pad(|n| n.confirm = true), &mut c, DT);
+                let mut typed = pad(|_| {});
+                typed.text = "K7Q".into();
+                ui.update(&typed, &mut c, DT);
+            } else {
+                open_nick_by_pad(&mut ui, &mut c);
+                if name == "nick-cyr" {
+                    let mut x = pad(|_| {});
+                    x.pad.layout = true;
+                    ui.update(&x, &mut c, DT);
+                }
+            }
+            ui.toast("Геймпад подключён");
+            let mut canvas = Canvas::new();
+            ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
+            let k = 4;
+            let mut big = vec![0u8; 256 * k * 240 * k * 4];
+            for y in 0..240 * k {
+                for x in 0..256 * k {
+                    let s = ((y / k) * 256 + x / k) * 4;
+                    big[(y * 256 * k + x) * 4..][..4].copy_from_slice(&canvas.px[s..s + 4]);
+                }
+            }
+            write_png(&format!("/tmp/oskwire-{name}.png"), &big, 256 * k, 240 * k);
+        }
+    }
+
+    /// Renders Settings (Effect row selected, CRT TV) in Russian and English to
+    /// /tmp/crtwire-settings-{ru,en}.png at 4x for a visual check.
+    #[test]
+    #[ignore]
+    fn ui_settings_effect_snapshots() {
+        let mut font = Font::new();
+        let pads = [PadInfo { name: "Steam Deck".into(), kind: PadKind::SteamDeck, slot: 0 }];
+        for (lang, name) in [(Lang::Ru, "ru"), (Lang::En, "en")] {
+            let mut cfg = Config::default();
+            cfg.nickname = "Ваня".into();
+            cfg.effect = Effect::CrtTv;
+            let mut ui = Ui::new(lang);
+            ui.stack = vec![Screen::Main, Screen::Settings];
+            ui.sel[Screen::Settings.slot()] = 4;
+            let c = UiCtx { library: &[], scanning: false, lobby: None, game: None, pads: &pads, config: &mut cfg, version: "0.1.0" };
+            let mut canvas = Canvas::new();
+            ui.draw(&mut canvas, &mut font, &c, &InputFrame::default());
+            let k = 4;
+            let mut big = vec![0u8; 256 * k * 240 * k * 4];
+            for y in 0..240 * k {
+                for x in 0..256 * k {
+                    let s = ((y / k) * 256 + x / k) * 4;
+                    big[(y * 256 * k + x) * 4..][..4].copy_from_slice(&canvas.px[s..s + 4]);
+                }
+            }
+            write_png(&format!("/tmp/crtwire-settings-{name}.png"), &big, 256 * k, 240 * k);
+        }
     }
 }
