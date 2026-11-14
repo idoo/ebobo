@@ -198,3 +198,67 @@ fn version_rules() {
     assert_eq!(local_version("Host"), mine);
     assert_eq!(local_version("OldVer x"), "0.0.0-oldver");
 }
+
+const NTSC_MS: f64 = 16.64;
+
+/// Auto input delay for one peer that produced `samples` (ms).
+fn delay_after(samples: &[f64]) -> usize {
+    let mut c = Peer::new().ctrl;
+    for &s in samples {
+        c.add_sample(s);
+    }
+    assert_eq!(c.samples as usize, samples.len());
+    auto_input_delay(c.delay_rtt().unwrap_or(0.0), NTSC_MS)
+}
+
+#[test]
+fn lobby_delay_lan_jitter() {
+    let s: Vec<f64> = (0..16).map(|i| 33.0 + [3.0, -3.0, 0.0, 2.0][i % 4]).collect();
+    let d = delay_after(&s);
+    assert!((1..=2).contains(&d), "33 ± 3 ms, 16 samples: {d}");
+}
+
+#[test]
+fn lobby_delay_steady_120() {
+    let d = delay_after(&[120.0; 16]);
+    assert!((4..=5).contains(&d), "steady 120 ms: {d}");
+}
+
+#[test]
+fn lobby_delay_cold_start_not_inflated() {
+    // RFC 6298 cold start (rttvar = R / 2) would plan for 240 ms → 8 → cap 6.
+    let d = delay_after(&[120.0]);
+    assert!(d < 6, "one 120 ms sample: {d}");
+    assert!(d >= 4, "one 120 ms sample still covers the one-way latency: {d}");
+    // Warm-up boundary: 7 samples use srtt * 1.25, the 8th switches to srtt + 2 * rttvar.
+    let mut c = Peer::new().ctrl;
+    for _ in 0..7 {
+        c.add_sample(120.0);
+    }
+    assert_eq!(c.delay_rtt(), Some(150.0));
+    c.add_sample(120.0);
+    assert_eq!(c.delay_rtt(), Some(c.rtt.unwrap() + 2.0 * c.rttvar));
+}
+
+#[test]
+fn lobby_delay_jittery_300_caps() {
+    let s: Vec<f64> = (0..16).map(|i| if i % 2 == 0 { 220.0 } else { 380.0 }).collect();
+    assert_eq!(delay_after(&s), 6);
+    assert_eq!(delay_after(&[300.0]), 6);
+}
+
+#[test]
+fn lobby_delay_no_samples_never_blocks() {
+    assert_eq!(delay_after(&[]), 1);
+}
+
+#[test]
+fn lobby_ctrl_rto_tracks_rtt() {
+    let mut c = Peer::new().ctrl;
+    assert_eq!(c.rto(), CTRL_RETRY);
+    c.add_sample(300.0);
+    // 300 + 4 * 150 = 900 ms: a 300 ms link is not retransmitted before its ack (Karn).
+    assert_eq!(c.rto(), Duration::from_millis(900));
+    c.add_sample(5000.0);
+    assert_eq!(c.rto(), Duration::from_secs(1));
+}

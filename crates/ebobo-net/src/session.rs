@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use ebobo_core::Nes;
 use ggrs::{DesyncDetection, GgrsError, GgrsEvent, GgrsRequest, InputStatus, P2PSession, PlayerType, SessionBuilder, SessionState};
 
-use crate::transport::{PeerId, RouteKind, Transport};
+use crate::mesh::Link;
+use crate::transport::{PeerId, RouteKind};
 use crate::{NetError, INPUT_RESET};
 
 /// ggrs configuration: `Input = u16` (pad bits 0-7, `INPUT_RESET` bit 8),
@@ -62,11 +63,11 @@ pub struct FrameOutcome {
     pub rollback_frames: u32,
 }
 
-/// The ggrs socket: shares the transport with the session so `take_departed`/`close` stay
+/// The ggrs socket: shares the link with the session so `take_departed`/`stats`/`leave` stay
 /// reachable after ggrs took ownership of its socket. Also counts payload bytes sent per peer
 /// (ggrs 0.13 reports no bandwidth).
 struct SharedSocket {
-    transport: Rc<RefCell<Transport>>,
+    link: Rc<RefCell<Option<Link>>>,
     sent: Rc<RefCell<[u64; 4]>>,
 }
 
@@ -75,20 +76,34 @@ impl ggrs::NonBlockingSocket<PeerId> for SharedSocket {
         if let (Some(total), Ok(len)) = (self.sent.borrow_mut().get_mut(addr.0 as usize), bincode::serialized_size(msg)) {
             *total += len;
         }
-        self.transport.borrow_mut().send_to(msg, addr);
+        if let Some(link) = self.link.borrow_mut().as_mut() {
+            link.send_to(msg, addr);
+        }
     }
 
+    /// Also drives the link (signaling, route health, punches) on every GGRS poll.
     fn receive_all_messages(&mut self) -> Vec<(PeerId, ggrs::Message)> {
-        self.transport.borrow_mut().receive_all_messages()
+        self.link.borrow_mut().as_mut().map_or_else(Vec::new, |l| l.receive_all_messages())
     }
 }
 
-const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// Tuned with `session_profile_matrix` (session_tests.rs; 8 s runs, 60 fps pacing, random input
+// every frame) on mobile (60±30 ms, bursty loss), far (150±20 ms), asym (15/180 ms) and a 4 s
+// blackout, 2 and 4 peers, input delay 1-6:
+// - prediction 10: far 2p stalls drop from 14-33 % (window 8) to 4-11 %, mobile 2p delay 1 from
+//   2.4 % to 1.9 %; 12 gains only ~1 point more but a 12-frame rollback costs 12.3 ms mean /
+//   14.6 ms worst on the core, nearly the whole 16.6 ms frame, against ~10 ms for 10.
+// - timeout 20 s: the 4 s blackout never disconnected (one Interrupted per peer, 0 Disconnected);
+//   20 s lets a ~15 s signal loss (tunnel) resume instead of dropping the player.
+// - notify 1.5 s: no Interrupted on mobile/far/asym in any run (loss bursts last ~50 ms), so the
+//   warning only shows for real outages.
+const MAX_PREDICTION: usize = 10;
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DISCONNECT_NOTIFY: Duration = Duration::from_millis(1500);
 
 pub struct NetSession {
     ggrs: P2PSession<EboboConfig>,
-    transport: Rc<RefCell<Transport>>,
+    link: Rc<RefCell<Option<Link>>>,
     sent: Rc<RefCell<[u64; 4]>>,
     started: Instant,
     slots: Vec<PeerId>,
@@ -106,20 +121,21 @@ fn io(e: GgrsError) -> NetError {
 
 impl NetSession {
     /// Builds the GGRS P2P session: `slots.len()` players, local handle = index of
-    /// `transport.me()` in `slots`, others remote. `fps` = 60 NTSC / 50 PAL.
-    pub fn new(transport: Transport, slots: &[PeerId], input_delay: usize, fps: usize) -> Result<NetSession, NetError> {
-        NetSession::with_timeouts(transport, slots, input_delay, fps, DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)
+    /// `link.me()` in `slots`, others remote. `fps` = 60 NTSC / 50 PAL.
+    pub fn new(link: Link, slots: &[PeerId], input_delay: usize, fps: usize) -> Result<NetSession, NetError> {
+        NetSession::with_tuning(link, slots, input_delay, fps, MAX_PREDICTION, DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)
     }
 
-    fn with_timeouts(
-        transport: Transport,
+    fn with_tuning(
+        link: Link,
         slots: &[PeerId],
         input_delay: usize,
         fps: usize,
+        max_prediction: usize,
         disconnect_timeout: Duration,
         notify_delay: Duration,
     ) -> Result<NetSession, NetError> {
-        let me = transport.me();
+        let me = link.me();
         let local = slots
             .iter()
             .position(|&p| p == me)
@@ -131,7 +147,7 @@ impl NetSession {
             .with_num_players(slots.len())
             .map_err(io)?
             .with_input_delay(input_delay)
-            .with_max_prediction_window(8)
+            .with_max_prediction_window(max_prediction)
             .with_fps(fps)
             .map_err(io)?
             .with_desync_detection_mode(DesyncDetection::On { interval: 60 })
@@ -141,13 +157,13 @@ impl NetSession {
             let kind = if handle == local { PlayerType::Local } else { PlayerType::Remote(peer) };
             builder = builder.add_player(kind, handle).map_err(io)?;
         }
-        let transport = Rc::new(RefCell::new(transport));
+        let link = Rc::new(RefCell::new(Some(link)));
         let sent = Rc::new(RefCell::new([0u64; 4]));
-        let socket = SharedSocket { transport: transport.clone(), sent: sent.clone() };
+        let socket = SharedSocket { link: link.clone(), sent: sent.clone() };
         let ggrs = builder.start_p2p_session(socket).map_err(io)?;
         Ok(NetSession {
             ggrs,
-            transport,
+            link,
             sent,
             started: Instant::now(),
             slots: slots.to_vec(),
@@ -172,7 +188,7 @@ impl NetSession {
     /// Network I/O; call every loop iteration, also while not advancing.
     pub fn poll(&mut self) {
         self.ggrs.poll_remote_clients();
-        let departed = self.transport.borrow_mut().take_departed();
+        let departed = self.link.borrow_mut().as_mut().map(Link::take_departed).unwrap_or_default();
         for peer in departed {
             if let Some(handle) = self.slots.iter().position(|&p| p == peer) {
                 if handle != self.local {
@@ -260,7 +276,7 @@ impl NetSession {
     }
 
     pub fn stats(&self) -> NetStats {
-        let transport = self.transport.borrow();
+        let link = self.link.borrow();
         let sent = self.sent.borrow();
         let secs = self.started.elapsed().as_secs_f64().max(1.0);
         let peers = self
@@ -269,7 +285,8 @@ impl NetSession {
             .enumerate()
             .filter(|&(slot, _)| slot != self.local)
             .map(|(slot, &peer)| {
-                let mut stats = PeerStats { peer: Some(peer), slot, route: transport.route_kind(peer), ..PeerStats::default() };
+                let route = link.as_ref().and_then(|l| l.route_kind(peer));
+                let mut stats = PeerStats { peer: Some(peer), slot, route, ..PeerStats::default() };
                 let bytes = sent.get(peer.0 as usize).copied().unwrap_or(0);
                 stats.kbps_sent = (bytes as f64 * 8.0 / 1000.0 / secs) as u32;
                 if let Ok(n) = self.ggrs.network_stats(slot) {
@@ -290,7 +307,9 @@ impl NetSession {
 
     /// Says BYE to every peer.
     pub fn leave(self) {
-        self.transport.borrow_mut().close();
+        if let Some(link) = self.link.borrow_mut().take() {
+            link.close();
+        }
     }
 }
 

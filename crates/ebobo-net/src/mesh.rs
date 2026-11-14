@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ use tungstenite::{Message, WebSocket};
 
 use crate::packet::Packet;
 use crate::stun;
-use crate::transport::{PeerId, RelayHandle, RelayOut, Route, RouteKind, Source, Transport};
+use crate::transport::{self, PeerId, RelayHandle, RelayOut, Route, RouteKind, Source, Transport};
 use crate::{normalize_code, random_code, random_token, NetError, DEFAULT_DIRECT_PORT};
 
 #[derive(Clone, Debug)]
@@ -62,10 +62,18 @@ pub(crate) enum MeshEvent {
 
 const PUNCH_EVERY: Duration = Duration::from_millis(50);
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(1);
-/// A direct route silent this long gets punched again...
+/// Lobby (1 Hz keepalives): a direct route silent this long gets punched again...
 const ROUTE_REPUNCH_AFTER: Duration = Duration::from_secs(3);
 /// ...and silent this long moves to the relay (decided by the lower id, sent as `route`).
 const ROUTE_DEAD_AFTER: Duration = Duration::from_secs(5);
+/// In game (GGRS ~60 packets/s): a direct route silent this long is re-punched and every
+/// packet to that peer is mirrored over the relay until the direct address is heard again.
+const GAME_MIRROR_AFTER: Duration = Duration::from_secs(1);
+/// In game: a direct route silent this long moves to the relay (lower id decides, `route`).
+const GAME_RELAY_AFTER: Duration = Duration::from_secs(3);
+/// A decided direct peer that punches from a new address with its token roams there once
+/// its current address has been silent this long (late pairing punches never flap a route).
+const ROAM_AFTER: Duration = Duration::from_secs(1);
 /// WebSocket reconnect: backoff steps (the last repeats) and the give-up time after a drop.
 const WS_BACKOFF_MS: [u64; 4] = [500, 1000, 2000, 4000];
 const WS_REJOIN_WINDOW: Duration = Duration::from_secs(60);
@@ -125,6 +133,8 @@ enum Mode {
         ws_out: Sender<RelayOut>,
     },
     HostDirect,
+    /// Fixed UDP routes, no server, no punching (`Link::udp`).
+    Fixed,
     JoinDirect {
         target: SocketAddr,
         deadline: Instant,
@@ -150,7 +160,14 @@ pub(crate) struct Mesh {
     last_keepalive: Instant,
     /// A `welcome` arrived (later ones are rejoins after a WebSocket drop).
     welcomed: bool,
+    /// Handed to the game (`Link`): game health thresholds and relay mirroring.
+    in_game: bool,
 }
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Link>();
+};
 
 impl Mesh {
     /// Binds the UDP socket, runs STUN, connects the WebSocket (room modes). Blocking, at
@@ -160,33 +177,17 @@ impl Mesh {
             MeshRole::HostDirect { port } => port,
             _ => 0,
         };
-        let udp = UdpSocket::bind(("0.0.0.0", bind_port)).map_err(|e| NetError::Io(e.to_string()))?;
+        let udp = transport::bind_udp(bind_port).map_err(|e| NetError::Io(e.to_string()))?;
         let now = Instant::now();
-        let base = |transport: Transport, mode: Mode, me: PeerId| Mesh {
-            transport,
-            mode,
-            me,
-            code: None,
-            token: 0,
-            my_cands: Vec::new(),
-            symmetric: false,
-            force_relay: cfg.force_relay,
-            peers: HashMap::new(),
-            routes: HashMap::new(),
-            events: Vec::new(),
-            ready_pending: true,
-            failed: false,
-            last_keepalive: now,
-            welcomed: false,
-        };
+        let base = |transport: Transport, mode: Mode, me: PeerId| Mesh::base(transport, mode, me, cfg.force_relay, now);
         match &cfg.role {
             MeshRole::HostDirect { .. } => {
-                let transport = Transport::new(udp, PeerId(0), None);
+                let transport = Transport::new(udp, None);
                 Ok(base(transport, Mode::HostDirect, PeerId(0)))
             }
             MeshRole::JoinDirect { addr } => {
                 let target = resolve_direct(addr)?;
-                let transport = Transport::new(udp, PeerId(1), None);
+                let transport = Transport::new(udp, None);
                 let mode = Mode::JoinDirect { target, deadline: now + DIRECT_TIMEOUT, last_punch: None };
                 Ok(base(transport, mode, PeerId(1)))
             }
@@ -194,8 +195,10 @@ impl Mesh {
                 let port = udp.local_addr().map_err(|e| NetError::Io(e.to_string()))?.port();
                 let stun = stun::query(&udp, stun::STUN_SERVERS, STUN_TIMEOUT);
                 let mut my_cands: Vec<SocketAddr> = Vec::new();
-                for ip in stun::local_ipv4() {
-                    let a = SocketAddr::new(ip.into(), port);
+                let v6_ips: Vec<IpAddr> =
+                    if transport::is_v6(&udp) { stun::local_ipv6().into_iter().map(IpAddr::from).collect() } else { Vec::new() };
+                for ip in stun::local_ipv4().into_iter().map(IpAddr::from).chain(v6_ips) {
+                    let a = SocketAddr::new(ip, port);
                     if !my_cands.contains(&a) {
                         my_cands.push(a);
                     }
@@ -215,7 +218,7 @@ impl Mesh {
                     .spawn(move || ws_thread(ws, url, out_rx, text_tx, in_tx, close_tx))
                     .map_err(|e| NetError::Io(e.to_string()))?;
                 let relay = RelayHandle { out: out_tx.clone(), inbound: in_rx };
-                let transport = Transport::new(udp, PeerId(0), Some(relay));
+                let transport = Transport::new(udp, Some(relay));
                 let mode = Mode::Room { text_rx, close_rx, ws_out: out_tx };
                 let mut mesh = base(transport, mode, PeerId(0));
                 mesh.code = Some(code);
@@ -225,6 +228,27 @@ impl Mesh {
                 mesh.ready_pending = false;
                 Ok(mesh)
             }
+        }
+    }
+
+    fn base(transport: Transport, mode: Mode, me: PeerId, force_relay: bool, now: Instant) -> Mesh {
+        Mesh {
+            transport,
+            mode,
+            me,
+            code: None,
+            token: 0,
+            my_cands: Vec::new(),
+            symmetric: false,
+            force_relay,
+            peers: HashMap::new(),
+            routes: HashMap::new(),
+            events: Vec::new(),
+            ready_pending: true,
+            failed: false,
+            last_keepalive: now,
+            welcomed: false,
+            in_game: false,
         }
     }
 
@@ -239,7 +263,7 @@ impl Mesh {
         self.poll_packets();
         match &mut self.mode {
             Mode::Room { .. } => self.drive_pairs(now),
-            Mode::HostDirect => {}
+            Mode::HostDirect | Mode::Fixed => {}
             Mode::JoinDirect { target, deadline, last_punch } => {
                 if !self.routes.contains_key(&PeerId(0)) && !self.failed {
                     if now >= *deadline {
@@ -266,9 +290,20 @@ impl Mesh {
         std::mem::take(&mut self.events)
     }
 
-    /// Sends a packet to a peer with a decided route.
+    /// Sends a packet to a peer with a decided route; in game also over the relay while the
+    /// peer's direct route is silent (`GAME_MIRROR_AFTER`).
     pub(crate) fn send(&mut self, to: PeerId, packet: &[u8]) {
         self.transport.send(to, packet);
+        if self.mirroring(to) {
+            self.transport.send_relay(to, packet);
+        }
+    }
+
+    /// In game, the peer's direct route has been silent ≥ `GAME_MIRROR_AFTER`.
+    fn mirroring(&self, peer: PeerId) -> bool {
+        self.in_game
+            && matches!(self.routes.get(&peer), Some(Route::Udp(_)))
+            && self.peers.get(&peer).and_then(|st| st.last_rx).is_some_and(|t| t.elapsed() >= GAME_MIRROR_AFTER)
     }
 
     pub(crate) fn me(&self) -> PeerId {
@@ -280,9 +315,10 @@ impl Mesh {
         self.transport.send_text(json!({"t": "lock"}).to_string());
     }
 
-    /// Hands routes (and the live relay WebSocket) to the game.
-    pub(crate) fn into_transport(self) -> Transport {
-        self.transport
+    /// Hands the live mesh (routes, relay WebSocket, route health) to the game.
+    pub(crate) fn into_link(mut self) -> Link {
+        self.in_game = true;
+        Link { mesh: self, departed: Vec::new() }
     }
 
     /// Leaves: BYE to peers, closes the WebSocket.
@@ -352,7 +388,6 @@ impl Mesh {
                 }
                 self.welcomed = true;
                 self.me = me;
-                self.transport.set_me(me);
                 self.events.push(MeshEvent::Ready { me, code: self.code.clone() });
                 for (id, name, away) in listed {
                     self.peer_joined(id, name);
@@ -386,7 +421,7 @@ impl Mesh {
                 let cands: Vec<SocketAddr> = v
                     .get("cands")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|c| c.as_str()?.parse().ok()).collect())
+                    .map(|a| a.iter().filter_map(|c| c.as_str()?.parse().ok().map(transport::unmap)).collect())
                     .unwrap_or_default();
                 let relay_only = v.get("relay_only").and_then(Value::as_bool).unwrap_or(false);
                 let now = Instant::now();
@@ -413,7 +448,7 @@ impl Mesh {
                 }
                 let route = match v.get("mode").and_then(Value::as_str) {
                     Some("direct") => {
-                        let given = v.get("addr").and_then(Value::as_str).and_then(|s| s.parse().ok());
+                        let given = v.get("addr").and_then(Value::as_str).and_then(|s| s.parse().ok()).map(transport::unmap);
                         match st.seen_from.or(st.confirmed).or(given) {
                             Some(a) => Route::Udp(a),
                             None => return,
@@ -430,10 +465,14 @@ impl Mesh {
 
     fn peer_left(&mut self, id: PeerId) {
         self.peers.remove(&id);
+        self.forget_route(id);
+        self.events.push(MeshEvent::PeerLeft { id });
+    }
+
+    fn forget_route(&mut self, id: PeerId) {
         if self.routes.remove(&id).is_some() {
             self.transport.remove_route(id);
         }
-        self.events.push(MeshEvent::PeerLeft { id });
     }
 
     fn switch_to_relay(&mut self, peer: PeerId) {
@@ -488,6 +527,8 @@ impl Mesh {
     fn drive_pairs(&mut self, now: Instant) {
         let me = self.me;
         let relay_after = if self.symmetric { RELAY_AFTER_SYMMETRIC } else { RELAY_AFTER };
+        let (repunch_after, dead_after) =
+            if self.in_game { (GAME_MIRROR_AFTER, GAME_RELAY_AFTER) } else { (ROUTE_REPUNCH_AFTER, ROUTE_DEAD_AFTER) };
         let mut decisions: Vec<(PeerId, Route)> = Vec::new();
         let mut dead: Vec<PeerId> = Vec::new();
         let ids: Vec<PeerId> = self.peers.keys().copied().collect();
@@ -497,9 +538,9 @@ impl Mesh {
                 // Route health: a silent direct route is punched again, then given up.
                 let Some(&Route::Udp(addr)) = self.routes.get(&peer) else { continue };
                 let silent = st.last_rx.map_or(Duration::ZERO, |t| now - t);
-                if silent >= ROUTE_DEAD_AFTER && me < peer {
+                if silent >= dead_after && me < peer {
                     dead.push(peer);
-                } else if silent >= ROUTE_REPUNCH_AFTER && st.last_punch.is_none_or(|t| now - t >= PUNCH_EVERY) {
+                } else if silent >= repunch_after && st.last_punch.is_none_or(|t| now - t >= PUNCH_EVERY) {
                     st.last_punch = Some(now);
                     let punch = Packet::Punch { token: self.token, from: me.0, to: peer.0 }.to_vec();
                     self.transport.send_udp(addr, &punch);
@@ -580,12 +621,23 @@ impl Mesh {
     fn routed_source(&self, src: Source) -> Option<PeerId> {
         match src {
             Source::Relay(p) => self.routes.contains_key(&p).then_some(p),
-            Source::Udp(addr) => self
-                .routes
-                .iter()
-                .find(|(_, r)| **r == Route::Udp(addr))
-                .map(|(&p, _)| p),
+            Source::Udp(addr) => self.transport.peer_at(addr),
         }
+    }
+
+    /// A decided direct peer punching (or acking) with its token from a new address moved
+    /// (NAT rebinding, Wi-Fi → LTE): its route follows once the old address is silent
+    /// (`ROAM_AFTER`). A relay-routed pair stays on the relay.
+    fn roam(&mut self, peer: PeerId, addr: SocketAddr) {
+        let Some(&Route::Udp(old)) = self.routes.get(&peer) else { return };
+        let Some(st) = self.peers.get_mut(&peer) else { return };
+        if old == addr || !st.decided || st.last_rx.is_some_and(|t| t.elapsed() < ROAM_AFTER) {
+            return;
+        }
+        st.last_rx = Some(Instant::now());
+        self.transport.set_route(peer, Route::Udp(addr));
+        self.routes.insert(peer, Route::Udp(addr));
+        self.events.push(MeshEvent::RouteChanged { id: peer, kind: RouteKind::Direct });
     }
 
     fn on_punch(&mut self, src: Source, token: u64, from: PeerId, to: PeerId) {
@@ -607,13 +659,14 @@ impl Mesh {
                     self.events.push(MeshEvent::RouteUp { id: from, kind: RouteKind::Direct });
                 }
             }
-            Mode::JoinDirect { .. } => {}
+            Mode::JoinDirect { .. } | Mode::Fixed => {}
             Mode::Room { .. } => {
                 let Some(st) = self.peers.get_mut(&from) else { return };
                 if st.token != Some(token) {
                     return;
                 }
                 st.seen_from.get_or_insert(addr);
+                self.roam(from, addr);
                 let ack = Packet::PunchAck { token: self.token, from: self.me.0, to: from.0 }.to_vec();
                 self.transport.send_udp(addr, &ack);
             }
@@ -626,7 +679,7 @@ impl Mesh {
             return;
         }
         match self.mode {
-            Mode::HostDirect => {}
+            Mode::HostDirect | Mode::Fixed => {}
             Mode::JoinDirect { .. } => {
                 if from != PeerId(0) || token != 0 || self.routes.contains_key(&from) {
                     return;
@@ -642,15 +695,96 @@ impl Mesh {
                     return;
                 }
                 st.confirmed.get_or_insert(addr);
+                self.roam(from, addr);
             }
         }
     }
 }
 
-/// `host[:port]` → socket address, default port 7777, IPv4 preferred.
+/// The mesh as the game sees it (`GameStart::link`): `NetSession` drives it on every poll, so
+/// signaling (`route`), route health, re-punching, relay mirroring and roaming keep running in
+/// game; only GGRS and BYE packets reach GGRS. `Send`, so the lobby thread can hand it over.
+pub struct Link {
+    mesh: Mesh,
+    departed: Vec<PeerId>,
+}
+
+impl Link {
+    /// Server-less link on fixed UDP routes (no relay, no punching): direct-IP tests and tools.
+    pub fn udp(udp: std::net::UdpSocket, me: PeerId, peers: &[(PeerId, SocketAddr)]) -> Link {
+        let mut mesh = Mesh::base(Transport::udp(udp, peers), Mode::Fixed, me, false, Instant::now());
+        mesh.ready_pending = false;
+        for &(p, a) in peers {
+            mesh.routes.insert(p, Route::Udp(transport::unmap(a)));
+        }
+        mesh.into_link()
+    }
+
+    pub fn me(&self) -> PeerId {
+        self.mesh.me()
+    }
+
+    pub fn route_kind(&self, peer: PeerId) -> Option<RouteKind> {
+        self.mesh.transport.route_kind(peer)
+    }
+
+    /// Peers that sent BYE since the last call.
+    pub fn take_departed(&mut self) -> Vec<PeerId> {
+        std::mem::take(&mut self.departed)
+    }
+
+    /// BYE to every routed peer, closes the relay WebSocket.
+    pub fn close(self) {
+        self.mesh.close();
+    }
+}
+
+impl ggrs::NonBlockingSocket<PeerId> for Link {
+    /// GGRS packet = `Packet::Ggrs(bincode 1.3 of msg)`.
+    fn send_to(&mut self, msg: &ggrs::Message, addr: &PeerId) {
+        let Ok(body) = bincode::serialize(msg) else { return };
+        let pkt = Packet::Ggrs(&body).to_vec();
+        if pkt.len() <= crate::packet::MAX_PACKET {
+            self.mesh.send(*addr, &pkt);
+        }
+    }
+
+    /// Polls the mesh (signaling, punches, keepalives, health), decodes GGRS packets, records
+    /// BYE senders for `take_departed`, ignores the rest (late CTRL etc.).
+    fn receive_all_messages(&mut self) -> Vec<(PeerId, ggrs::Message)> {
+        let mut out = Vec::new();
+        for ev in self.mesh.poll() {
+            let MeshEvent::Packet { from, data } = ev else { continue };
+            match Packet::parse(&data) {
+                Some(Packet::Ggrs(body)) => {
+                    if let Ok(m) = bincode::deserialize::<ggrs::Message>(body) {
+                        out.push((from, m));
+                    }
+                }
+                Some(Packet::Bye) => {
+                    if !self.departed.contains(&from) {
+                        self.departed.push(from);
+                    }
+                    self.mesh.forget_route(from);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// `host[:port]`, `[v6]:port` or a bare IPv6 literal → socket address, default port 7777,
+/// IPv4 preferred for hostnames.
 fn resolve_direct(addr: &str) -> Result<SocketAddr, NetError> {
     let addr = addr.trim();
-    let with_port = if addr.parse::<SocketAddr>().is_ok() || addr.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+    if let Ok(a) = addr.parse::<SocketAddr>() {
+        return Ok(transport::unmap(a));
+    }
+    if let Ok(ip) = addr.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        return Ok(transport::unmap(SocketAddr::new(ip, DEFAULT_DIRECT_PORT)));
+    }
+    let with_port = if addr.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
         addr.to_string()
     } else {
         format!("{addr}:{DEFAULT_DIRECT_PORT}")
@@ -976,6 +1110,7 @@ fn ws_connect_once(url: &str) -> Result<Ws, tungstenite::Error> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::net::UdpSocket;
 
     const SERVER: &str = "https://ebobo-signal.mc-se.workers.dev";
 
@@ -1070,6 +1205,40 @@ mod tests {
         let [a, b] = nodes;
         a.mesh.close();
         b.mesh.close();
+    }
+
+    #[test]
+    fn mesh_direct_mode_localhost_v6() {
+        let Ok(probe) = UdpSocket::bind("[::1]:0") else {
+            eprintln!("IPv6 loopback unavailable; skipped");
+            return;
+        };
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let host = Mesh::open(cfg(MeshRole::HostDirect { port }, false)).unwrap();
+        let guest = Mesh::open(cfg(MeshRole::JoinDirect { addr: format!("[::1]:{port}") }, false)).unwrap();
+        let mut nodes = [Node::new(host), Node::new(guest)];
+        pump_until(&mut nodes, 5, "direct routes", |ns| {
+            ns[0].routes.get(&PeerId(1)) == Some(&RouteKind::Direct)
+                && ns[1].routes.get(&PeerId(0)) == Some(&RouteKind::Direct)
+        });
+        exchange(&mut nodes);
+        let [a, b] = nodes;
+        a.mesh.close();
+        b.mesh.close();
+    }
+
+    #[test]
+    fn mesh_resolve_direct_forms() {
+        let r = |s: &str| resolve_direct(s).unwrap();
+        assert_eq!(r("192.0.2.1"), "192.0.2.1:7777".parse().unwrap());
+        assert_eq!(r("192.0.2.1:9000"), "192.0.2.1:9000".parse().unwrap());
+        assert_eq!(r("[2001:db8::1]:9000"), "[2001:db8::1]:9000".parse().unwrap());
+        assert_eq!(r("2001:db8::1"), "[2001:db8::1]:7777".parse().unwrap());
+        assert_eq!(r("[2001:db8::1]"), "[2001:db8::1]:7777".parse().unwrap());
+        assert_eq!(r("::1"), "[::1]:7777".parse().unwrap());
+        assert_eq!(r("[::ffff:192.0.2.1]:5"), "192.0.2.1:5".parse().unwrap());
+        assert!(r("localhost:5").port() == 5);
     }
 
     /// Opens a room mesh with an extra loopback candidate: this Mac's application firewall
@@ -1188,10 +1357,18 @@ mod tests {
     fn mesh_live_dead_direct_route_falls_back_to_relay() {
         let mut nodes = live_room(1, false);
         assert!(nodes.iter().all(|n| n.routes.values().all(|k| *k == RouteKind::Direct)));
-        let peer = nodes[1].me.unwrap();
+        // Kill the direct path both ways and forget the candidates, so re-punching cannot heal
+        // it by roaming back to a live address (that path has its own unit test).
+        let ids: Vec<PeerId> = nodes.iter().map(|n| n.me.unwrap()).collect();
         let dead = Route::Udp(SocketAddr::from(([127, 0, 0, 1], 9)));
-        nodes[0].mesh.transport.set_route(peer, dead);
-        nodes[0].mesh.routes.insert(peer, dead);
+        for (i, n) in nodes.iter_mut().enumerate() {
+            let peer = ids[1 - i];
+            n.mesh.transport.set_route(peer, dead);
+            n.mesh.routes.insert(peer, dead);
+            if let Some(st) = n.mesh.peers.get_mut(&peer) {
+                st.cands.clear();
+            }
+        }
         let started = Instant::now();
         pump_until(&mut nodes, 15, "relay fallback", |ns| {
             ns.iter().all(|n| n.routes.values().all(|k| *k == RouteKind::Relay))
@@ -1200,5 +1377,238 @@ mod tests {
         assert!(took >= Duration::from_secs(4), "switched too early: {took:?}");
         exchange_until(&mut nodes, 10);
         nodes.into_iter().for_each(|n| n.mesh.close());
+    }
+
+    // ---- in-game link ----
+
+    fn ggrs_msg() -> ggrs::Message {
+        // Message { header: { magic: 0x1234 }, body: SyncRequest { random_request: 42 } }
+        let mut raw = 0x1234u16.to_le_bytes().to_vec();
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&42u32.to_le_bytes());
+        bincode::deserialize(&raw).unwrap()
+    }
+
+    fn local_sock() -> UdpSocket {
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        s
+    }
+
+    fn udp_pair() -> (Link, Link) {
+        let (a, b) = (local_sock(), local_sock());
+        let (aa, ba) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+        (Link::udp(a, PeerId(0), &[(PeerId(1), ba)]), Link::udp(b, PeerId(1), &[(PeerId(0), aa)]))
+    }
+
+    fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            if let Some(v) = f() {
+                return Some(v);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    #[test]
+    fn link_ggrs_message_round_trip() {
+        use ggrs::NonBlockingSocket;
+        let (mut a, mut b) = udp_pair();
+        a.send_to(&ggrs_msg(), &PeerId(1));
+        let got = wait_for(|| b.receive_all_messages().pop()).unwrap();
+        assert_eq!(got, (PeerId(0), ggrs_msg()));
+    }
+
+    #[test]
+    fn link_ggrs_framing_and_bye() {
+        use ggrs::NonBlockingSocket;
+        let (mut a, mut b) = udp_pair();
+        // A GGRS-framed packet with an undecodable body is ignored; BYE marks departure.
+        a.mesh.send(PeerId(1), &Packet::Ggrs(&[0xFF; 3]).to_vec());
+        a.close();
+        let mut departed = Vec::new();
+        wait_for(|| {
+            assert!(b.receive_all_messages().is_empty());
+            departed.extend(b.take_departed());
+            (!departed.is_empty()).then_some(())
+        })
+        .unwrap();
+        assert_eq!(departed, vec![PeerId(0)]);
+        assert_eq!(b.route_kind(PeerId(0)), None);
+    }
+
+    /// An in-game room link without a server: a fake relay whose `RelayOut`s the test reads,
+    /// injectable signaling text, and one peer decided direct at `peer_addr`.
+    struct FakeRoom {
+        link: Link,
+        addr: SocketAddr,
+        out: Receiver<RelayOut>,
+        text: Sender<String>,
+        _close: Sender<(u16, String)>,
+        _inbound: Sender<(PeerId, Vec<u8>)>,
+    }
+
+    fn fake_room(me: PeerId, peer: PeerId, peer_addr: SocketAddr, peer_token: u64) -> FakeRoom {
+        let udp = local_sock();
+        let addr = udp.local_addr().unwrap();
+        let (out_tx, out) = mpsc::channel();
+        let (inbound, in_rx) = mpsc::channel();
+        let (text, text_rx) = mpsc::channel();
+        let (close, close_rx) = mpsc::channel();
+        let relay = RelayHandle { out: out_tx.clone(), inbound: in_rx };
+        let mode = Mode::Room { text_rx, close_rx, ws_out: out_tx };
+        let mut mesh = Mesh::base(Transport::new(udp, Some(relay)), mode, me, false, Instant::now());
+        mesh.ready_pending = false;
+        mesh.welcomed = true;
+        mesh.token = 0xA11CE;
+        let mut st = PeerState::new();
+        st.token = Some(peer_token);
+        st.sent_cands = true;
+        st.cands = vec![peer_addr];
+        mesh.peers.insert(peer, st);
+        mesh.adopt_route(peer, Route::Udp(peer_addr));
+        FakeRoom { link: mesh.into_link(), addr, out, text, _close: close, _inbound: inbound }
+    }
+
+    impl FakeRoom {
+        /// Pretends the peer has been silent for `ms`.
+        fn silent_for(&mut self, peer: PeerId, ms: u64) {
+            self.link.mesh.peers.get_mut(&peer).unwrap().last_rx = Some(Instant::now() - Duration::from_millis(ms));
+        }
+
+        fn poll(&mut self) {
+            use ggrs::NonBlockingSocket;
+            let _ = self.link.receive_all_messages();
+        }
+
+        /// Drains the fake relay: (binary destinations, text frames).
+        fn drain(&self) -> (Vec<PeerId>, Vec<String>) {
+            let (mut bins, mut texts) = (Vec::new(), Vec::new());
+            while let Ok(o) = self.out.try_recv() {
+                match o {
+                    RelayOut::Binary { to, .. } => bins.push(to),
+                    RelayOut::Text(t) => texts.push(t),
+                    _ => {}
+                }
+            }
+            (bins, texts)
+        }
+    }
+
+    #[test]
+    fn link_silent_direct_route_mirrors_then_moves_to_relay() {
+        let b = local_sock();
+        let mut a = fake_room(PeerId(0), PeerId(1), b.local_addr().unwrap(), 0xB0B);
+        let pkt = Packet::Ggrs(b"x").to_vec();
+        a.poll();
+        a.link.mesh.send(PeerId(1), &pkt);
+        assert_eq!(a.drain().0, vec![], "healthy route: no mirroring");
+
+        // Silent ≥ 1 s: re-punch the route and mirror every packet over the relay.
+        a.silent_for(PeerId(1), 1100);
+        a.poll();
+        a.link.mesh.send(PeerId(1), &pkt);
+        assert_eq!(a.drain().0, vec![PeerId(1)]);
+        let mut buf = [0u8; 64];
+        let punched = wait_for(|| {
+            let n = b.recv(&mut buf).ok()?;
+            matches!(Packet::parse(&buf[..n]), Some(Packet::Punch { token: 0xA11CE, from: 0, to: 1 })).then_some(())
+        });
+        assert!(punched.is_some(), "silent route re-punched");
+
+        // Traffic back on the direct address stops mirroring.
+        b.send_to(&Packet::Keepalive.to_vec(), a.addr).unwrap();
+        wait_for(|| {
+            a.poll();
+            a.link.mesh.peers[&PeerId(1)].last_rx.filter(|t| t.elapsed() < GAME_MIRROR_AFTER)
+        })
+        .expect("keepalive heard");
+        a.drain();
+        a.link.mesh.send(PeerId(1), &pkt);
+        assert_eq!(a.drain().0, vec![]);
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Direct));
+
+        // Silent ≥ 3 s: the lower id moves the pair to the relay with `route`.
+        a.silent_for(PeerId(1), 3100);
+        a.poll();
+        let (_, texts) = a.drain();
+        let route: Vec<Value> = texts.iter().filter_map(|t| serde_json::from_str(t).ok()).collect();
+        assert!(route.iter().any(|v| v["t"] == "route" && v["to"] == 1 && v["mode"] == "relay"), "{texts:?}");
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Relay));
+        a.link.mesh.send(PeerId(1), &pkt);
+        assert_eq!(a.drain().0, vec![PeerId(1)]);
+    }
+
+    #[test]
+    fn link_higher_id_mirrors_but_waits_for_route() {
+        let b = local_sock();
+        let mut a = fake_room(PeerId(2), PeerId(1), b.local_addr().unwrap(), 0xB0B);
+        a.silent_for(PeerId(1), 3100);
+        a.poll();
+        a.link.mesh.send(PeerId(1), &Packet::Keepalive.to_vec());
+        let (bins, texts) = a.drain();
+        assert_eq!(bins, vec![PeerId(1)]);
+        assert!(texts.is_empty(), "only the lower id decides: {texts:?}");
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Direct));
+        a.text.send(json!({"t": "route", "from": 1, "mode": "relay"}).to_string()).unwrap();
+        a.poll();
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Relay));
+    }
+
+    #[test]
+    fn link_roams_to_new_address_on_punch_with_token() {
+        use ggrs::NonBlockingSocket;
+        let b_old = local_sock();
+        let mut a = fake_room(PeerId(0), PeerId(1), b_old.local_addr().unwrap(), 0xB0B);
+        let b_new = local_sock();
+        let b_new_addr = b_new.local_addr().unwrap();
+        a.silent_for(PeerId(1), 1100);
+
+        // A wrong token never moves the route.
+        let stranger = local_sock();
+        stranger.send_to(&Packet::Punch { token: 0xBAD, from: 1, to: 0 }.to_vec(), a.addr).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        a.poll();
+        assert_eq!(a.link.mesh.routes[&PeerId(1)], Route::Udp(b_old.local_addr().unwrap()));
+
+        // B's PUNCH with its token from the new socket moves the route and is answered.
+        b_new.send_to(&Packet::Punch { token: 0xB0B, from: 1, to: 0 }.to_vec(), a.addr).unwrap();
+        wait_for(|| {
+            a.poll();
+            (a.link.mesh.routes[&PeerId(1)] == Route::Udp(b_new_addr)).then_some(())
+        })
+        .expect("roamed");
+        assert_eq!(a.link.mesh.transport.peer_at(b_new_addr), Some(PeerId(1)));
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Direct));
+        let mut buf = [0u8; 1500];
+        let n = b_new.recv(&mut buf).unwrap();
+        assert!(matches!(Packet::parse(&buf[..n]), Some(Packet::PunchAck { token: 0xA11CE, from: 0, to: 1 })));
+
+        // GGRS flows both ways on the new address.
+        a.link.send_to(&ggrs_msg(), &PeerId(1));
+        let got = wait_for(|| {
+            let n = b_new.recv(&mut buf).ok()?;
+            matches!(Packet::parse(&buf[..n]), Some(Packet::Ggrs(_))).then_some(())
+        });
+        assert!(got.is_some(), "ggrs packet reached the new address");
+        let body = bincode::serialize(&ggrs_msg()).unwrap();
+        b_new.send_to(&Packet::Ggrs(&body).to_vec(), a.addr).unwrap();
+        let got = wait_for(|| a.link.receive_all_messages().pop()).unwrap();
+        assert_eq!(got, (PeerId(1), ggrs_msg()));
+    }
+
+    #[test]
+    fn link_relay_pair_does_not_roam() {
+        let b_old = local_sock();
+        let mut a = fake_room(PeerId(0), PeerId(1), b_old.local_addr().unwrap(), 0xB0B);
+        a.link.mesh.switch_to_relay(PeerId(1));
+        a.silent_for(PeerId(1), 5000);
+        let b_new = local_sock();
+        b_new.send_to(&Packet::Punch { token: 0xB0B, from: 1, to: 0 }.to_vec(), a.addr).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        a.poll();
+        assert_eq!(a.link.route_kind(PeerId(1)), Some(RouteKind::Relay));
     }
 }

@@ -23,7 +23,8 @@ use std::fmt;
 pub use diag::{NatKind, NetDiag, diagnose};
 pub use lobby::{GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, PlayerInfo, RomState, Stage};
 pub use session::{FrameOutcome, NetEvent, NetSession, NetStats, PeerStats};
-pub use transport::{PeerId, RouteKind, Transport};
+pub use mesh::Link;
+pub use transport::{PeerId, RouteKind};
 
 /// Lobby `proto` value; peers with a different one refuse to play together.
 pub const PROTOCOL_VERSION: u32 = 1;

@@ -11,14 +11,18 @@ use std::time::{Duration, Instant};
 use ebobo_core::{cart, Region};
 use serde_json::{json, Value};
 
-use crate::mesh::{Mesh, MeshConfig, MeshEvent, MeshRole};
+use crate::mesh::{Link, Mesh, MeshConfig, MeshEvent, MeshRole};
 use crate::packet::{Packet, ROM_CHUNK_DATA};
-use crate::transport::{PeerId, RouteKind, Transport};
+use crate::transport::{PeerId, RouteKind};
 use crate::{NetError, MAX_PLAYERS, PROTOCOL_VERSION};
 
 const TICK: Duration = Duration::from_millis(4);
 const CTRL_RETRY: Duration = Duration::from_millis(200);
-const PING_EVERY: Duration = Duration::from_secs(1);
+/// Lobby keepalive and RTT probe: 4 pings a second (~25 B each) give the auto input delay
+/// steady RTT samples.
+const PING_EVERY: Duration = Duration::from_millis(250);
+/// RTT samples a peer needs before the auto input delay trusts `srtt + 2 * rttvar`.
+const WARM_SAMPLES: u32 = 8;
 const ROM_WINDOW: u32 = 32;
 const ROM_RETRY: Duration = Duration::from_millis(300);
 const START_ACK_WAIT: Duration = Duration::from_secs(3);
@@ -98,7 +102,8 @@ pub struct LobbyStatus {
 
 /// Everything the game loop needs once the host pressed start.
 pub struct GameStart {
-    pub transport: Transport,
+    /// The live mesh: routes, relay, in-game route health and roaming.
+    pub link: Link,
     pub me: PeerId,
     /// `slots[i]` = peer id on NES controller i+1.
     pub slots: Vec<PeerId>,
@@ -222,7 +227,45 @@ struct Ctrl {
     next_seq: u32,
     unacked: BTreeMap<u32, Pending>,
     seen: HashSet<u32>,
+    /// Smoothed control-message RTT in ms (RFC 6298 SRTT).
     rtt: Option<f64>,
+    /// RTT variation in ms (RFC 6298 RTTVAR), feeds the auto input delay.
+    rttvar: f64,
+    /// RTT samples taken (first transmissions only, Karn's rule).
+    samples: u32,
+}
+
+impl Ctrl {
+    /// RFC 6298 section 2 update (alpha = 1/8, beta = 1/4) with one RTT sample in ms.
+    fn add_sample(&mut self, sample: f64) {
+        match self.rtt {
+            Some(srtt) => {
+                self.rttvar = 0.75 * self.rttvar + 0.25 * (srtt - sample).abs();
+                self.rtt = Some(0.875 * srtt + 0.125 * sample);
+            }
+            None => {
+                self.rttvar = sample / 2.0;
+                self.rtt = Some(sample);
+            }
+        }
+        self.samples += 1;
+    }
+
+    /// RTT (ms) the auto input delay plans for: `srtt + 2 * rttvar` once `WARM_SAMPLES`
+    /// samples are in. Before that RFC 6298's cold-start `rttvar = R / 2` would add a whole
+    /// RTT, so it uses `srtt * 1.25` instead.
+    fn delay_rtt(&self) -> Option<f64> {
+        let srtt = self.rtt?;
+        Some(if self.samples >= WARM_SAMPLES { srtt + 2.0 * self.rttvar } else { srtt * 1.25 })
+    }
+
+    /// Retransmit timeout: RFC 6298 `srtt + 4 * rttvar`, at least `CTRL_RETRY`, at most 1 s, so
+    /// slow links are not retransmitted before their ack can arrive (which Karn's rule would
+    /// discard as a sample).
+    fn rto(&self) -> Duration {
+        let ms = self.rtt.map_or(0.0, |r| r + 4.0 * self.rttvar);
+        Duration::from_secs_f64(ms / 1000.0).clamp(CTRL_RETRY, Duration::from_secs(1))
+    }
 }
 
 struct Xfer {
@@ -251,7 +294,7 @@ impl Peer {
         Peer {
             name: String::new(),
             route: None,
-            ctrl: Ctrl { next_seq: 1, unacked: BTreeMap::new(), seen: HashSet::new(), rtt: None },
+            ctrl: Ctrl { next_seq: 1, unacked: BTreeMap::new(), seen: HashSet::new(), rtt: None, rttvar: 0.0, samples: 0 },
             rom: RomState::Unknown,
             ready: false,
             links: Vec::new(),
@@ -298,6 +341,14 @@ struct Worker {
     my_rom: RomState,
     sent_links: Option<Vec<u8>>,
     host_list: Option<Vec<ListEntry>>,
+}
+
+/// Auto GGRS input delay from the worst peer's `Ctrl::delay_rtt` (ms): one-way latency plus
+/// jitter in frames, 1..=6. `session_profile_matrix` shows mean rollback falls below one frame
+/// once delay ≈ one-way frames (mobile 60±30 ms: delay 4 → 0.8, 5 → 0.35); far links
+/// (150 ms) still want more, but past 6 frames (100 ms) the input lag itself hurts.
+fn auto_input_delay(worst_rtt_ms: f64, frame_ms: f64) -> usize {
+    ((worst_rtt_ms / 2.0 / frame_ms).ceil() as usize).clamp(1, 6)
 }
 
 fn run(cfg: LobbyConfig, shared: Arc<Mutex<LobbyStatus>>, cmds: Receiver<Cmd>, game_tx: Sender<GameStart>) {
@@ -552,12 +603,9 @@ impl Worker {
             Some(Packet::CtrlAck { seq }) => {
                 let Some(p) = self.peers.get_mut(&from) else { return };
                 if let Some(pend) = p.ctrl.unacked.remove(&seq) {
+                    // Karn's rule: an ack of a retransmitted message is ambiguous.
                     if !pend.resent {
-                        let sample = pend.first.elapsed().as_secs_f64() * 1000.0;
-                        p.ctrl.rtt = Some(match p.ctrl.rtt {
-                            Some(r) => r * 0.8 + sample * 0.2,
-                            None => sample,
-                        });
+                        p.ctrl.add_sample(pend.first.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
             }
@@ -789,8 +837,9 @@ impl Worker {
         // Reliable CTRL retransmits.
         if let Some(mesh) = self.mesh.as_mut() {
             for (id, p) in &mut self.peers {
+                let rto = p.ctrl.rto();
                 for pend in p.ctrl.unacked.values_mut() {
-                    if now.duration_since(pend.last) >= CTRL_RETRY {
+                    if now.duration_since(pend.last) >= rto {
                         mesh.send(*id, &pend.packet);
                         pend.last = now;
                         pend.resent = true;
@@ -898,10 +947,10 @@ impl Worker {
         let (Some(me), Some(hr)) = (self.me, self.host_rom.as_ref()) else { return };
         let frame_ms = if hr.region == Region::Pal { 20.0 } else { 16.64 };
         let header_four = hr.four_score;
-        let max_rtt = self.peers.values().filter_map(|p| p.ctrl.rtt).fold(0.0, f64::max);
+        let worst = self.peers.values().filter_map(|p| p.ctrl.delay_rtt()).fold(0.0, f64::max);
         let delay = match self.input_delay {
             Some(d) => d as usize,
-            None => ((max_rtt / 2.0 / frame_ms).ceil() as usize).clamp(1, 4),
+            None => auto_input_delay(worst, frame_ms),
         };
         let mut slots = vec![me];
         slots.extend(self.peers.keys().copied());
@@ -955,7 +1004,7 @@ impl Worker {
         let (Some(me), Some(mesh)) = (self.me, self.mesh.take()) else { return };
         let names = slots.iter().map(|id| self.name_of(*id)).collect();
         let game = GameStart {
-            transport: mesh.into_transport(),
+            link: mesh.into_link(),
             me,
             slots,
             names,

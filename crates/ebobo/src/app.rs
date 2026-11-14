@@ -770,7 +770,7 @@ impl App {
         nes.set_four_score(start.four_score);
         nes.set_sprite_limit(self.config.sprite_limit.applies(start.four_score));
         let fps = if start.region == Region::Pal { 50 } else { 60 };
-        let session = match NetSession::new(start.transport, &start.slots, start.input_delay, fps) {
+        let session = match NetSession::new(start.link, &start.slots, start.input_delay, fps) {
             Ok(session) => session,
             Err(err) => {
                 self.ui.show_main();

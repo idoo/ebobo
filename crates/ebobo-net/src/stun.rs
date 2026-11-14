@@ -1,7 +1,9 @@
 //! STUN (RFC 5389 Binding) and local address discovery. Owner: transport slice.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
+
+use crate::transport::{is_v6, recv_udp_from, send_udp_to};
 
 pub(crate) const STUN_SERVERS: &[&str] = &["stun.cloudflare.com:3478", "stun.l.google.com:19302"];
 
@@ -77,6 +79,7 @@ pub(crate) fn query(socket: &UdpSocket, servers: &[&str], timeout: Duration) -> 
         return StunResult::default();
     }
 
+    let v6 = is_v6(socket);
     let prev_timeout = socket.read_timeout().ok().flatten();
     // std has no non-blocking getter. A socket without a read timeout is taken to be a
     // non-blocking game socket and is made non-blocking again afterwards.
@@ -92,14 +95,14 @@ pub(crate) fn query(socket: &UdpSocket, servers: &[&str], timeout: Duration) -> 
         if now >= next_send {
             for (t, a) in targets.iter().zip(&answers) {
                 if a.is_none() {
-                    let _ = socket.send_to(&req, t);
+                    let _ = send_udp_to(socket, v6, &req, *t);
                 }
             }
             next_send = now + Duration::from_millis(250);
         }
         let wait = (next_send.min(start + timeout) - now).max(Duration::from_millis(1));
         let _ = socket.set_read_timeout(Some(wait));
-        if let Ok((n, from)) = socket.recv_from(&mut buf) {
+        if let Ok((n, from)) = recv_udp_from(socket, &mut buf) {
             if let Some(addr) = parse_response(&buf[..n], &txid) {
                 if let Some(i) = targets.iter().position(|t| *t == from) {
                     answers[i] = Some(addr);
@@ -141,6 +144,23 @@ pub(crate) fn local_ipv4() -> Vec<Ipv4Addr> {
     out
 }
 
+/// Global unicast (2000::/3) only: excludes link-local, ULA, loopback, multicast, unspecified.
+pub(crate) fn is_global_v6(ip: &Ipv6Addr) -> bool {
+    ip.segments()[0] & 0xE000 == 0x2000
+}
+
+/// This machine's global IPv6 address (direct candidate on CGNAT/mobile networks), if any.
+pub(crate) fn local_ipv6() -> Vec<Ipv6Addr> {
+    let Ok(s) = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)) else { return Vec::new() };
+    if s.connect("[2001:4860:4860::8888]:53").is_err() {
+        return Vec::new();
+    }
+    match s.local_addr() {
+        Ok(SocketAddr::V6(a)) if is_global_v6(a.ip()) => vec![*a.ip()],
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +191,21 @@ mod tests {
         b.extend_from_slice(&ip.to_be_bytes());
         assert_eq!(parse_response(&b, &tx), Some("203.0.113.5:40000".parse().unwrap()));
         assert_eq!(parse_response(&b, &[0u8; 12]), None);
+    }
+
+    #[test]
+    fn stun_global_v6_filter() {
+        let g = |s: &str| is_global_v6(&s.parse().unwrap());
+        assert!(g("2001:db8::1"));
+        assert!(g("2a02:aa1:1000::5"));
+        assert!(g("3fff::1"));
+        assert!(!g("fe80::1"));
+        assert!(!g("fd12:3456::1"));
+        assert!(!g("fc00::1"));
+        assert!(!g("::1"));
+        assert!(!g("::"));
+        assert!(!g("::ffff:192.0.2.1"));
+        assert!(!g("ff02::1"));
     }
 
     #[test]

@@ -101,13 +101,20 @@ Test hook: `&grace=<ms>` on the connect URL shortens that peer's grace period (i
 
 ## 2. Route establishment (per pair of peers)
 
-Each client binds one UDP socket (IPv4, `0.0.0.0:0`, or the configured port in direct mode) for
-the whole session and uses it for STUN, punching and game traffic.
+Each client binds one UDP socket for the whole session and uses it for STUN, punching and game
+traffic: dual-stack `[::]:0` (IPV6_V6ONLY off), falling back to `0.0.0.0:0` when IPv6 is
+unavailable; a direct-IP host keeps its configured port. Addresses are stored and compared in
+normalized form: an IPv4-mapped `::ffff:a.b.c.d` is plain IPv4 `a.b.c.d:port`, and IPv4
+destinations are mapped automatically when the socket is IPv6.
 
-Candidates: the socket's local LAN addresses (one per non-loopback IPv4 interface, same port)
-plus the STUN reflexive address (`stun.cloudflare.com:3478`, `stun.l.google.com:19302`,
-RFC 5389 Binding Request, XOR-MAPPED-ADDRESS). If two STUN servers report different ports the
-NAT is symmetric: punching is still tried but the relay timeout is shortened to 1.5 s.
+Candidates, in this order: the socket's LAN addresses (one per non-loopback IPv4 interface, same
+port), the machine's global IPv6 addresses (2000::/3 only, never link-local, ULA or loopback;
+listed only when the socket is IPv6), then the STUN reflexive address (`stun.cloudflare.com:3478`,
+`stun.l.google.com:19302`, RFC 5389 Binding Request, XOR-MAPPED-ADDRESS; IPv4 servers only). All
+use Rust `SocketAddr` text form (`192.168.1.6:53211`, `[2001:db8::1]:53211`); a peer whose
+socket is IPv4-only skips IPv6 candidates. Punching an IPv6 candidate works like IPv4: the
+outbound punch opens stateful firewalls. If two STUN servers report different ports the NAT is
+symmetric: punching is still tried but the relay timeout is shortened to 1.5 s.
 
 On `welcome` (for every listed peer) and on `joined`, each side sends to that peer via the
 server:
@@ -130,20 +137,35 @@ or immediately if either side set `relay_only` (config `force_relay`). The other
 decision (for `direct` it uses the address it received packets from). Punching stops once the
 route is decided. Relay routes send packets as binary WebSocket frames (section 1).
 
-Keepalive and route health: during the lobby, send `KEEPALIVE` to every UDP route every 1 s
-(NAT mappings expire); in game GGRS traffic keeps them alive. Any packet from a direct route's
-address counts as alive. A direct route silent for 3 s is punched again (PUNCH every 50 ms to
-the route address and the peer's candidates); if it is still silent after 5 s the decider
-(lower id) sends `{"t":"route","to":<peer>,"mode":"relay"}` and both sides switch that pair to
-the relay. A `route` `relay` for an already decided direct pair is the only route change ever
-accepted; nothing switches back to direct.
+The mesh outlives the lobby: the game drives the same signaling, punching and route health on
+every GGRS poll, and only GGRS and BYE packets reach GGRS (PUNCH, PUNCH_ACK, KEEPALIVE and CTRL
+stay in the mesh). Any packet from a direct route's address counts as alive.
+
+Lobby (1 Hz `KEEPALIVE` to every UDP route, NAT mappings expire): a direct route silent for 3 s
+is punched again (PUNCH every 50 ms to the route address and the peer's candidates); if it is
+still silent after 5 s the decider (lower id) sends `{"t":"route","to":<peer>,"mode":"relay"}`
+and both sides switch that pair to the relay.
+
+Game (GGRS sends about 60 packets per second, so silence means something): a direct route silent
+for 1 s is re-punched the same way, and every outgoing packet to that peer is also mirrored over
+the relay (duplicates are harmless: GGRS ignores inputs it already has). Mirroring stops as soon
+as a packet arrives on the direct address. After 3 s of silence the lower id sends `route`
+`relay` and both sides switch.
+
+Roaming (lobby and game): a PUNCH or PUNCH_ACK carrying the peer's session token from a new
+address moves a decided direct route to that source address once the current address has been
+silent for at least 1 s (so late pairing punches cannot flap a working route); the PUNCH is
+answered with PUNCH_ACK. This covers NAT rebinding and Wi-Fi → LTE. A relay-routed pair stays on
+the relay: a `route` `relay` for a decided direct pair is the only switch the decider ever sends,
+and nothing switches back to direct. Direct-IP mode (token 0) never roams.
 
 ### Direct IP mode (2 players, no server)
 
-Host binds UDP port `P` (default 7777) and waits. Guest binds `0.0.0.0:0` and sends `PUNCH`
-(token 0, from id 1, to id 0) to `host:P` every 50 ms; host answers `PUNCH_ACK` and both use
-that address. Ids: host 0, guest 1. Port forwarding / LAN / VPN (Tailscale) is the user's
-problem in this mode.
+Host binds UDP port `P` (default 7777) and waits. Guest binds `[::]:0` (or `0.0.0.0:0`) and
+sends `PUNCH` (token 0, from id 1, to id 0) to `host:P` every 50 ms; host answers `PUNCH_ACK` and
+both use that address. The guest accepts `host[:port]`, `[v6]:port` or a bare IPv6 address
+(default port 7777; IPv4 preferred when a hostname resolves to both). Ids: host 0, guest 1. Port
+forwarding / LAN / VPN (Tailscale) is the user's problem in this mode.
 
 ## 3. Packets (UDP payload = relay payload)
 
@@ -168,8 +190,10 @@ All little-endian. Max packet 1200 bytes.
 Packets from an address that is not a known route are ignored, except PUNCH/PUNCH_ACK with a
 valid token.
 
-CTRL is reliable: the sender retransmits every 200 ms until it gets `CTRL_ACK` with that seq
-(per-peer seq counter starting at 1); the receiver acks every copy and processes each seq once.
+CTRL is reliable: the sender retransmits until it gets `CTRL_ACK` with that seq (per-peer seq
+counter starting at 1), after RTO = clamp(SRTT + 4·RTTVAR, 200 ms, 1 s); the receiver acks every
+copy and processes each seq once. RTT samples come only from acks of first transmissions (Karn's
+rule) and feed an RFC 6298 estimator per peer (alpha 1/8, beta 1/4).
 
 ROM transfer: sender keeps up to 32 chunks in flight from `next`, retransmits from the last
 acked `next` after 300 ms without progress; receiver acks the highest contiguous byte count on
@@ -200,6 +224,10 @@ so the game cannot start with it.
 Guest → host whenever its state changes: `{"t":"ready","links":[0,2]}` = ROM loaded plus the
 peer ids it has a decided route to.
 
+Any → every routed peer every 250 ms while in the lobby: `{"t":"ping"}` (about 25 bytes). The
+receiver only acks it (unknown `t` values are acked and ignored); its job is to give the RTT
+estimator steady samples for the input delay.
+
 Host → every guest whenever anything changes (lobby UI):
 
 ```json
@@ -213,10 +241,13 @@ present peers. Host sends `{"t":"lock"}` to the server, then to every guest:
 {"t":"start","slots":[0,1,2],"delay":2,"four_score":true}
 ```
 
-`slots[i]` = peer id playing NES controller i+1. `delay` = GGRS input delay chosen by the
-host: its setting, or auto = clamp(ceil(max_rtt_ms / 2 / frame_ms), 1, 4). `four_score` = true
-when more than 2 slots are used or the ROM header asks for it. Each peer starts GGRS when it
-receives (guests) or sends (host) `start`.
+`slots[i]` = peer id playing NES controller i+1. `delay` = GGRS input delay chosen by the host:
+its setting (1-6), or auto = clamp(ceil(R / 2 / frame_ms), 1, 6), where R is the worst peer's
+planning RTT: SRTT + 2·RTTVAR once that peer has at least 8 samples, otherwise SRTT·1.25 (RFC
+6298's cold-start RTTVAR = R/2 would add a whole extra RTT). A peer with no samples counts as
+0 ms, and the start never waits for samples. frame_ms is 16.64 (NTSC) or 20 (PAL). `four_score`
+= true when more than 2 slots are used or the ROM header asks for it. Each peer starts GGRS when
+it receives (guests) or sends (host) `start`.
 
 `{"t":"leave"}` (any → all) and BYE packets end the lobby/game for that peer.
 
@@ -224,7 +255,17 @@ receives (guests) or sends (host) `start`.
 
 `ggrs::Config`: `Input = u16` (bits 0-7 NES pad, bit 8 = reset request), `State =
 ebobo_core::Snapshot`, `Address = PeerId(u8)`. Players = `slots.len()`, local handle = own slot
-index, every other slot is `PlayerType::Remote(PeerId)`. FPS = 60 (NTSC) / 50 (PAL).
-Max prediction 8, desync detection every 60 frames (checksum = `Nes::state_hash` truncated to
-u128), disconnect timeout 10 s, notify after 1.5 s. A frame whose combined input has any reset
+index, every other slot is `PlayerType::Remote(PeerId)`. FPS = 60 (NTSC) / 50 (PAL). The
+session takes the `Link` from `GameStart.link` (the lobby's live mesh, section 2), or
+`Link::udp(socket, me, peers)` for fixed UDP routes without a server; every GGRS poll also
+drives its signaling, route health, punching, relay mirroring and roaming. A BYE from a peer
+disconnects its player.
+Max prediction 10, desync detection every 60 frames (checksum = `Nes::state_hash` truncated to
+u128), disconnect timeout 20 s, notify after 1.5 s. A frame whose combined input has any reset
 bit runs `Nes::reset()` before `run_frame`.
+
+Tuning (measured with the network profiles in `crates/ebobo-net/src/session_tests.rs`, release
+build): prediction 10 instead of 8 cuts stalls on a 150 ms one-way link from 14-33 % to 4-11 % of
+frames; a 4 s blackout never disconnects and 20 s lets a phone in a tunnel come back. No profile
+(mobile bursty loss, 150 ms far, 15/180 ms asymmetric, 4 s blackout; 2 and 4 peers) ever
+desynced.
