@@ -3,7 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "deploy": "npx wrangler@latest deploy",
+    "deploy": "wrangler deploy",
     "smoke": "node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.162.0"
   }
 }

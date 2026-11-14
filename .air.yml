@@ -1,0 +1,12 @@
+# air-ci (Ivan's Air): push to main deploys the ebobo-signal Worker (worker/), then smoke-tests it live.
+push:
+  deploy:
+    light: true
+    timeout: 15
+    paths: ['.air.yml', 'worker/src/**', 'worker/wrangler.toml', 'worker/package.json', 'worker/package-lock.json', 'worker/tsconfig.json', 'worker/test/**']
+    run: |
+      set -e
+      cd worker
+      npm ci --no-audit --no-fund
+      npx wrangler deploy
+      node test/smoke.mjs

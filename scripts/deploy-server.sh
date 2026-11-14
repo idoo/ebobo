@@ -10,7 +10,8 @@ if ! command -v npx >/dev/null 2>&1; then
     echo "Install Node.js first (https://nodejs.org), then run this again." >&2
     exit 1
 fi
-wrangler=(npx --yes wrangler@latest)
+npm ci --no-audit --no-fund --silent
+wrangler=(npx wrangler)   # the version pinned in worker/package.json
 
 who="$("${wrangler[@]}" whoami 2>&1 || true)"
 case "$who" in
