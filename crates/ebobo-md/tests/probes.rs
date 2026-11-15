@@ -22,6 +22,9 @@ const KNOWN_DIFF: &[(&str, &str)] = &[
     ("row_point", "HV words read after each write differ by a few H counts (poll phase: access timing inside an instruction); \
                    the rows each write changes match, see tools/md-oracle/row_point.py"),
     ("row_point_c", "as row_point"),
+    ("boot_phase", "power-on HV word reads V = 0x9F (NTSC) / 0x84 (PAL), H = 0 in the reference although its first blanking \
+                    comes 32 / 58 lines later; ours matches the blanking time within 1 poll pass, not the HV word"),
+    ("boot_clock", "frame 1 within 2 passes of 210 clocks; ours loses 4 passes a frame (refresh/access timing, as frame_cycles)"),
 ];
 
 /// Word 0 of the result block when the probe's `main` returned.

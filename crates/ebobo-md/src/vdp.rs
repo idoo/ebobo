@@ -661,6 +661,12 @@ mod tests {
     use super::*;
     use std::hash::{Hash, Hasher};
 
+    /// A chip at the start of line 0 (power-on starts part-way through a frame): the tests
+    /// count lines and clocks from there.
+    fn at_line_0(pal: bool) -> Vdp {
+        Vdp { line: 0, mclk: 0, fired: 0, ..Vdp::new(pal) }
+    }
+
     /// Returns the word address's low 16 bits and records every address read.
     struct Rec(Vec<u32>);
     impl DmaSource for Rec {
@@ -695,7 +701,7 @@ mod tests {
 
     /// 320-pixel mode, display on, at the start of line 0, a video RAM write command at 0.
     fn drawing_h40() -> Vdp {
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         set_reg(&mut v, 1, 0x44);
         set_reg(&mut v, 12, 0x81);
@@ -793,7 +799,7 @@ mod tests {
 
     #[test]
     fn registers_and_memories_round_trip() {
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         set_reg(&mut v, 1, 0x14);
         set_reg(&mut v, 15, 2);
@@ -820,7 +826,7 @@ mod tests {
 
     #[test]
     fn auto_increment_and_pending_cleared_by_status() {
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         set_reg(&mut v, 15, 4);
         let mut m = Rec(Vec::new());
@@ -840,7 +846,7 @@ mod tests {
 
     #[test]
     fn vram_fill_pattern() {
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         set_reg(&mut v, 1, 0x10);
         set_reg(&mut v, 15, 1);
@@ -856,7 +862,7 @@ mod tests {
 
     #[test]
     fn vram_copy() {
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         set_reg(&mut v, 15, 2);
         cmd(&mut v, 1, 0, &mut Rec(Vec::new()));
@@ -875,7 +881,7 @@ mod tests {
 
     #[test]
     fn bus_dma_source_wraps_and_freezes() {
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         set_reg(&mut v, 1, 0x10);
         set_reg(&mut v, 15, 2);
@@ -890,7 +896,7 @@ mod tests {
         assert_eq!(&v.vram()[0x200..0x208], &[0xFF, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01]);
 
         // 167 words = 334 bytes at 167 bytes per blanked 256-pixel line: two lines.
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         set_reg(&mut v, 1, 0x10);
         set_reg(&mut v, 15, 2);
@@ -913,7 +919,7 @@ mod tests {
 
     #[test]
     fn one_frame_done_per_frame() {
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         let mut done = Vec::new();
         while done.len() < 3 {
             let t = v.next_event();
@@ -931,7 +937,7 @@ mod tests {
     #[test]
     fn vertical_interrupt_at_line_224() {
         for enabled in [false, true] {
-            let mut v = Vdp::new(false);
+            let mut v = at_line_0(false);
             v.run_to(0, None);
             if enabled {
                 set_reg(&mut v, 1, 0x20);
@@ -956,7 +962,7 @@ mod tests {
 
     #[test]
     fn horizontal_interrupt_every_n_plus_one_lines() {
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         set_reg(&mut v, 0, 0x10);
         set_reg(&mut v, 10, 3);
@@ -982,7 +988,7 @@ mod tests {
     #[test]
     fn vblank_flag_falls_a_line_before_line_0() {
         for (pal, total) in [(false, 262u64), (true, 313)] {
-            let mut v = Vdp::new(pal);
+            let mut v = at_line_0(pal);
             v.run_to(0, None);
             set_reg(&mut v, 1, 0x44);
             let hint = timing::hint_point(false) as u64;
@@ -1001,7 +1007,7 @@ mod tests {
     #[test]
     fn horizontal_interrupt_lines_follow_the_v_counter() {
         for (r10, first, step) in [(0u8, 261u64, 1usize), (1, 0, 2), (7, 6, 8)] {
-            let mut v = Vdp::new(false);
+            let mut v = at_line_0(false);
             v.run_to(0, None);
             set_reg(&mut v, 0, 0x10);
             set_reg(&mut v, 10, r10);
@@ -1039,7 +1045,7 @@ mod tests {
         assert_eq!(timing::v_counter(312, true, false, 0), 0xFF);
         assert_eq!(timing::v_counter(312, true, true, 0), 0xFF);
 
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         assert_eq!(v.read(8, 0), 0x0000);
         v.run_to(100 * 3420, None);
@@ -1055,7 +1061,7 @@ mod tests {
 
     #[test]
     fn clone_mid_frame_continues_identically() {
-        let mut v = Vdp::new(false);
+        let mut v = at_line_0(false);
         v.run_to(0, None);
         set_reg(&mut v, 0, 0x10);
         set_reg(&mut v, 1, 0x20);
