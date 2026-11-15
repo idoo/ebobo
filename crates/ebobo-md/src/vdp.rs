@@ -59,6 +59,39 @@ const FIRED_ROW: u8 = 1;
 const FIRED_VINT: u8 = 2;
 const FIRED_HINT: u8 = 4;
 
+/// A DMA on its way: the data moves one unit per access slot (a byte of video RAM, a word of
+/// colour or scroll RAM), unit `k` at the master clock [`timing::dma_duration`] gives for `k + 1`
+/// units from the start. Everything is zero / empty when no transfer is pending.
+#[derive(Clone, Default, Hash, Serialize, Deserialize)]
+struct DmaPending {
+    /// 0 none, 1 68000 transfer, 2 fill, 3 copy.
+    kind: u8,
+    /// Command code CD3-CD0 at the trigger: the memory written.
+    target: u8,
+    /// Source words of a 68000 transfer, read at the trigger (the 68000 is held for all of it).
+    words: Vec<u16>,
+    /// Units written / units in all.
+    done: u32,
+    total: u32,
+    /// Where the next unit goes, and the step after each (register 15 at the trigger).
+    addr: u16,
+    inc: u16,
+    /// Copy: where the next byte comes from.
+    src: u16,
+    /// Fill: the data word.
+    fill: u16,
+    /// Master clocks of the trigger and of the last unit.
+    t0: u64,
+    end: u64,
+    /// Beam and mode at the trigger ([`DmaStart`]).
+    line: u32,
+    mclk: u32,
+    h40: bool,
+    display_on: bool,
+    active_lines: u32,
+    total_lines: u32,
+}
+
 /// Complete emulated state of the chip.
 #[derive(Clone, Hash, Serialize, Deserialize)]
 pub struct Vdp {
@@ -101,6 +134,8 @@ pub struct Vdp {
     frame_done: bool,
     m68k_frozen_until: u64,
     dma_busy_until: u64,
+    /// The transfer whose data is still on its way.
+    dma: DmaPending,
     /// Write FIFO: the master clocks at which the last four data-port writes leave it, oldest
     /// first (a video RAM word leaves with its first byte; the second is written from a latch
     /// in the next slot). A write is waiting while its entry is after `clock`.
@@ -149,6 +184,7 @@ impl Vdp {
             frame_done: false,
             m68k_frozen_until: 0,
             dma_busy_until: 0,
+            dma: DmaPending::default(),
             fifo_done: [0; 4],
             fifo_tail: 0,
             hv_latch: None,
@@ -186,6 +222,7 @@ impl Vdp {
         loop {
             self.fire_due(screen.as_deref_mut());
             if self.clock >= now {
+                self.dma_apply();
                 return;
             }
             let next = self.next_point_in_line();
@@ -222,6 +259,7 @@ impl Vdp {
         let active = self.active_lines();
         if self.fired & FIRED_ROW == 0 && self.mclk >= row {
             self.fired |= FIRED_ROW;
+            self.dma_apply();
             if self.line < active {
                 self.draw_row(screen);
             }
@@ -237,6 +275,7 @@ impl Vdp {
         }
         if self.fired & FIRED_HINT == 0 && self.mclk >= hint {
             self.fired |= FIRED_HINT;
+            self.dma_apply();
             self.row_vsram.copy_from_slice(&self.vsram);
             // The V counter steps here; the counter counts on the lines it then shows as
             // 0 to `active` (the step into line 0 counts already) and reloads on the others.
@@ -448,6 +487,7 @@ impl Vdp {
     /// Word read of a port, `addr` = 0x00-0x1E even (the low bits of 0xC000xx): 0x00/0x02
     /// data, 0x04/0x06 status, 0x08-0x0E HV counter. Other addresses give 0xFFFF.
     pub fn read(&mut self, addr: u32, _now: u64) -> u16 {
+        self.dma_apply();
         match addr & 0x1E {
             0x00 | 0x02 => {
                 self.pending = false;
@@ -500,9 +540,10 @@ impl Vdp {
     }
 
     /// Word write of a port (data or control). A control write that starts a 68k→VDP DMA
-    /// reads its source through `mem`; the transfer happens here and
-    /// [`Vdp::m68k_frozen_until`] reports how long it takes.
+    /// reads its source through `mem` here; the data reaches video memory unit by unit until
+    /// [`Vdp::m68k_frozen_until`].
     pub fn write(&mut self, addr: u32, val: u16, _now: u64, mem: &mut dyn DmaSource) {
+        self.dma_apply();
         match addr & 0x1E {
             0x00 | 0x02 => self.write_data(val),
             0x04 | 0x06 => self.write_control(val, mem),
@@ -568,8 +609,9 @@ impl Vdp {
         }
     }
 
-    /// Master clock a DMA of `units` started now ends at.
-    fn dma_end(&self, kind: DmaKind, units: u32) -> u64 {
+    /// Starts a transfer of `units` now (the caller has set what it moves in `self.dma`) and
+    /// returns the master clock it ends at.
+    fn dma_begin(&mut self, kind: DmaKind, units: u32) -> u64 {
         let start = DmaStart {
             line: self.line,
             mclk: self.mclk,
@@ -578,18 +620,115 @@ impl Vdp {
             active_lines: self.active_lines(),
             total_lines: self.lines(),
         };
-        self.clock + timing::dma_duration(kind, units, start)
+        let end = self.clock + timing::dma_duration(kind, units, start);
+        let inc = self.increment();
+        let d = &mut self.dma;
+        d.kind = match kind {
+            DmaKind::Bus => 1,
+            DmaKind::Fill => 2,
+            DmaKind::Copy => 3,
+        };
+        d.target = self.code & 0x0F;
+        d.done = 0;
+        d.total = units;
+        d.addr = self.addr;
+        d.inc = inc;
+        d.t0 = self.clock;
+        d.end = end;
+        d.line = start.line;
+        d.mclk = start.mclk;
+        d.h40 = start.h40;
+        d.display_on = start.display_on;
+        d.active_lines = start.active_lines;
+        d.total_lines = start.total_lines;
+        self.dma_busy_until = end;
+        end
+    }
+
+    /// Writes the units of the pending transfer that are due at the chip's position.
+    fn dma_apply(&mut self) {
+        if self.dma.kind == 0 {
+            return;
+        }
+        let d = &self.dma;
+        let due = if self.clock >= d.end {
+            d.total
+        } else {
+            let kind = match d.kind {
+                1 => DmaKind::Bus,
+                2 => DmaKind::Fill,
+                _ => DmaKind::Copy,
+            };
+            let start = DmaStart {
+                line: d.line,
+                mclk: d.mclk,
+                h40: d.h40,
+                display_on: d.display_on,
+                active_lines: d.active_lines,
+                total_lines: d.total_lines,
+            };
+            timing::dma_units_done(kind, start, self.clock - d.t0).min(d.total)
+        };
+        self.dma_advance(due);
+    }
+
+    /// Finishes the pending transfer at once (a new one is starting).
+    fn dma_flush(&mut self) {
+        self.dma_advance(self.dma.total);
+    }
+
+    /// Writes units up to `due`. A 68000 transfer to video RAM writes a word's low byte, then
+    /// its high byte; a fill the data word's high byte to `address ^ 1` (colour and scroll RAM
+    /// get whole words); a copy a byte from the source.
+    fn dma_advance(&mut self, due: u32) {
+        while self.dma.done < due {
+            let a = self.dma.addr as usize;
+            let mut step = true;
+            match (self.dma.kind, self.dma.target) {
+                (1, 0x01) => {
+                    let w = self.dma.words[(self.dma.done >> 1) as usize];
+                    if self.dma.done & 1 == 0 {
+                        self.vram[a ^ 1] = w as u8;
+                        step = false;
+                    } else {
+                        self.vram[a] = (w >> 8) as u8;
+                    }
+                }
+                (2, 0x01) => self.vram[a ^ 1] = (self.dma.fill >> 8) as u8,
+                (3, _) => {
+                    self.vram[a ^ 1] = self.vram[self.dma.src as usize ^ 1];
+                    self.dma.src = self.dma.src.wrapping_add(1);
+                }
+                (kind, 0x03) | (kind, 0x05) => {
+                    let w = if kind == 1 { self.dma.words[self.dma.done as usize] } else { self.dma.fill };
+                    if self.dma.target == 0x03 {
+                        self.cram[(a >> 1) & 0x3F] = w & 0x0EEE;
+                    } else if let Some(e) = self.vsram.get_mut((a >> 1) & 0x3F) {
+                        *e = w & 0x07FF;
+                    }
+                }
+                _ => {}
+            }
+            if step {
+                self.dma.addr = self.dma.addr.wrapping_add(self.dma.inc);
+            }
+            self.dma.done += 1;
+        }
+        if self.dma.done >= self.dma.total {
+            self.dma.kind = 0;
+            self.dma.words.clear();
+        }
     }
 
     /// 68000 to VRAM, CRAM or VSRAM. Source: word address in registers 21-23, wrapping
-    /// inside its 128 KB window.
+    /// inside its 128 KB window. The source is read now; the registers get their end values.
     fn dma_bus(&mut self, mem: &mut dyn DmaSource) {
+        self.dma_flush();
         let len = self.dma_len();
         let high = (self.regs[23] as u32 & 0x7F) << 16;
         let mut src = self.regs[21] as u16 | (self.regs[22] as u16) << 8;
         for _ in 0..len {
-            let w = mem.dma_read16((high | src as u32) << 1);
-            self.store(w);
+            self.dma.words.push(mem.dma_read16((high | src as u32) << 1));
             src = src.wrapping_add(1);
         }
         self.regs[21] = src as u8;
@@ -597,49 +736,36 @@ impl Vdp {
         self.regs[19] = 0;
         self.regs[20] = 0;
         let units = if self.code & 0x0F == 0x01 { len * 2 } else { len };
-        let end = self.dma_end(DmaKind::Bus, units);
-        self.m68k_frozen_until = end;
-        self.dma_busy_until = end;
+        self.m68k_frozen_until = self.dma_begin(DmaKind::Bus, units);
+        self.addr = self.addr.wrapping_add((len as u16).wrapping_mul(self.increment()));
     }
 
     /// VRAM fill after the data write `val`: the high byte goes to `address ^ 1` for each
     /// byte of the length, the address advancing by register 15. Colour and scroll RAM get
     /// the whole word.
     fn dma_fill(&mut self, val: u16) {
+        self.dma_flush();
         let len = self.dma_len();
-        for _ in 0..len {
-            let a = self.addr as usize;
-            match self.code & 0x0F {
-                0x01 => self.vram[a ^ 1] = (val >> 8) as u8,
-                0x03 => self.cram[(a >> 1) & 0x3F] = val & 0x0EEE,
-                0x05 => {
-                    if let Some(e) = self.vsram.get_mut((a >> 1) & 0x3F) {
-                        *e = val & 0x07FF;
-                    }
-                }
-                _ => {}
-            }
-            self.addr = self.addr.wrapping_add(self.increment());
-        }
+        self.dma.fill = val;
+        self.dma_begin(DmaKind::Fill, len);
+        self.addr = self.addr.wrapping_add((len as u16).wrapping_mul(self.increment()));
         self.regs[19] = 0;
         self.regs[20] = 0;
-        self.dma_busy_until = self.dma_end(DmaKind::Fill, len);
     }
 
     /// VRAM copy: bytes from the source (registers 21-22) to the address, one per step.
     fn dma_copy(&mut self) {
+        self.dma_flush();
         let len = self.dma_len();
-        let mut src = self.regs[21] as u16 | (self.regs[22] as u16) << 8;
-        for _ in 0..len {
-            self.vram[self.addr as usize ^ 1] = self.vram[src as usize ^ 1];
-            src = src.wrapping_add(1);
-            self.addr = self.addr.wrapping_add(self.increment());
-        }
+        let src = self.regs[21] as u16 | (self.regs[22] as u16) << 8;
+        self.dma.src = src;
+        self.dma_begin(DmaKind::Copy, len);
+        self.addr = self.addr.wrapping_add((len as u16).wrapping_mul(self.increment()));
+        let src = src.wrapping_add(len as u16);
         self.regs[21] = src as u8;
         self.regs[22] = (src >> 8) as u8;
         self.regs[19] = 0;
         self.regs[20] = 0;
-        self.dma_busy_until = self.dma_end(DmaKind::Copy, len);
     }
 
     /// Lines per frame: 262 or 313.
@@ -863,8 +989,9 @@ mod tests {
         set_reg(&mut v, 23, 0x80);
         cmd(&mut v, 0x21, 0, &mut Rec(Vec::new()));
         data(&mut v, 0xAABB);
-        assert_eq!(&v.vram()[0..7], &[0xAA, 0xBB, 0xAA, 0xAA, 0x00, 0xAA, 0x00]);
         assert_ne!(v.read(4, 0) & 2, 0);
+        v.run_to(v.dma_busy_until, None);
+        assert_eq!(&v.vram()[0..7], &[0xAA, 0xBB, 0xAA, 0xAA, 0x00, 0xAA, 0x00]);
         assert_eq!(v.m68k_frozen_until(), 0);
     }
 
@@ -883,6 +1010,7 @@ mod tests {
         set_reg(&mut v, 22, 0);
         set_reg(&mut v, 23, 0xC0);
         cmd(&mut v, 0x30, 0x10, &mut Rec(Vec::new()));
+        v.run_to(v.dma_busy_until, None);
         assert_eq!(&v.vram()[0x10..0x15], &[1, 2, 3, 4, 0]);
         assert_eq!(v.reg(21), 4);
     }
@@ -901,6 +1029,7 @@ mod tests {
         let mut m = Rec(Vec::new());
         cmd(&mut v, 0x21, 0x200, &mut m);
         assert_eq!(m.0, vec![0xFFFFFC, 0xFFFFFE, 0xFE0000, 0xFE0002]);
+        v.run_to(v.dma_busy_until, None);
         assert_eq!(&v.vram()[0x200..0x208], &[0xFF, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01]);
 
         // 167 words = 334 bytes at 167 bytes per blanked 256-pixel line: two lines.
@@ -923,6 +1052,124 @@ mod tests {
         assert_eq!(timing::dma_duration(DmaKind::Bus, 18, s), 3420);
         assert_eq!(timing::dma_duration(DmaKind::Fill, 36, s), 6840);
         assert_eq!(timing::dma_duration(DmaKind::Copy, 102, DmaStart { line: 224, ..s }), 3420);
+    }
+
+    /// Bytes of `v`'s video RAM in `range` equal to `b`.
+    fn count(v: &Vdp, range: std::ops::Range<usize>, b: u8) -> usize {
+        v.vram()[range].iter().filter(|&&x| x == b).count()
+    }
+
+    fn hash_of(v: &Vdp) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        v.hash(&mut h);
+        h.finish()
+    }
+
+    /// A 64-byte 68000 → VRAM transfer to 0x200 from source words 0x8080.., started at `line`.
+    fn bus_64(line: u32) -> Vdp {
+        let mut v = Vdp { line, mclk: 0, fired: 0, ..Vdp::new(false) };
+        v.run_to(0, None);
+        set_reg(&mut v, 1, 0x50);
+        set_reg(&mut v, 12, 0x81);
+        set_reg(&mut v, 15, 2);
+        set_reg(&mut v, 19, 32);
+        set_reg(&mut v, 21, 0x80);
+        set_reg(&mut v, 22, 0x80);
+        cmd(&mut v, 0x21, 0x200, &mut Rec(Vec::new()));
+        v
+    }
+
+    #[test]
+    fn units_done_inverts_duration() {
+        let s = DmaStart { line: 220, mclk: 1000, h40: true, display_on: true, active_lines: 224, total_lines: 262 };
+        for kind in [DmaKind::Bus, DmaKind::Fill, DmaKind::Copy] {
+            for start in [s, DmaStart { line: 0, mclk: 0, ..s }, DmaStart { h40: false, mclk: 3419, ..s }] {
+                for n in 1..700 {
+                    let t = timing::dma_duration(kind, n, start);
+                    assert_eq!(timing::dma_units_done(kind, start, t), n);
+                    assert_eq!(timing::dma_units_done(kind, start, t - 1), n - 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bus_dma_lands_unit_by_unit() {
+        let mut v = bus_64(0);
+        assert_eq!(count(&v, 0x200..0x240, 0), 64);
+        assert_eq!(v.m68k_frozen_until(), 12160);
+        assert_eq!((v.addr, v.reg(21), v.reg(19)), (0x240, 0xA0, 0));
+        v.run_to(3420, None);
+        assert_eq!(count(&v, 0x200..0x240, 0), 64 - 18);
+        assert_eq!(count(&v, 0x200..0x212, 0), 0);
+        v.run_to(12159, None);
+        assert_eq!(count(&v, 0x200..0x240, 0), 1);
+        v.run_to(12160, None);
+        for i in 0..32 {
+            assert_eq!(&v.vram()[0x200 + 2 * i..0x202 + 2 * i], &[0x80, 0x80 + i as u8]);
+        }
+        assert!(v.dma.words.is_empty() && v.dma.kind == 0);
+    }
+
+    #[test]
+    fn bus_dma_in_vertical_blanking_takes_under_a_line() {
+        let mut v = bus_64(230);
+        assert_eq!(v.m68k_frozen_until(), 1068);
+        v.run_to(3420, None);
+        assert_eq!(count(&v, 0x200..0x240, 0), 0);
+    }
+
+    #[test]
+    fn clone_mid_transfer_continues_identically() {
+        let mut a = bus_64(0);
+        a.run_to(5000, None);
+        let mut b = a.clone();
+        assert_eq!(hash_of(&a), hash_of(&b));
+        a.run_to(9000, None);
+        b.run_to(7000, None);
+        b.run_to(9000, None);
+        assert_eq!(hash_of(&a), hash_of(&b));
+        a.run_to(13000, None);
+        b.run_to(13000, None);
+        assert_eq!(hash_of(&a), hash_of(&b));
+        assert_eq!(hash_of(&a), {
+            let mut c = bus_64(0);
+            c.run_to(13000, None);
+            hash_of(&c)
+        });
+    }
+
+    #[test]
+    fn fill_and_copy_land_unit_by_unit() {
+        let mut v = at_line_0(false);
+        v.run_to(0, None);
+        set_reg(&mut v, 1, 0x50);
+        set_reg(&mut v, 12, 0x81);
+        set_reg(&mut v, 15, 1);
+        set_reg(&mut v, 19, 36);
+        set_reg(&mut v, 23, 0x80);
+        cmd(&mut v, 0x21, 0x300, &mut Rec(Vec::new()));
+        data(&mut v, 0xAB00);
+        assert_eq!(count(&v, 0x300..0x330, 0xAB), 1);
+        v.run_to(3420, None);
+        assert_eq!(count(&v, 0x300..0x330, 0xAB), 18);
+        assert_ne!(v.read(4, 3420) & 2, 0);
+        v.run_to(6840, None);
+        assert_eq!(count(&v, 0x300..0x330, 0xAB), 36);
+        assert_eq!(v.read(4, 6840) & 2, 0);
+
+        v.vram[0x400..0x412].fill(0x5A);
+        set_reg(&mut v, 19, 18);
+        set_reg(&mut v, 21, 0x00);
+        set_reg(&mut v, 22, 0x04);
+        set_reg(&mut v, 23, 0xC0);
+        cmd(&mut v, 0x30, 0x500, &mut Rec(Vec::new()));
+        assert_eq!(count(&v, 0x500..0x520, 0x5A), 0);
+        v.run_to(6840 + 3420, None);
+        assert_eq!(count(&v, 0x500..0x520, 0x5A), 9);
+        v.run_to(6840 + 6840, None);
+        assert_eq!(count(&v, 0x500..0x520, 0x5A), 18);
+        assert_eq!((v.reg(21), v.reg(22)), (0x12, 0x04));
     }
 
     #[test]

@@ -176,6 +176,26 @@ pub fn dma_duration(kind: DmaKind, units: u32, s: DmaStart) -> u64 {
     }
 }
 
+/// Units of a DMA started at `s` that are done `elapsed` master clocks later: the inverse of
+/// [`dma_duration`] (the largest count whose duration is at most `elapsed`), stepped line by line.
+pub fn dma_units_done(kind: DmaKind, s: DmaStart, elapsed: u64) -> u32 {
+    let lc = LINE_CLOCKS as u64;
+    let mut line = s.line % s.total_lines;
+    let mut avail = (LINE_CLOCKS - s.mclk.min(LINE_CLOCKS)) as u64;
+    let mut t = 0u64;
+    let mut done = 0u64;
+    loop {
+        let rate = dma_rate(kind, s.h40, !s.display_on || line >= s.active_lines) as u64;
+        if elapsed < t + avail {
+            return (done + (elapsed - t) * rate / lc) as u32;
+        }
+        done += rate * avail / lc;
+        t += avail;
+        avail = lc;
+        line = (line + 1) % s.total_lines;
+    }
+}
+
 /// Access slots of a drawing line in the 320-pixel mode: master clock of the line of each of the 18.
 /// Measured with the `fifo_pace` probe (when a held data-port write resumes, video RAM words from
 /// H 0x10, 0x80 and 0xE8): the slots crowd near both edges of the picture and are sparse in its

@@ -726,9 +726,10 @@ mod tests {
         }
         let frozen = m.s.vdp.m68k_frozen_until();
         assert!(frozen > m.s.now, "the DMA holds the 68000's bus");
-        assert_eq!(&m.s.vdp.vram()[..8], &rom()[..8], "the DMA read the cartridge");
         m.step_m68k();
         assert_eq!((m.s.now, m.s.m68k.pc), (frozen, ENTRY), "time passed, nothing ran");
+        m.s.vdp.run_to(m.s.now, None);
+        assert_eq!(&m.s.vdp.vram()[..8], &rom()[..8], "the DMA read the cartridge");
         m.step_m68k();
         assert_eq!((m.s.now, m.s.m68k.pc), (frozen + 28, 0x202));
     }
