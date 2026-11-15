@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "directories",
  "ebobo-art",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo-art"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "ebobo-console",
  "png",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo-console"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "ebobo-core",
  "ebobo-md",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo-core"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "serde",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo-m68k"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "serde",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo-md"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "ebobo-m68k",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo-net"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "ebobo-console",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "ebobo-z80"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
