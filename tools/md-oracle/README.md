@@ -50,6 +50,25 @@ python3 tools/md-oracle/oracle.py run 240pSuite-GenesisMD-1.21.zip --frames 300 
 # frame 300 crc32 BC8D7A5A 320x224        (the suite's main menu)
 ```
 
+## Comparing with ebobo: `compare.py`
+
+```sh
+python3 tools/md-oracle/compare.py ROM [ROM ...] [--frames 600] [--at 60,120,300,600] [--input FILE] [--region R] \
+    [--out /tmp/md-compare] [--ours target-md-hl/release/examples/headless]
+```
+
+- Runs `oracle.py run` and ebobo's `headless` example with the same flags into `OUT/<rom stem>/ref/` and `OUT/<rom stem>/ours/`
+  (logs in `ref.log`, `ours.log`). A run that fails or takes over 60 s is a `crash`, shown with the last lines of its output.
+- **Colours** are compared per channel on the console's 15 output steps: normal colour k is step 2k, shadowed k is step k,
+  highlighted k is step 7 + k. The reference's RGB565 value v gives step `v >> 4` (its highlighted 7 lands on 15 and is
+  counted as 14). ebobo's value is taken to the nearest of its levels in `crates/ebobo-md/src/vdp_render.rs` (`SHADOW` then
+  `HIGHLIGHT`; they hold every `NORMAL` level too); keep the list in `compare.py` in step with that file. A plain `v >> 5` does
+  not work: shadowed and highlighted pixels sit between the 3-bit levels and the two sides round them differently.
+- Per frame: sizes, differing pixels (one step apart versus more), their bounding box and the differing 8x8 cells. Per ROM:
+  `same`, `close (<1% pixels)` (every frame under 1%), `different`, `size` or `crash`; a table of all ROMs at the end.
+  Exit code 1 when any ROM is not `same` or `close`.
+- `OUT/<stem>/diff_NNNNNN.png`: reference, ours and a mask (dimmed reference; red = differs, dark red = one step apart).
+
 ## Licence
 
 Genesis Plus GX is not part of this repository. It is under a non-commercial licence. `fetch-core` downloads the
