@@ -298,6 +298,17 @@ impl Md {
         self.m.s.cart.load_battery_ram(data);
     }
 
+    /// Debugging and tests: the 64 KB work RAM, in the 68000's byte order (index 0 is the
+    /// byte at 0xFF0000).
+    pub fn ram(&self) -> &[u8] {
+        &self.m.s.ram
+    }
+
+    /// Debugging and tests: the Z80's 8 KB RAM.
+    pub fn z80_ram(&self) -> &[u8] {
+        &self.m.s.zram
+    }
+
     /// Serializes the machine: magic, version, ROM CRC and region, then the state. The ROM is
     /// not included; load it into an `Md` running the same ROM.
     pub fn save_state(&self) -> Vec<u8> {
