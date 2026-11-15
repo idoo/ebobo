@@ -8,6 +8,11 @@
 //! format of [`SpriteRow`]: bits 0-3 the colour (0 = transparent), bits 4-5 the palette line,
 //! bit 7 the priority flag of the cell (kept on transparent pixels too: shadow mode needs
 //! it). The layers are then composited into colours.
+//!
+//! An output pixel is `0xLLRRGGBB`: the colour, and in the top byte the layer that supplied
+//! it (display aids read it, the picture ignores it): 0 the backdrop colour, 1 plane B,
+//! 2 plane A or the window, 3 a sprite. While compositing, a pixel is its line buffer byte
+//! with that layer in bits 8-9, so the layer travels with whichever pixel wins.
 
 use crate::vdp_mem::{Mem, SpriteFlags, SpriteRow};
 use crate::vdp_sprites::sprite_row;
@@ -19,7 +24,13 @@ const SHADOW: [u8; 8] = [0, 29, 52, 70, 87, 101, 116, 130];
 /// Output levels of a highlighted pixel.
 const HIGHLIGHT: [u8; 8] = [130, 144, 158, 172, 187, 206, 228, 255];
 
-/// Draws screen row `row` into `out` (the first 256 or 320 entries, `0x00RRGGBB`) and returns
+/// Layer tags of a pixel while compositing (bits 8-9 over the line buffer byte).
+const TAG_B: u16 = 1 << 8;
+const TAG_A: u16 = 2 << 8;
+const TAG_SPRITE: u16 = 3 << 8;
+
+/// Draws screen row `row` into `out` (the first 256 or 320 entries, `0xLLRRGGBB`: the colour
+/// and the layer it came from, see the module text) and returns
 /// the flags the row's sprites raise. With `out` = `None` only the flags are worked out, and
 /// they are the same. `row` counts from the first displayed line; in interlace mode 2 rows
 /// are half lines (0..448 or 0..480).
@@ -129,21 +140,29 @@ fn scroll_plane(m: &Mem, t: Table, cell_shift: u32, hs: usize, plane: usize, row
     }
 }
 
-/// The plane pixel in front at one column: A high, B high, A low, B low; 0 if both are
-/// transparent.
+/// The plane pixel in front at one column, tagged with its layer: A high, B high, A low,
+/// B low; 0 (which is also layer 0) if both are transparent.
 #[inline]
-fn plane_front(b: u8, a: u8) -> u8 {
+fn plane_front(b: u8, a: u8) -> u16 {
     if a >= 0x80 && a & 15 != 0 {
-        a
+        u16::from(a) | TAG_A
     } else if b >= 0x80 && b & 15 != 0 {
-        b
+        u16::from(b) | TAG_B
     } else if a & 15 != 0 {
-        a
+        u16::from(a) | TAG_A
     } else if b & 15 != 0 {
-        b
+        u16::from(b) | TAG_B
     } else {
         0
     }
+}
+
+/// The output word of the composited pixel `c` (a tagged line buffer byte): its colour from
+/// `pal`, or the backdrop colour `bg` if it is transparent, under its layer. A transparent
+/// pixel is only ever the 0 of [`plane_front`], so the backdrop comes out as layer 0.
+#[inline]
+fn output(pal: &[u32; 64], bg: usize, c: u16) -> u32 {
+    pal[if c & 15 == 0 { bg } else { usize::from(c & 0x3F) }] | u32::from(c >> 8) << 24
 }
 
 /// Planes and compositing of [`render_row`], given the row's sprite pixels.
@@ -203,8 +222,8 @@ fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32]) {
         }
         for (((o, &b), &a), &s) in layers {
             let p = plane_front(b, a);
-            let c = if s & 15 != 0 && (s >= 0x80 || p < 0x80) { s } else { p };
-            *o = pal[if c & 15 == 0 { bg } else { usize::from(c & 0x3F) }];
+            let c = if s & 15 != 0 && (s >= 0x80 || p & 0x80 == 0) { u16::from(s) | TAG_SPRITE } else { p };
+            *o = output(&pal, bg, c);
         }
     } else {
         let mut pal = [[0u32; 64]; 3];
@@ -217,19 +236,19 @@ fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32]) {
             // Shadowed unless a high-priority cell of either plane is here, whatever its pixel.
             let mut shade = usize::from((a | b) & 0x80 == 0);
             let mut c = plane_front(b, a);
-            if s & 15 != 0 && (s >= 0x80 || c < 0x80) {
+            if s & 15 != 0 && (s >= 0x80 || c & 0x80 == 0) {
                 match s & 0x3F {
                     0x3E => shade = if shade == 1 { 0 } else { 2 },
                     0x3F => shade = 1,
                     _ => {
-                        c = s;
+                        c = u16::from(s) | TAG_SPRITE;
                         if s >= 0x80 || s & 15 == 14 {
                             shade = 0;
                         }
                     }
                 }
             }
-            *o = pal[shade][if c & 15 == 0 { bg } else { usize::from(c & 0x3F) }];
+            *o = output(&pal[shade], bg, c);
         }
     }
     if r[0] & 0x20 != 0 {
@@ -295,10 +314,16 @@ mod tests {
             self.poke(base + (row * self.hcells + col) * 2, entry);
         }
 
-        fn draw_with(&self, row: u32, sprites: &SpriteRow) -> [u32; 320] {
+        /// The row as drawn: colour and layer of every column.
+        fn raw_with(&self, row: u32, sprites: &SpriteRow) -> [u32; 320] {
             let mut out = [UNTOUCHED; 320];
             draw_row(&self.mem(), row, sprites, &mut out);
             out
+        }
+
+        /// The colours of the row (the layer byte cleared; columns not drawn stay `UNTOUCHED`).
+        fn draw_with(&self, row: u32, sprites: &SpriteRow) -> [u32; 320] {
+            self.raw_with(row, sprites).map(|c| if c == UNTOUCHED { c } else { c & 0x00FF_FFFF })
         }
 
         fn draw(&self, row: u32) -> [u32; 320] {
@@ -705,6 +730,10 @@ mod tests {
         let o = f.draw_with(0, &s);
         assert!(o[0..8].iter().all(|&c| c == f.col(7)));
         assert_eq!(o[8], f.col(5));
+        // The blanked column is the backdrop layer whatever was drawn there.
+        let o = f.raw_with(0, &s);
+        assert!(o[0..8].iter().all(|&c| c == f.col(7)));
+        assert_eq!(o[8], f.col(5) | 3 << 24);
         // The blanked column is at normal brightness in shadow mode.
         f.regs[12] = 0x89;
         f.cell(A, 0, 0, 0);
@@ -725,13 +754,99 @@ mod tests {
         let mut out = [UNTOUCHED; 320];
         let flags = render_row(&m, 0, Some(&mut out));
         for i in 0..8 {
-            assert_eq!(out[i], f.col(32 + 1 + i));
+            assert_eq!(out[i], f.col(32 + 1 + i) | 3 << 24);
         }
         assert_eq!(out[8], f.col(0));
+        assert_eq!(out[320 - 1], f.col(0));
         assert_eq!(flags, SpriteFlags::default());
         assert_eq!(render_row(&m, 0, None), flags);
         let mut out = [UNTOUCHED; 320];
         render_row(&m, 8, Some(&mut out));
         assert_eq!(out[0], f.col(0));
+    }
+
+    /// Colour and layer of an output word.
+    fn parts(px: u32) -> (u32, u32) {
+        (px & 0x00FF_FFFF, px >> 24)
+    }
+
+    #[test]
+    fn layer_of_the_winning_pixel() {
+        let mut f = Fx::new();
+        f.regs[7] = 0x2B;
+        // Cell 0: B low. Cell 1: A low over B low. Cell 2: B high over A low. Cell 3: A high over B high.
+        f.cell(B, 0, 0, 0x0002);
+        f.cell(B, 1, 0, 0x0002);
+        f.cell(A, 1, 0, 0x2003);
+        f.cell(B, 2, 0, 0x8002);
+        f.cell(A, 2, 0, 0x2003);
+        f.cell(B, 3, 0, 0x8002);
+        f.cell(A, 3, 0, 0xA003);
+        let mut s: SpriteRow = [0; 320];
+        s[1] = 0x25;
+        s[17] = 0x25;
+        s[18] = 0xA5;
+        s[41] = 0x25;
+        s[42] = 0xA5;
+        let o = f.raw_with(0, &s);
+        assert_eq!(parts(o[0]), (f.col(2), 1));
+        assert_eq!(parts(o[8]), (f.col(16 + 3), 2));
+        assert_eq!(parts(o[16]), (f.col(2), 1));
+        assert_eq!(parts(o[24]), (f.col(16 + 3), 2));
+        assert_eq!(parts(o[40]), (f.col(0x2B), 0));
+        // A low sprite over a low plane and over the backdrop, hidden behind a high plane; a high sprite in front of all.
+        assert_eq!(parts(o[1]), (f.col(0x25), 3));
+        assert_eq!(parts(o[17]), (f.col(2), 1));
+        assert_eq!(parts(o[18]), (f.col(0x25), 3));
+        assert_eq!(parts(o[41]), (f.col(0x25), 3));
+        assert_eq!(parts(o[42]), (f.col(0x25), 3));
+        // The window is the layer of plane A, at either priority.
+        f.regs[17] = 2;
+        f.cell(W, 0, 0, 0x4004);
+        f.cell(W, 2, 0, 0xC004);
+        let o = f.raw_with(0, &s);
+        assert_eq!(parts(o[0]), (f.col(32 + 4), 2));
+        assert_eq!(parts(o[16]), (f.col(32 + 4), 2));
+        assert_eq!(parts(o[17]), (f.col(32 + 4), 2));
+        assert_eq!(parts(o[18]), (f.col(0x25), 3));
+        // A transparent window pixel shows plane B.
+        assert_eq!(parts(o[8]), (f.col(2), 1));
+    }
+
+    #[test]
+    fn operators_keep_the_layer_underneath() {
+        let mut f = Fx::new();
+        f.regs[12] = 0x89;
+        f.cell(A, 0, 0, 0x0002);
+        f.cell(B, 1, 0, 0x0003);
+        f.cell(A, 2, 0, 0x8002);
+        let mut s: SpriteRow = [0; 320];
+        s[0] = 0x3E;
+        s[1] = 0x3F;
+        s[2] = 0x15;
+        s[8] = 0x3E;
+        s[9] = 0x3F;
+        s[16] = 0xBE;
+        s[17] = 0xBF;
+        s[18] = 0x95;
+        s[24] = 0x3E;
+        s[25] = 0xBF;
+        let o = f.raw_with(0, &s);
+        // Highlight and shadow over plane A, then a real sprite pixel.
+        assert_eq!(parts(o[0]), (rgb(f.cram[2], 0), 2));
+        assert_eq!(parts(o[1]), (rgb(f.cram[2], 1), 2));
+        assert_eq!(parts(o[2]), (rgb(f.cram[0x15], 1), 3));
+        assert_eq!(parts(o[3]), (rgb(f.cram[2], 1), 2));
+        // Over plane B.
+        assert_eq!(parts(o[8]), (rgb(f.cram[3], 0), 1));
+        assert_eq!(parts(o[9]), (rgb(f.cram[3], 1), 1));
+        // High-priority operators over a high plane A pixel.
+        assert_eq!(parts(o[16]), (rgb(f.cram[2], 2), 2));
+        assert_eq!(parts(o[17]), (rgb(f.cram[2], 1), 2));
+        assert_eq!(parts(o[18]), (rgb(f.cram[0x15], 0), 3));
+        // Over the backdrop.
+        assert_eq!(parts(o[24]), (rgb(f.cram[0], 0), 0));
+        assert_eq!(parts(o[25]), (rgb(f.cram[0], 1), 0));
+        assert_eq!(parts(o[26]), (rgb(f.cram[0], 1), 0));
     }
 }
