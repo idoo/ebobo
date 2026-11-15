@@ -42,6 +42,12 @@ const KNOWN_DIFF: &[(&str, &str)] = &[
     ("cpu_rate", "register, RAM, ROM, I/O, VDP and stack loops within 1-4 passes of the reference; divu, lsl #63 and mulu loops get \
                   10-13 passes fewer: the reference loses little refresh time during long internal instructions (99.5 % of the frame \
                   vs 98.3 %), ours holds 2 of every 130 cycles whatever runs; see tools/md-oracle/cpu_rate.py"),
+    ("ym_timers", "every timer A and B overflow count matches (NTSC and PAL, rates equal to 0.04 %); the busy flag reads clear after \
+                   9-10 polls in ours, 8 in the reference; the reference gives the status byte only at 0xA04000 and 0 at \
+                   0xA04001-3, ours the status at all four; see tools/md-oracle/sound_clock.py"),
+    ("z80_rate", "the plain loop and the interrupt case match within 0.1 %; a read through the bank window costs the Z80 3 T-states \
+                  more in the reference (4.35 % fewer passes), and the per-line bus request costs it 0.5 % more; see \
+                  tools/md-oracle/sound_clock.py"),
 ];
 
 /// Word 0 of the result block when the probe's `main` returned.
