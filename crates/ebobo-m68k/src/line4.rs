@@ -236,6 +236,9 @@ fn chk(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
 /// MOVEM registers to memory. Control modes: D0 first, addresses going up. -(An): A7 first (bit 0 of the list),
 /// addresses going down; An in the list stores its value from before the instruction, An is left at the last address.
 /// 8 + 4 (word) or 8 (long) for each register, plus the extension.
+///
+/// At an odd address the first write is an address error (-(An), word or long: at An - 2, An not moved). The frame's
+/// PC is 2 past the list and extension words in every mode: the chip has prefetched one word further.
 fn movem_to_mem(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let (m, r) = (mode(op), reg(op));
     let long = op & 0x0040 != 0;
@@ -243,6 +246,7 @@ fn movem_to_mem(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
         return Err(Fault::Illegal);
     }
     let list = cpu.fetch16(bus)?;
+    cpu.ae_pc = 2;
     if m == 4 {
         let mut addr = cpu.a(r);
         for i in 0..16u8 {
@@ -262,6 +266,7 @@ fn movem_to_mem(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
         return Ok(());
     }
     let mut addr = cpu.ea_addr(bus, m, r)?;
+    cpu.ae_pc = 2;
     let size = if long { Size::Long } else { Size::Word };
     for n in 0..16u8 {
         if list & (1 << n) == 0 {
@@ -275,9 +280,11 @@ fn movem_to_mem(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
 }
 
 /// MOVEM memory to registers: D0 first, addresses going up, words sign-extended into the whole register, then one more
-/// word read past the last one. (An)+ leaves An past the last one; at an odd address the first read is an address
-/// error and An is left 2 past it, as the chip has stepped it. 12 + 4 (word) or 8 (long) for each register, plus the
-/// extension.
+/// word read past the last one. (An)+ leaves An past the last one. 12 + 4 (word) or 8 (long) for each register, plus
+/// the extension.
+///
+/// At an odd address the first read is an address error: no register is loaded, An of (An)+ is not moved, the frame's
+/// PC is 2 past the list and extension words in every mode, and a PC-relative source shows the program function code.
 fn movem_to_reg(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let (m, r) = (mode(op), reg(op));
     let size = if op & 0x0040 != 0 { Size::Long } else { Size::Word };
@@ -286,9 +293,8 @@ fn movem_to_reg(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     }
     let list = cpu.fetch16(bus)?;
     let mut addr = if m == 3 { cpu.a(r) } else { cpu.ea_addr(bus, m, r)? };
-    if m == 3 && addr & 1 != 0 {
-        cpu.set_a(r, addr.wrapping_add(2));
-    }
+    cpu.ae_pc = 2;
+    cpu.ae_program = m == 7 && (r == 2 || r == 3);
     for n in 0..16u8 {
         if list & (1 << n) == 0 {
             continue;
