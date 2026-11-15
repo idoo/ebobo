@@ -1,4 +1,4 @@
-//! ROM library: folder scan, CRC index, .nes/.zip loading. Owner: canvas slice.
+//! ROM library: folder scan, CRC index, ROM file and .zip loading. Owner: canvas slice.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -8,17 +8,19 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
 
-use ebobo_core::Region;
+use ebobo_console::{Region, System};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RomEntry {
     pub path: PathBuf,
-    /// Display name: file stem without extension (zip: inner .nes stem).
+    /// Display name: file stem without extension (zip: the stem of the ROM entry inside).
     pub name: String,
-    /// PRG+CHR CRC-32 (`RomInfo::crc32`), the netplay identity.
+    pub system: System,
+    /// `RomId::crc32`, the netplay identity.
     pub crc32: u32,
+    /// NES mapper number, 0 for other systems.
     pub mapper: u16,
-    /// Mapper is in `ebobo_core::SUPPORTED_MAPPERS`.
+    /// A `Console` can run it (`false`: a NES board ebobo does not emulate).
     pub supported: bool,
     pub region: Region,
     /// When the file was last modified, seconds since the Unix epoch (0 = unknown). Orders
@@ -26,34 +28,52 @@ pub struct RomEntry {
     pub mtime: u64,
 }
 
+/// Extensions of ROM images, lower case: NES, then Mega Drive. `.bin` is used for many other
+/// things too; such a file is read like the rest and dropped when `identify` does not know it.
+const ROM_EXTS: [&str; 5] = ["nes", "md", "gen", "smd", "bin"];
+
+fn is_rom_ext(path: &Path) -> bool {
+    ext_lower(path).is_some_and(|e| ROM_EXTS.contains(&e.as_str()))
+}
+
 const MAX_ROM_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DEPTH: usize = 4;
 const MAX_FILES: usize = 5000;
 
-/// Folders scanned by default: ~/ROMs, ~/roms, ~/Games/NES, ~/Documents/ROMs, ~/Downloads,
-/// `config::data_dir()/roms`, ~/Emulation/roms/nes and every `/run/media/**/Emulation/roms/nes`
-/// (EmuDeck on Steam Deck, internal and SD card).
+/// Folders under the home directory that are scanned by default.
+const HOME_DIRS: [&str; 7] = ["ROMs", "roms", "Games/NES", "Games/Genesis", "Games/MegaDrive", "Documents/ROMs", "Downloads"];
+/// EmuDeck's folders under `Emulation/roms` (Steam Deck, internal and SD card).
+const EMUDECK_DIRS: [&str; 3] = ["Emulation/roms/nes", "Emulation/roms/genesis", "Emulation/roms/megadrive"];
+
+/// Folders scanned by default, those that exist: ~/ROMs, ~/roms, ~/Games/NES, ~/Games/Genesis,
+/// ~/Games/MegaDrive, ~/Documents/ROMs, ~/Downloads, `config::data_dir()/roms`,
+/// ~/Emulation/roms/{nes,genesis,megadrive} and the same three under every
+/// `/run/media/**/Emulation/roms/` (EmuDeck on Steam Deck, internal and SD card).
 pub fn default_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut dirs = candidate_dirs(home.as_deref(), Path::new("/run/media"));
+    let mut seen = HashSet::new();
+    dirs.retain(|d| d.is_dir() && seen.insert(d.clone()));
+    dirs
+}
+
+/// `default_dirs` before the check that a folder exists. `media` is `/run/media`.
+fn candidate_dirs(home: Option<&Path>, media: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for rel in ["ROMs", "roms", "Games/NES", "Documents/ROMs", "Downloads"] {
-            dirs.push(home.join(rel));
-        }
+    if let Some(home) = home {
+        dirs.extend(HOME_DIRS.iter().map(|rel| home.join(rel)));
         dirs.push(crate::config::data_dir().join("roms"));
-        dirs.push(home.join("Emulation/roms/nes"));
+        dirs.extend(EMUDECK_DIRS.iter().map(|rel| home.join(rel)));
     } else {
         dirs.push(crate::config::data_dir().join("roms"));
     }
-    // /run/media/<user>/<card>/Emulation/roms/nes (and /run/media/<card>/... on some setups).
-    let tail = Path::new("Emulation/roms/nes");
-    for level1 in subdirs(Path::new("/run/media")) {
-        dirs.push(level1.join(tail));
+    // <media>/<user>/<card>/Emulation/roms/<system> (and <media>/<card>/... on some setups).
+    for level1 in subdirs(media) {
+        dirs.extend(EMUDECK_DIRS.iter().map(|rel| level1.join(rel)));
         for level2 in subdirs(&level1) {
-            dirs.push(level2.join(tail));
+            dirs.extend(EMUDECK_DIRS.iter().map(|rel| level2.join(rel)));
         }
     }
-    let mut seen = HashSet::new();
-    dirs.retain(|d| d.is_dir() && seen.insert(d.clone()));
     dirs
 }
 
@@ -74,7 +94,8 @@ fn stem(path: &Path) -> String {
     path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// Reads the ROM bytes and, for a zip, the stem of the `.nes` entry inside.
+/// Reads the ROM bytes and, for a zip, the stem of the ROM entry inside: the first file with
+/// one of `ROM_EXTS`.
 fn read_rom(path: &Path) -> Result<(Vec<u8>, Option<String>), String> {
     let shown = path.display();
     let meta = fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
@@ -88,7 +109,7 @@ fn read_rom(path: &Path) -> Result<(Vec<u8>, Option<String>), String> {
             for i in 0..zip.len() {
                 let mut entry = zip.by_index(i).map_err(|e| format!("{shown}: {e}"))?;
                 let name = entry.name().to_string();
-                if !entry.is_file() || !name.to_ascii_lowercase().ends_with(".nes") {
+                if !entry.is_file() || !is_rom_ext(Path::new(&name)) {
                     continue;
                 }
                 if entry.size() > MAX_ROM_BYTES {
@@ -105,28 +126,42 @@ fn read_rom(path: &Path) -> Result<(Vec<u8>, Option<String>), String> {
                 let inner = name.rsplit(['/', '\\']).next().unwrap_or(&name);
                 return Ok((bytes, Some(stem(Path::new(inner)))));
             }
-            Err(format!("{shown}: no .nes file inside the zip"))
+            Err(format!("{shown}: no ROM file inside the zip"))
         }
         _ => fs::read(path).map(|b| (b, None)).map_err(|e| format!("{shown}: {e}")),
     }
 }
 
-/// Reads a ROM file: `.nes` as is, `.zip` = first `.nes` entry inside.
+/// Reads a ROM file: `.nes`, `.md`, `.gen`, `.smd`, `.bin` as is, `.zip` = the first entry
+/// inside with one of those extensions.
 pub fn load_rom_file(path: &Path) -> Result<Vec<u8>, String> {
     read_rom(path).map(|(bytes, _)| bytes)
 }
 
+/// The library entry of a file's bytes; an error when `ebobo_console::identify` does not know
+/// them as a ROM.
 fn make_entry(path: &Path, bytes: &[u8], inner_stem: Option<String>, mtime: u64) -> Result<RomEntry, String> {
-    let info = ebobo_core::cart::parse(bytes).map_err(|e| format!("{}: {e:?}", path.display()))?;
+    let id = ebobo_console::identify(bytes).ok_or_else(|| format!("{}: not a ROM", path.display()))?;
     Ok(RomEntry {
         path: path.to_path_buf(),
         name: inner_stem.unwrap_or_else(|| stem(path)),
-        crc32: info.crc32,
-        mapper: info.mapper,
-        supported: ebobo_core::SUPPORTED_MAPPERS.contains(&info.mapper),
-        region: info.region,
+        system: id.system,
+        crc32: id.crc32,
+        mapper: id.mapper,
+        supported: id.supported,
+        region: id.region,
         mtime,
     })
+}
+
+/// `RomEntry::supported` of a cached row, by this build's rules (the cache may be older than
+/// the build): a NES game when its mapper is emulated; `identify` names other systems only
+/// when they run.
+fn supported(system: System, mapper: u16) -> bool {
+    match system {
+        System::Nes => ebobo_console::nes::SUPPORTED_MAPPERS.contains(&mapper),
+        System::MegaDrive => true,
+    }
 }
 
 /// Modification time as the cache stores it: nanoseconds since the Unix epoch, 0 = unknown.
@@ -153,29 +188,59 @@ fn insert_sorted(list: &mut Vec<RomEntry>, entry: RomEntry) {
     list.insert(at, entry);
 }
 
+/// First line of the cache file. A file that starts with anything else was written by a build
+/// with another row format (or another idea of what a ROM is): it is ignored and rebuilt.
+const CACHE_HEADER: &str = "ebobo library cache 2";
+
+/// What the cache keeps of a ROM.
+#[derive(Clone)]
+struct CachedRom {
+    name: String,
+    system: System,
+    crc32: u32,
+    mapper: u16,
+    region: Region,
+}
+
 /// One cache row: file identity (size + mtime) → parse result (`None` = not a ROM).
 #[derive(Clone)]
 struct CacheRow {
     size: u64,
     mtime: u128,
-    rom: Option<(String, u32, u16, Region)>,
+    rom: Option<CachedRom>,
 }
 
+/// Rows of the cache file: `CACHE_HEADER`, then one line per file of tab-separated path, size,
+/// mtime (nanoseconds), CRC-32 (hex), system (`nes`, `md`), mapper, region (`N`, `P`, `J`) and
+/// name; a file that is not a ROM has `-` in the last five.
 fn load_cache(path: &Path) -> HashMap<PathBuf, CacheRow> {
     let mut map = HashMap::new();
     let Ok(text) = fs::read_to_string(path) else { return map };
-    for line in text.lines() {
+    let mut lines = text.lines();
+    if lines.next() != Some(CACHE_HEADER) {
+        return map;
+    }
+    for line in lines {
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 7 {
+        if f.len() != 8 {
             continue;
         }
         let (Ok(size), Ok(mtime)) = (f[1].parse(), f[2].parse()) else { continue };
         let rom = if f[3] == "-" {
             None
         } else {
-            let (Ok(crc), Ok(mapper)) = (u32::from_str_radix(f[3], 16), f[4].parse()) else { continue };
-            let region = if f[5] == "P" { Region::Pal } else { Region::Ntsc };
-            Some((f[6].to_string(), crc, mapper, region))
+            let (Ok(crc32), Ok(mapper)) = (u32::from_str_radix(f[3], 16), f[5].parse()) else { continue };
+            let system = match f[4] {
+                "nes" => System::Nes,
+                "md" => System::MegaDrive,
+                _ => continue,
+            };
+            let region = match f[6] {
+                "P" => Region::Pal,
+                "J" => Region::Japan,
+                _ => Region::Ntsc,
+            };
+            Some(CachedRom { name: f[7].to_string(), system, crc32, mapper, region })
         };
         map.insert(PathBuf::from(f[0]), CacheRow { size, mtime, rom });
     }
@@ -183,19 +248,27 @@ fn load_cache(path: &Path) -> HashMap<PathBuf, CacheRow> {
 }
 
 fn save_cache(path: &Path, rows: &HashMap<PathBuf, CacheRow>) {
-    let mut text = String::new();
+    let mut text = format!("{CACHE_HEADER}\n");
     for (p, row) in rows {
         let Some(ps) = p.to_str() else { continue };
         let clean = |s: &str| !s.contains(['\t', '\n', '\r']);
-        if !clean(ps) || row.rom.as_ref().is_some_and(|r| !clean(&r.0)) {
+        if !clean(ps) || row.rom.as_ref().is_some_and(|r| !clean(&r.name)) {
             continue;
         }
         match &row.rom {
-            Some((name, crc, mapper, region)) => {
-                let r = if *region == Region::Pal { "P" } else { "N" };
-                text.push_str(&format!("{ps}\t{}\t{}\t{crc:08x}\t{mapper}\t{r}\t{name}\n", row.size, row.mtime));
+            Some(CachedRom { name, system, crc32, mapper, region }) => {
+                let s = match system {
+                    System::Nes => "nes",
+                    System::MegaDrive => "md",
+                };
+                let r = match region {
+                    Region::Ntsc => "N",
+                    Region::Pal => "P",
+                    Region::Japan => "J",
+                };
+                text.push_str(&format!("{ps}\t{}\t{}\t{crc32:08x}\t{s}\t{mapper}\t{r}\t{name}\n", row.size, row.mtime));
             }
-            None => text.push_str(&format!("{ps}\t{}\t{}\t-\t-\t-\t-\n", row.size, row.mtime)),
+            None => text.push_str(&format!("{ps}\t{}\t{}\t-\t-\t-\t-\t-\n", row.size, row.mtime)),
         }
     }
     if let Some(dir) = path.parent() {
@@ -279,12 +352,18 @@ impl Shared {
                     _ => CacheRow {
                         size,
                         mtime,
-                        rom: self.read_entry(&path).ok().map(|e| (e.name, e.crc32, e.mapper, e.region)),
+                        rom: self.read_entry(&path).ok().map(|e| CachedRom {
+                            name: e.name,
+                            system: e.system,
+                            crc32: e.crc32,
+                            mapper: e.mapper,
+                            region: e.region,
+                        }),
                     },
                 };
-                if let Some((name, crc32, mapper, region)) = row.rom.clone() {
-                    let supported = ebobo_core::SUPPORTED_MAPPERS.contains(&mapper);
-                    let entry = RomEntry { path: path.clone(), name, crc32, mapper, supported, region, mtime: mtime_secs(mtime) };
+                if let Some(CachedRom { name, system, crc32, mapper, region }) = row.rom.clone() {
+                    let supported = supported(system, mapper);
+                    let entry = RomEntry { path: path.clone(), name, system, crc32, mapper, supported, region, mtime: mtime_secs(mtime) };
                     add(entry, &mut found);
                 }
                 new_cache.insert(path, row);
@@ -299,7 +378,8 @@ impl Shared {
     }
 }
 
-/// Collects `.nes`/`.zip` files ≤ 8 MiB under `dir` in name order, depth-first.
+/// Collects files with a ROM extension (`ROM_EXTS`) or `.zip`, ≤ 8 MiB, under `dir` in name
+/// order, depth-first.
 fn collect_files(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, u64, u128)>, budget: &mut usize) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     let mut items: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
@@ -318,7 +398,7 @@ fn collect_files(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, u64, u128)>, 
                 collect_files(&path, depth + 1, out, budget);
             }
         } else if meta.is_file()
-            && matches!(ext_lower(&path).as_deref(), Some("nes" | "zip"))
+            && (is_rom_ext(&path) || ext_lower(&path).as_deref() == Some("zip"))
             && meta.len() <= MAX_ROM_BYTES
         {
             *budget -= 1;
@@ -327,10 +407,11 @@ fn collect_files(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, u64, u128)>, 
     }
 }
 
-/// Background-scanned list of ROMs. Scan: recursive (depth ≤ 4), `.nes` and `.zip` files
-/// ≤ 8 MiB, ≤ 5000 files, entries sorted by name, unparseable files skipped. A cache file in
-/// `config::data_dir()` (path, size, mtime → crc/mapper/region) makes rescans fast. Cloning is
-/// cheap and shares the same list (the netplay guest lookup holds a clone).
+/// Background-scanned list of ROMs. Scan: recursive (depth ≤ 4), ROM (`ROM_EXTS`) and `.zip`
+/// files ≤ 8 MiB, ≤ 5000 files, entries sorted by name, files that are not ROMs skipped. A
+/// cache file in `config::data_dir()` (path, size, mtime → crc/system/mapper/region) makes
+/// rescans fast. Cloning is cheap and shares the same list (the netplay guest lookup holds a
+/// clone).
 #[derive(Clone)]
 pub struct Library {
     shared: Arc<Shared>,
@@ -458,7 +539,7 @@ mod tests {
     }
 
     fn crc(bytes: &[u8]) -> u32 {
-        ebobo_core::cart::parse(bytes).unwrap().crc32
+        ebobo_console::identify(bytes).unwrap().crc32
     }
 
     #[test]
@@ -594,12 +675,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A cache file written before entries carried a date (seven tab-separated fields, mtime
-    /// in nanoseconds) is still used: its rows are trusted without reading the files, and the
-    /// entry's date comes from the file.
+    /// A cache file's rows are trusted without reading the files (here the file is not a ROM
+    /// at all); the entry's date comes from the file.
     #[test]
-    fn library_cache_from_an_older_build_still_loads() {
-        let root = temp_dir("oldcache");
+    fn library_cache_rows_are_used_without_reading_files() {
+        let root = temp_dir("cacherows");
         let dir = root.join("roms");
         fs::create_dir_all(&dir).unwrap();
         // Not a ROM at all: the entry can only come from the cache row.
@@ -609,7 +689,7 @@ mod tests {
         let gone = dir.join("gone.nes");
         let cache = root.join("library-cache.tsv");
         let text = format!(
-            "{}\t10\t1794600000000000000\t0123abcd\t4\tP\tCached Game (Europe)\n{}\t5\t7\t-\t-\t-\t-\n",
+            "{CACHE_HEADER}\n{}\t10\t1794600000000000000\t0123abcd\tnes\t4\tP\tCached Game (Europe)\n{}\t5\t7\t-\t-\t-\t-\t-\n",
             path.display(),
             gone.display()
         );
@@ -623,13 +703,105 @@ mod tests {
             [RomEntry {
                 path,
                 name: "Cached Game (Europe)".into(),
+                system: System::Nes,
                 crc32: 0x0123_abcd,
                 mapper: 4,
-                supported: ebobo_core::SUPPORTED_MAPPERS.contains(&4),
+                supported: ebobo_console::nes::SUPPORTED_MAPPERS.contains(&4),
                 region: Region::Pal,
                 mtime: 1_794_600_000,
             }]
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A cache file written by a build before the systems column (no header line, seven
+    /// fields) is ignored: the file is read again and the cache is rewritten in today's format.
+    #[test]
+    fn library_cache_from_an_older_build_is_ignored() {
+        let root = temp_dir("oldcache");
+        let dir = root.join("roms");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("whatever.nes");
+        fs::write(&path, b"0123456789").unwrap();
+        set_mtime(&path, 1_794_600_000);
+        let cache = root.join("library-cache.tsv");
+        let old = format!("{}\t10\t1794600000000000000\t0123abcd\t4\tP\tCached Game (Europe)\n", path.display());
+        fs::write(&cache, &old).unwrap();
+        assert!(load_cache(&cache).is_empty());
+
+        let lib = Library::with_cache(vec![dir], cache.clone());
+        wait(&lib);
+        assert_eq!(lib.shared.reads.load(Ordering::Relaxed), 1, "the old row is not trusted, the file is read");
+        assert_eq!(lib.entries(), []);
+        let written = fs::read_to_string(&cache).unwrap();
+        assert_eq!(written, format!("{CACHE_HEADER}\n{}\t10\t1794600000000000000\t-\t-\t-\t-\t-\n", path.display()));
+        assert_eq!(load_cache(&cache).len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A system and a region other than the NES defaults survive the cache file.
+    #[test]
+    fn library_cache_keeps_system_and_region() {
+        let root = temp_dir("cachecols");
+        let cache = root.join("library-cache.tsv");
+        let rom = CachedRom { name: "Sonic (Japan)".into(), system: System::MegaDrive, crc32: 0xdead_beef, mapper: 0, region: Region::Japan };
+        let rows = HashMap::from([(root.join("Sonic.md"), CacheRow { size: 3, mtime: 9, rom: Some(rom) })]);
+        save_cache(&cache, &rows);
+        let back = load_cache(&cache);
+        let row = &back[&root.join("Sonic.md")];
+        let got = row.rom.as_ref().unwrap();
+        assert_eq!((row.size, row.mtime), (3, 9));
+        assert_eq!((got.name.as_str(), got.system, got.crc32, got.mapper, got.region), ("Sonic (Japan)", System::MegaDrive, 0xdead_beef, 0, Region::Japan));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Mega Drive images are picked up by extension, read and, while the Mega Drive core is
+    /// not playable (`ebobo_md::PLAYABLE` is false, so `identify` does not name them), skipped
+    /// without an error; the NES game next to them is listed.
+    #[test]
+    fn library_mega_drive_image_is_skipped_for_now() {
+        let root = temp_dir("md");
+        let mut image = vec![0u8; 0x400];
+        image[0x100..0x110].copy_from_slice(b"SEGA MEGA DRIVE ");
+        assert_eq!(ebobo_console::identify(&image), None);
+        for name in ["Sonic.md", "Sonic.gen", "Sonic.SMD", "Sonic.bin"] {
+            fs::write(root.join(name), &image).unwrap();
+        }
+        zip_with(&root.join("Sonic.zip"), "Sonic (World).md", &image);
+        fs::write(root.join("firmware.bin"), b"something else entirely").unwrap();
+        fs::write(root.join("Mario.nes"), rom(0, false, 1)).unwrap();
+        assert_eq!(load_rom_file(&root.join("Sonic.zip")).unwrap(), image, "a zip gives its ROM entry whatever the system");
+
+        let lib = Library::with_cache(vec![root.clone()], root.join("cache/library-cache.tsv"));
+        wait(&lib);
+        let names: Vec<String> = lib.entries().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["Mario"]);
+        assert_eq!(lib.entries()[0].system, System::Nes);
+        assert_eq!(lib.shared.reads.load(Ordering::Relaxed), 7, "every file with a ROM extension is read once");
+        // The answer "not a ROM" is cached like any other.
+        lib.rescan();
+        wait(&lib);
+        assert_eq!(lib.shared.reads.load(Ordering::Relaxed), 7);
+        assert!(lib.add_file(&root.join("Sonic.md")).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn library_default_dirs_cover_mega_drive() {
+        let root = temp_dir("dirs");
+        let (home, media) = (root.join("home"), root.join("media"));
+        fs::create_dir_all(media.join("deck/card")).unwrap();
+        let dirs = candidate_dirs(Some(&home), &media);
+        for rel in ["Games/NES", "Games/Genesis", "Games/MegaDrive", "Emulation/roms/nes", "Emulation/roms/genesis", "Emulation/roms/megadrive"] {
+            assert!(dirs.contains(&home.join(rel)), "{rel}");
+        }
+        for system in ["nes", "genesis", "megadrive"] {
+            let rel = Path::new("Emulation/roms").join(system);
+            assert!(dirs.contains(&media.join("deck").join(&rel)), "{system} on a card mounted at the first level");
+            assert!(dirs.contains(&media.join("deck/card").join(&rel)), "{system} on a card mounted under the user");
+        }
+        // Without a home folder only the data folder and the cards are left.
+        assert!(!candidate_dirs(None, &media).iter().any(|d| d.starts_with(&home)));
         let _ = fs::remove_dir_all(&root);
     }
 }

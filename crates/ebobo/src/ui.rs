@@ -1523,7 +1523,7 @@ impl Ui {
             let e = &lib[i];
             let (tag, tag_col) = if !e.supported {
                 (format!("{} {}", self.t(S::Unsupported), e.mapper), DIS)
-            } else if e.region == ebobo_core::Region::Pal {
+            } else if e.region.is_pal() {
                 ("PAL".to_string(), if selected { WHITE } else { WARN })
             } else {
                 (String::new(), SEC)
@@ -2171,14 +2171,14 @@ fn draw_glyph(c: &mut Canvas, f: &mut Font, x: i32, y: i32, kind: Option<PadKind
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ebobo_core::Region;
+    use ebobo_console::{Region, System};
     use ebobo_net::{PeerId, PlayerInfo};
     use std::path::PathBuf;
 
     const DT: Duration = Duration::from_millis(16);
 
     fn entry(name: &str, supported: bool, region: Region) -> RomEntry {
-        RomEntry { path: PathBuf::from(format!("/r/{name}.nes")), name: name.into(), crc32: 1, mapper: if supported { 1 } else { 90 }, supported, region, mtime: 0 }
+        RomEntry { path: PathBuf::from(format!("/r/{name}.nes")), name: name.into(), system: System::Nes, crc32: 1, mapper: if supported { 1 } else { 90 }, supported, region, mtime: 0 }
     }
 
     /// A build of `name` dated `unix_secs`, in its own folder (as received ROMs are).
