@@ -28,8 +28,9 @@ sha256() {
 # "SEGA" somewhere in the 16-byte console name at 0x100.
 has_sega() { dd if="$1" bs=1 skip=256 count=16 2>/dev/null | LC_ALL=C grep -q SEGA; }
 
-# The domestic game name of the header (48 bytes at 0x120), trailing blanks cut.
-header_name() { dd if="$1" bs=1 skip=288 count=48 2>/dev/null | LC_ALL=C tr -c '[:print:]' ' ' | sed 's/ *$//'; }
+# The overseas game name of the header (48 bytes at 0x150), trailing blanks cut. The domestic name at 0x120 is
+# often Shift-JIS and prints as noise.
+header_name() { dd if="$1" bs=1 skip=336 count=48 2>/dev/null | LC_ALL=C tr -c '[:print:]' ' ' | sed 's/ *$//'; }
 
 # fetch_one NAME URL SHA [ZIP_MEMBER]: prints one status line; non-zero when the file is not in DEST afterwards.
 fetch_one() {
@@ -96,7 +97,7 @@ sgdk-flash-save.bin	$SGDK/flash-save/out/rom.bin	b5814e4a2e5a59ee48619d733aede5d
 sgdk-console.bin	$SGDK/sys/console/out/rom.bin	698a116ac77a8c411b45752c5b938455f31778bb3e5b7180b2367cb5248e83e4
 # Cave Story MD 0.8.8 (English): fan port by andwn of Pixel's freeware game, free release by the author; battery RAM, 6-button pad, FM+PSG+PCM, 4 MB; https://github.com/andwn/cave-story-md/releases/tag/v0.8.8
 cave-story-md.gen	https://github.com/andwn/cave-story-md/releases/download/v0.8.8/doukutsu-en.gen	053ed9009b47512972d7fd0954f3c251774422be8be6eb8df90f39fe22b50061
-# KleleAtoms MD 1.2.1: puzzle/strategy game for up to four players by Nightwolf-47; MIT; https://github.com/Nightwolf-47/KleleAtoms-MD/releases/tag/v1.2.1
+# KleleAtoms MD 1.2.1: puzzle/strategy game for 1-4 players by Nightwolf-47, one pad per human through a multitap, Mega Mouse; MIT; https://github.com/Nightwolf-47/KleleAtoms-MD/releases/tag/v1.2.1
 kleleatoms.bin	https://github.com/Nightwolf-47/KleleAtoms-MD/releases/download/v1.2.1/kleleatoms-md-121.bin	d0660df5af9d39696272b0c6774f25f296ee38e86eacf8b52645eab3ea8b003a
 # Miniplanets REMIX (REV04): puzzle platformer by Sik (Javier Degirolmo); zlib licence, ROM in the author's repository; https://github.com/sikthehedgehog/miniplanets
 miniplanets.bin	$SIK/miniplanets/0ac9c395289cc5d0837c96d45e61a27300e8eebc/Miniplanets%20REMIX%20Ver%20(REV04).bin	e8aee1b9fedca87b638a7624709d7f6e1a2aff8a5222083346d1cd63963acbe7
