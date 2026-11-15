@@ -2,6 +2,8 @@
 # Builds every probe (*.s except rt.s) into out/<name>.bin with the cross tools of the Docker
 # image `ebobo-md-probes` (docker build -t ebobo-md-probes tools/md-oracle/probes).
 # Each image is padded with 0xFF to a multiple of 512 bytes, at least 1024.
+# A source with a `| standalone` line among its first three has its own vectors, header and
+# start-up and is linked without rt.o.
 set -eu
 cd "$(dirname "$0")"
 docker run --rm -v "$PWD":/work -w /work ebobo-md-probes sh -c '
@@ -13,7 +15,8 @@ for src in *.s; do
     name=${src%.s}
     if [ "$name" = rt ]; then continue; fi
     $AS -o build/$name.o $src
-    m68k-linux-gnu-ld -T link.ld -o build/$name.elf build/rt.o build/$name.o
+    if head -3 $src | grep -q "^| standalone"; then rt=; else rt=build/rt.o; fi
+    m68k-linux-gnu-ld -T link.ld -o build/$name.elf $rt build/$name.o
     m68k-linux-gnu-objcopy -O binary build/$name.elf out/$name.bin
     python3 -c "
 import sys
