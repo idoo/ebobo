@@ -69,6 +69,17 @@ python3 tools/md-oracle/compare.py ROM [ROM ...] [--frames 600] [--at 60,120,300
   Exit code 1 when any ROM is not `same` or `close`.
 - `OUT/<stem>/diff_NNNNNN.png`: reference, ours and a mask (dimmed reference; red = differs, dark red = one step apart).
 
+## A drawing difference, or the same picture early: `phase.py`
+
+```sh
+python3 tools/md-oracle/phase.py ROM --at 120,300 [--span 4] [--input FILE] [--region R] [--ours PATH]
+```
+
+Compares ebobo's picture at each frame with the reference's pictures `--span` frames either side. A program that waits on
+something that takes slightly longer in one emulator is a whole frame or more apart from then on: every picture is right,
+only early or late. `same picture, ours 2 frame(s) ahead` is that case; `differs at every offset` is a drawing difference
+(exit code 1). Run it on every `different` verdict of `compare.py` before looking for a drawing bug.
+
 ## Licence
 
 Genesis Plus GX is not part of this repository. It is under a non-commercial licence. `fetch-core` downloads the
