@@ -113,6 +113,9 @@ pub struct Cpu {
     pub(crate) ae_program: bool,
     /// A long (An)+: the register and its value before the step, put back when the access faults.
     pub(crate) ae_restore: Option<(u8, u32)>,
+    /// The instruction register the frame shows when it is not this instruction's opcode (the
+    /// chip had already prefetched the next one); set by an instruction before it returns the fault.
+    pub(crate) ae_ir: Option<u16>,
 }
 
 /// Cycles of bus traffic inside [`Cpu::exception`]: three words pushed, two read.
@@ -152,7 +155,7 @@ impl Cpu {
             return 4;
         }
         self.cyc = 0;
-        (self.ae_pc, self.ae_program, self.ae_restore) = (0, false, None);
+        (self.ae_pc, self.ae_program, self.ae_restore, self.ae_ir) = (0, false, None, None);
 
         if self.trace_pending {
             self.trace_pending = false;
@@ -291,6 +294,7 @@ impl Cpu {
     /// before it, its opcode fetch not counted; an instruction whose frame differs moves `pc` or `cyc` before it
     /// returns the fault.
     fn address_error(&mut self, bus: &mut impl Bus, addr: u32, write: bool, program: bool, op: u16, in_exception: bool) -> Res<()> {
+        let op = self.ae_ir.take().unwrap_or(op);
         let (pc, program_space, cycles) = if program {
             (self.pc.wrapping_sub(2), true, self.cyc.max(4) + 46)
         } else {
