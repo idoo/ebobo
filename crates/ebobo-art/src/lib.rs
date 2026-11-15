@@ -13,6 +13,7 @@
 //! - `names.rs`: the names database (parse, lookup, where to download it and the pictures).
 //! - `image.rs`: PNG in and out, shrinking. `net.rs`: downloading through the system `curl`.
 //! - `title.rs`: capturing a title screen from a ROM.
+//! - `shelf.rs`: favourites, play history, and the filtered, sorted view of the library.
 //! - `lib.rs`: the [`Art`] service: queue, background thread, disk and memory caches.
 
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ pub use ebobo_console::System;
 pub mod image;
 pub mod names;
 pub mod net;
+pub mod shelf;
 pub mod title;
 
 /// Largest side of a cached picture, in pixels: a card is never drawn larger.
