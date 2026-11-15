@@ -4,7 +4,7 @@ A NES and Sega Mega Drive / Genesis emulator for playing with friends over the i
 
 It uses rollback netcode, like fighting games do. A bad connection makes a sprite jump now and then, and the game never slows down. The input delay follows the connection during the game: up to three frames on a slow link, the rest is rollback. If the Wi-Fi drops or a phone hotspot switches networks mid-game, ebobo reroutes through the server within a few seconds, goes back to a direct link when one works again, and waits up to 20 seconds for a player to come back. IPv6 is used when both sides have it, which gets many mobile connections a direct link.
 
-No games included. Bring your own ROMs.
+No games included. Bring your own ROMs. The Mega Drive core is new and so far checked on free homebrew and demos only: if a game misbehaves, open an issue.
 
 ## Install
 
