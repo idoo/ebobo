@@ -1,13 +1,88 @@
 //! Lines 1, 2, 3 and 7: MOVE and MOVEA (byte, long, word) and MOVEQ.
 
-use crate::core::{Fault, Res, Size, reg9};
+use crate::core::{Ea, Fault, Res, Size, mode, reg, reg9};
 use crate::{Bus, Cpu};
 
-pub(crate) fn exec(cpu: &mut Cpu, _bus: &mut impl Bus, op: u16) -> Res<()> {
+pub(crate) fn exec(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     match op >> 12 {
+        1 => mov(cpu, bus, op, Size::Byte),
+        2 => mov(cpu, bus, op, Size::Long),
+        3 => mov(cpu, bus, op, Size::Word),
         // Bit 8 of a line 7 opcode is always 0.
         7 if op & 0x0100 == 0 => moveq(cpu, op),
         _ => Err(Fault::Illegal),
+    }
+}
+
+/// MOVE <ea>,<ea> and MOVEA <ea>,An. The source is read, then the destination address is worked out, then the value
+/// is written. MOVE: N and Z from the value, V and C cleared, X kept. MOVEA (destination mode 1, word or long): the
+/// word is sign-extended, the whole register is written, no flag changes.
+/// Cycles: only the bus accesses and the 2 of an indexed mode or of a -(An) source, which the helpers charge.
+///
+/// What an odd destination (address error on the write) shows of the chip's order:
+/// - (An)+ is stepped only after the write: a faulting write leaves An as it was.
+/// - -(An): the prefetch of the next opcode (4 cycles) comes before the write, so the stacked PC is one word further
+///   on; a long goes out low word first, and An has been stepped by 2 only when that word faults.
+/// - (xxx).l after a memory source: the low address word is taken from the prefetch queue, and its bus read (and
+///   `pc` passing it) comes only after the write.
+fn mov(cpu: &mut Cpu, bus: &mut impl Bus, op: u16, size: Size) -> Res<()> {
+    let (smode, sreg) = (mode(op), reg(op));
+    let dmode = ((op >> 6) & 7) as u8;
+    let dreg = reg9(op);
+    let byte = matches!(size, Size::Byte);
+    // No byte from or to an address register; the destination is never PC-relative or immediate.
+    if (byte && (smode == 1 || dmode == 1)) || (dmode == 7 && dreg > 1) || (smode == 7 && sreg > 4) {
+        return Err(Fault::Illegal);
+    }
+    let src = cpu.ea(bus, smode, sreg, size)?;
+    let val = cpu.load(bus, src, size)?;
+    if dmode == 1 {
+        cpu.set_a(dreg, size.sext(val));
+        return Ok(());
+    }
+    let late_ext = dmode == 7 && dreg == 1 && matches!(src, Ea::Mem(_));
+    let dst = if late_ext {
+        let hi = u32::from(cpu.fetch16(bus)?);
+        // Already in the prefetch queue: no bus cycle until the queue is refilled after the write.
+        let lo = u32::from(bus.read16(cpu.pc & 0x00FF_FFFF));
+        Ea::Mem(hi << 16 | lo)
+    } else {
+        let before = cpu.a(dreg);
+        let dst = cpu.ea_plain(bus, dmode, dreg, size)?;
+        if dmode == 3 {
+            cpu.set_a(dreg, before);
+        }
+        dst
+    };
+    cpu.nz(val, size);
+    match dst {
+        Ea::Mem(addr) if dmode == 4 => {
+            let written = if matches!(size, Size::Long) {
+                cpu.write(bus, addr.wrapping_add(2), Size::Word, val & 0xFFFF)
+                    .inspect_err(|_| cpu.set_a(dreg, addr.wrapping_add(2)))
+                    .and_then(|()| cpu.write(bus, addr, Size::Word, val >> 16))
+            } else {
+                cpu.store(bus, dst, size, val)
+            };
+            written.inspect_err(|_| {
+                cpu.pc = cpu.pc.wrapping_add(2);
+                cpu.cyc += 4;
+            })
+        }
+        Ea::Mem(_) if dmode == 3 => {
+            cpu.store(bus, dst, size, val)?;
+            // A byte on A7 steps by 2, which keeps the stack even.
+            let by = if byte && dreg == 7 { 2 } else { size.bytes() };
+            cpu.set_a(dreg, cpu.a(dreg).wrapping_add(by));
+            Ok(())
+        }
+        _ => {
+            cpu.store(bus, dst, size, val)?;
+            if late_ext {
+                cpu.fetch16(bus)?;
+            }
+            Ok(())
+        }
     }
 }
 
