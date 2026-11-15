@@ -303,8 +303,8 @@ impl Cpu {
         let old = self.sr;
         self.sr = (old | sr::S) & !sr::T;
         let function_code = if old & sr::S != 0 { 4 } else { 0 } | if program_space { 2 } else { 1 };
-        // A fetch from an odd address (the target of a jump, branch or return) shows as "not an instruction" too.
-        let status = (op & 0xFFE0) | (u16::from(!write) << 4) | (u16::from(in_exception || program) << 3) | function_code;
+        // Bit 3 is set only for a fault during exception processing: a fetch from an odd jump target has it clear.
+        let status = (op & 0xFFE0) | (u16::from(!write) << 4) | (u16::from(in_exception) << 3) | function_code;
         self.push32(bus, pc)?;
         self.push16(bus, old)?;
         self.push16(bus, op)?;

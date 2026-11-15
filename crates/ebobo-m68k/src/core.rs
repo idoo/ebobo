@@ -971,7 +971,7 @@ mod tests {
         assert_eq!(cpu.step(&mut bus), 50);
         assert_eq!((cpu.pc, cpu.ssp, cpu.sr), (0x1030, 0x8000 - 14, 0x2700));
         let sp = cpu.ssp;
-        assert_eq!(bus.r16(sp), 0x001E); // read, not an instruction, supervisor program
+        assert_eq!(bus.r16(sp), 0x0016); // read, supervisor program
         assert_eq!(bus.r32(sp + 2), 0x401); // access address
         assert_eq!(bus.r16(sp + 6), 0); // instruction register: nothing was fetched
         assert_eq!(bus.r16(sp + 8), 0x2700); // SR
