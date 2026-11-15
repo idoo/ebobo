@@ -59,14 +59,16 @@ const fn at_h(hc: u32, h40: bool) -> u32 {
 }
 
 /// Horizontal blanking flag: set from `hblank_start` to the end of the line and from the
-/// start of the next to `hblank_end` (H counter 0x93 to 0x05, 0xB3 to 0x06 in 320-pixel mode).
+/// start of the next to `hblank_end` (H counter 0x8F to 0x01 in the 256-pixel mode, 0xAF to 0x01
+/// in the 320-pixel mode). Measured against the reference with the `blank_edges` probe; the
+/// documented 0x93/0xB3 to 0x05/0x06 read about 4 H counts late on both edges in both widths.
 pub fn hblank_start(h40: bool) -> u32 {
-    at_h(if h40 { 0xB3 } else { 0x93 }, h40)
+    at_h(if h40 { 0xAF } else { 0x8F }, h40)
 }
 
 /// See [`hblank_start`].
 pub fn hblank_end(h40: bool) -> u32 {
-    at_h(if h40 { 0x06 } else { 0x05 }, h40)
+    at_h(0x01, h40)
 }
 
 /// Where on the first line of vertical blanking the vertical interrupt is requested

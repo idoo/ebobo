@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 const KNOWN_DIFF: &[(&str, &str)] = &[
     ("frame_cycles", "access timing inside an instruction (2 passes in 4202)"),
     ("vcounter", "H counter spacing: access timing inside an instruction"),
-    ("blank_edges", "H-blank flag edges and HV sample spacing: access timing inside an instruction, H-blank edges open"),
+    ("blank_edges", "H-blank flag edges (both widths) agree on average within 0.5 H count over 12 lines each; single words differ by \
+                    about 2 H counts, or by one poll-loop period (6-8) where the poll's phase lands on the other side of the edge: \
+                    HV sample spacing, access timing inside an instruction"),
     ("hint_lines", "register 10 = 0, first setting right after start-up: ours takes an extra request at V = 0xFF; hint_pend shows latching across blanking matches, so the cause is in the start-up frame (open)"),
     ("hint_pend", "counts and V bytes match; only H counter bytes differ: access timing inside an instruction"),
     ("fifo_rate", "one write slot off at the start: FIFO slot timing"),
