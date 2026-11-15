@@ -45,9 +45,10 @@ const KNOWN_DIFF: &[(&str, &str)] = &[
     ("ym_timers", "every timer A and B overflow count matches (NTSC and PAL, rates equal to 0.04 %); the busy flag reads clear after \
                    9-10 polls in ours, 8 in the reference; the reference gives the status byte only at 0xA04000 and 0 at \
                    0xA04001-3, ours the status at all four; see tools/md-oracle/sound_clock.py"),
-    ("z80_rate", "the plain loop and the interrupt case match within 0.1 %; a read through the bank window costs the Z80 3 T-states \
-                  more in the reference (4.35 % fewer passes), and the per-line bus request costs it 0.5 % more; see \
-                  tools/md-oracle/sound_clock.py"),
+    ("z80_rate", "the plain loop, the bank-window loop (3 wait T-states a window access) and the interrupt case match within 0.1 %; \
+                  with the bus requested once a line ours runs 0.5 % more passes. A delay before the Z80 runs again moves this \
+                  in a step (+0.52 % up to 9 master clocks, -0.17 % from 10), a phase lock with the 68000's poll, not a rate; \
+                  see tools/md-oracle/sound_clock.py"),
 ];
 
 /// Word 0 of the result block when the probe's `main` returned.

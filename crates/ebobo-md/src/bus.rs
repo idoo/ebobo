@@ -99,11 +99,17 @@ pub(crate) struct Machine {
     /// runs in slices; every access that could see or change what it does catches it up first.
     /// Derived, not state: 0 after power-on and after state loads.
     pub z80_due: u64,
+    /// T-states the Z80's current instruction waited for the 68000's bus (window accesses),
+    /// added to its time when the instruction ends. Always 0 between instructions: not state.
+    pub z80_wait: u32,
 }
 
 const CART_END: u32 = 0x40_0000;
 /// Longest the Z80 runs behind the 68000: one line of master clocks.
 const Z80_SLICE: u64 = 3420;
+/// T-states a Z80 access through the bank window waits for the 68000's bus (measured: probe
+/// `z80_rate` case b, 69 T-states a pass take as long as 72).
+const Z80_WINDOW_WAIT: u32 = 3;
 const RAM_START: u32 = 0xE0_0000;
 
 /// Cartridge and work RAM: the 68000 memory that a DMA and the Z80's window read.
@@ -175,7 +181,8 @@ impl Machine {
             m68k_refresh: 0,
         };
         let audio = AudioOut::new(if pal { MCLK_PAL } else { MCLK_NTSC });
-        let mut machine = Machine { s, cart, screen: Screen::new(), audio, output: true, vdp_due: 0, z80_due: 0 };
+        let mut machine =
+            Machine { s, cart, screen: Screen::new(), audio, output: true, vdp_due: 0, z80_due: 0, z80_wait: 0 };
         machine.reset_m68k();
         machine
     }
@@ -243,7 +250,7 @@ impl Machine {
             cpu.irq = self.s.vdp.z80_irq();
             let t_states = cpu.step(&mut Z80View(self));
             self.s.z80 = cpu;
-            self.s.z80_now += u64::from(t_states) * Z80_DIV;
+            self.s.z80_now += u64::from(t_states + std::mem::take(&mut self.z80_wait)) * Z80_DIV;
         }
     }
 
@@ -498,7 +505,9 @@ impl ebobo_z80::Bus for Z80View<'_> {
         if addr < 0x8000 {
             self.0.zspace_read(addr, self.0.s.z80_now)
         } else {
-            // Cartridge and RAM only; the VDP and controller ports give 0xFF here.
+            // Cartridge and RAM only; the VDP and controller ports give 0xFF here. The Z80
+            // waits for the 68000's bus.
+            self.0.z80_wait += Z80_WINDOW_WAIT;
             let target = self.banked(addr);
             self.0.mem().read8(target)
         }
@@ -508,6 +517,7 @@ impl ebobo_z80::Bus for Z80View<'_> {
         if addr < 0x8000 {
             self.0.zspace_write(addr, val, self.0.s.z80_now);
         } else {
+            self.0.z80_wait += Z80_WINDOW_WAIT;
             let target = self.banked(addr);
             self.0.mem().write8(target, val);
         }
