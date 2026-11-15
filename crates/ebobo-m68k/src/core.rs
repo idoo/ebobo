@@ -1049,7 +1049,15 @@ mod tests {
         let (mut cpu, mut bus) = machine();
         bus.w16(0x400, 0x4E71);
         cpu.set_sr(0xA700);
-        assert_eq!(cpu.step(&mut bus), 4 + 34);
+        assert_eq!(cpu.step(&mut bus), 4);
+        assert!(cpu.trace_pending);
+        assert_eq!((cpu.pc, cpu.sr, cpu.ssp), (0x402, 0xA700, 0x8000));
+        // The trace exception is the next step, ahead of an interrupt.
+        cpu.irq = 7;
+        assert_eq!(cpu.step(&mut bus), 34);
+        cpu.irq = 0;
+        cpu.irq_prev = 0;
+        assert!(!cpu.trace_pending);
         assert_eq!((cpu.pc, cpu.sr, cpu.ssp), (0x1090, 0x2700, 0x7FFA));
         assert_eq!((bus.r16(0x7FFA), bus.r32(0x7FFC)), (0xA700, 0x402));
 
@@ -1057,6 +1065,7 @@ mod tests {
         cpu.pc = 0x500;
         cpu.set_sr(0xA700);
         assert_eq!(cpu.step(&mut bus), 34);
+        assert!(!cpu.trace_pending);
         assert_eq!((cpu.pc, cpu.sr, bus.r32(0x7FF6)), (0x1040, 0x2700, 0x500));
     }
 }

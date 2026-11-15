@@ -25,10 +25,13 @@
 //! - `prefetch` is the two words at the instruction's address: written to memory at `pc - 4` and `pc - 2` (after
 //!   `ram`). The final `prefetch` is bus traffic, not compared.
 //! - Final `pc`: see `final_pc` below for the rule found in the cases.
+//! - Trace: the suite's `final` is the instruction boundary; for a case that starts with T set the trace exception
+//!   is still pending there. `Cpu::step` stops at the same point (`Cpu::trace_pending`), so these compare directly.
 //! - `transactions` are not compared. Kinds `re` / `we` are address-error cycles that never reach memory (AS is not
 //!   asserted); the harness only notes that a case has one, to split the failures into address-error cases and others.
 //! - `length` (the cycle count) is compared with what `Cpu::step` returns.
 
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -52,8 +55,14 @@ const KNOWN: &[(&str, &str)] = &[
 /// Checked over whole files with decode.py: NOP (2500 of 2500: initial + 2), Bcc (1156 not taken: next + 4,
 /// 674 taken: target + 4, 670 address errors on an odd target: vector 3 handler + 4), TRAP (2500: vector handler + 4),
 /// MOVE.w (1013 straight: initial + instruction length, 1487 address errors: vector 3 handler + 4).
-fn final_pc(suite_pc: u32) -> u32 {
-    suite_pc.wrapping_sub(4)
+///
+/// STOP is the one exception: a CPU that stopped has read the immediate word but does not refill the queue for
+/// the instruction after it, so `m_au` stays where it was when STOP began: STOP's address + 4, which is the address
+/// of the instruction after STOP (all 598 supervisor-mode cases of STOP.json.bin: final `pc` = initial `pc`,
+/// `length` 4). That is the state of the address counter only: an interrupt out of STOP stacks STOP's address + 4,
+/// which is exactly what our `pc` holds, so for a stopped CPU the suite's `pc` is compared unchanged.
+fn final_pc(suite_pc: u32, stopped: bool) -> u32 {
+    if stopped { suite_pc } else { suite_pc.wrapping_sub(4) }
 }
 
 struct State {
@@ -270,7 +279,7 @@ fn diff(case: &Case, cpu: &Cpu, ram: &Ram) -> Vec<String> {
     reg("usp".into(), f.usp, cpu.usp);
     reg("ssp".into(), f.ssp, cpu.ssp);
     reg("sr".into(), f.sr, cpu.sr as u32);
-    reg("pc".into(), final_pc(f.pc), cpu.pc);
+    reg("pc".into(), final_pc(f.pc, cpu.stopped), cpu.pc);
     for &(addr, exp) in &f.ram {
         let got = ram.word(addr);
         if got != exp {
@@ -287,23 +296,27 @@ struct FileResult {
     ae_cases: usize,
     state_fail: usize,
     cycle_fail: usize,
-    /// Failing cases (state or cycles) that start with T set in SR: see `TRACE_NOTE`.
-    fail_trace: usize,
-    /// Failing cases without T that end in an address error, and those that do not.
+    /// Failing cases that end in an address error, and those that do not.
     fail_ae: usize,
     fail_other: usize,
-    /// First failing case without T and its differences, or the panic.
+    /// First failing case and its differences, or the panic.
     first: Option<String>,
-    /// First failing case with T, shown only when no other case fails.
-    first_trace: Option<String>,
+    /// `failOther` cases by kind (the set of fields that differ): count and the first example.
+    kinds: BTreeMap<String, (usize, String)>,
     panicked: bool,
 }
 
-/// The suite's `final` stops at the instruction boundary: when the instruction began with T set in SR, the trace
-/// exception is still pending there (MAME takes it as the start of the next instruction). Our `Cpu::step` takes it
-/// inside the same step (vector 9, a 6-byte frame, 34 more cycles), so such cases differ in ssp, sr, pc, the stack
-/// and cycles even when the instruction itself is right. They are counted apart (`failT`), not hidden.
-const TRACE_NOTE: &str = "failT: case starts with T set; suite stops before the trace exception, our step takes it";
+/// The kind of a failure: which fields differ (`d`, `a`, `usp`, `ssp`, `sr`, `pc`, `ram`, `cycles`), in that order.
+fn kind_of(bad: &[String]) -> String {
+    let mut kinds: Vec<&str> = Vec::new();
+    for b in bad {
+        let k = ["usp", "ssp", "sr", "pc", "ram", "cycles", "d", "a"].into_iter().find(|k| b.starts_with(k)).unwrap_or("?");
+        if !kinds.contains(&k) {
+            kinds.push(k);
+        }
+    }
+    kinds.join("+")
+}
 
 fn run_file(name: &str, path: &Path, limit: usize) -> FileResult {
     let mut r = FileResult {
@@ -312,11 +325,10 @@ fn run_file(name: &str, path: &Path, limit: usize) -> FileResult {
         ae_cases: 0,
         state_fail: 0,
         cycle_fail: 0,
-        fail_trace: 0,
         fail_ae: 0,
         fail_other: 0,
         first: None,
-        first_trace: None,
+        kinds: BTreeMap::new(),
         panicked: false,
     };
     let cases = match catch_unwind(|| load(path)) {
@@ -360,21 +372,16 @@ fn run_file(name: &str, path: &Path, limit: usize) -> FileResult {
                 bad.push(format!("cycles exp {} got {cycles}", case.length));
             }
             if !bad.is_empty() {
-                let line = |kind: &str| format!("{}{kind}: {}", case.name, bad.join(", "));
-                if init.sr & 0x8000 != 0 {
-                    r.fail_trace += 1;
-                    if r.first_trace.is_none() {
-                        r.first_trace = Some(line(" (T set)"));
-                    }
+                let line = format!("{}{}: {}", case.name, if case.addr_error { " (address error)" } else { "" }, bad.join(", "));
+                if case.addr_error {
+                    r.fail_ae += 1;
                 } else {
-                    if case.addr_error {
-                        r.fail_ae += 1;
-                    } else {
-                        r.fail_other += 1;
-                    }
-                    if r.first.is_none() {
-                        r.first = Some(line(if case.addr_error { " (address error)" } else { "" }));
-                    }
+                    r.fail_other += 1;
+                    let e = r.kinds.entry(kind_of(&bad)).or_insert_with(|| (0, line.clone()));
+                    e.0 += 1;
+                }
+                if r.first.is_none() {
+                    r.first = Some(line);
                 }
             }
             ram.clear();
@@ -399,26 +406,22 @@ fn mame() {
     let results = par_map(&files, |name, path| run_file(name, path, limit));
     std::panic::set_hook(hook);
 
-    // failT + failAE + failOther = cases failing in state or cycles; AE = cases whose transactions hold `re` / `we`.
-    println!("{TRACE_NOTE}");
-    println!(
-        "{:<14} {:>6} {:>6} {:>7} {:>7} {:>6} {:>7} {:>9}  first failure without T",
-        "file", "cases", "AE", "state", "cycles", "failT", "failAE", "failOther"
-    );
+    // failAE + failOther = cases failing in state or cycles; AE = cases whose transactions hold `re` / `we`.
+    println!("{:<14} {:>6} {:>6} {:>7} {:>7} {:>7} {:>9}  first failure", "file", "cases", "AE", "state", "cycles", "failAE", "failOther");
     let mut failing = Vec::new();
     let (mut passed, mut panicked) = (0, 0);
-    let mut tot = [0usize; 7];
+    let mut tot = [0usize; 6];
     for r in &results {
         let ok = !r.panicked && r.state_fail == 0 && r.cycle_fail == 0;
         let known = KNOWN.iter().find(|(f, _)| r.name.split('.').next() == Some(*f));
-        let first = r.first.as_deref().or(r.first_trace.as_deref()).unwrap_or("");
+        let first = r.first.as_deref().unwrap_or("");
         let note = known.map_or(String::new(), |(_, why)| format!(" [known: {why}]"));
         let p = if r.panicked { " PANIC" } else { "" };
         println!(
-            "{:<14} {:>6} {:>6} {:>7} {:>7} {:>6} {:>7} {:>9}{p}  {first}{note}",
-            r.name, r.cases, r.ae_cases, r.state_fail, r.cycle_fail, r.fail_trace, r.fail_ae, r.fail_other
+            "{:<14} {:>6} {:>6} {:>7} {:>7} {:>7} {:>9}{p}  {first}{note}",
+            r.name, r.cases, r.ae_cases, r.state_fail, r.cycle_fail, r.fail_ae, r.fail_other
         );
-        for (t, v) in tot.iter_mut().zip([r.cases, r.ae_cases, r.state_fail, r.cycle_fail, r.fail_trace, r.fail_ae, r.fail_other]) {
+        for (t, v) in tot.iter_mut().zip([r.cases, r.ae_cases, r.state_fail, r.cycle_fail, r.fail_ae, r.fail_other]) {
             *t += v;
         }
         if ok {
@@ -431,7 +434,13 @@ fn mame() {
         }
     }
     let t = tot;
-    println!("{:<14} {:>6} {:>6} {:>7} {:>7} {:>6} {:>7} {:>9}", "total", t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
+    println!("{:<14} {:>6} {:>6} {:>7} {:>7} {:>7} {:>9}", "total", t[0], t[1], t[2], t[3], t[4], t[5]);
+    println!("failOther by kind (fields that differ), with the first example of each:");
+    for r in &results {
+        for (kind, (n, example)) in &r.kinds {
+            println!("KIND {:<14} {n:>5}  {kind:<24} {example}", r.name);
+        }
+    }
     println!("{} files: {passed} pass, {panicked} panicked, {} with failures (known ones not counted)", results.len(), failing.len());
     assert!(failing.is_empty(), "failing files: {}", failing.join(" "));
 }

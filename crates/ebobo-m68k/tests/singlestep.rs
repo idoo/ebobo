@@ -17,6 +17,11 @@
 //! - `ram` lists `[address, byte]`; the final list holds every byte the instruction touched, all compared.
 //! - `length` is the cycles of the whole instruction with immediate DTACK, compared with what `Cpu::step` returns.
 //! - Address errors are not special: the case's `final` is the state after the exception was taken.
+//! - Trace: this suite's `final` for a case that starts with T set is the state after the trace exception was
+//!   taken too (vector 9, 34 cycles in `length`). Our `Cpu::step` stops at the instruction boundary with
+//!   `Cpu::trace_pending` set, so the harness calls `step` a second time when the case started with T set and the
+//!   first step left a trace pending, and adds its cycles. An instruction that was refused or aborted (illegal,
+//!   privilege, address error) leaves none pending, and the suite shows none taken.
 //! - `transactions` (bus order) is not compared.
 
 use std::fs::File;
@@ -233,7 +238,11 @@ fn run_file(name: &str, path: &Path, limit: usize) -> FileResult {
             for (k, word) in init.prefetch.iter().enumerate() {
                 ram.write16(init.pc.wrapping_add(2 * k as u32), *word);
             }
-            let cycles = cpu.step(&mut ram);
+            let mut cycles = cpu.step(&mut ram);
+            // The rule of the header: the suite's final state has the trace exception taken.
+            if init.sr & 0x8000 != 0 && cpu.trace_pending {
+                cycles += cpu.step(&mut ram);
+            }
             let mut bad = diff(case, &cpu, &ram);
             if !bad.is_empty() {
                 r.state_fail += 1;

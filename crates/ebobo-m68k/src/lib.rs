@@ -2,9 +2,13 @@
 //!
 //! Contract (the Mega Drive system and the single-step tests are written against it; change
 //! it only together with them):
-//! - [`Cpu::step`] runs one instruction, or takes one pending interrupt or exception, and
-//!   returns its length in CPU clock cycles as on the real chip, prefetch included (the
-//!   `length` of the SingleStepTests cases).
+//! - [`Cpu::step`] runs one instruction, or takes one pending trace exception or interrupt,
+//!   and returns its length in CPU clock cycles as on the real chip, prefetch included (the
+//!   `length` of the SingleStepTests cases). It ends on an instruction boundary: an
+//!   instruction that began with T set leaves [`Cpu::trace_pending`] set, and the trace
+//!   exception is the whole of the next step (34 cycles), ahead of any interrupt. The
+//!   exceptions of an instruction itself (illegal, privilege, address error, TRAP, CHK,
+//!   divide by zero) are part of that instruction's step.
 //! - All memory traffic goes through [`Bus`]. Addresses are 24 bits wide. Word accesses are
 //!   always even: a word or long access at an odd address raises the address error exception
 //!   and never reaches the bus. A long is two word accesses, high word first.
@@ -80,6 +84,12 @@ pub struct Cpu {
     /// Double fault (an address error while taking an address error or the reset): halted
     /// until [`Cpu::reset`].
     pub halted: bool,
+    /// The last instruction began with T set and ran to its end: the trace exception
+    /// (vector 9) is taken by the next [`Cpu::step`] as a step of its own, before a pending
+    /// interrupt and before any fetch. Not set by an instruction that was refused or
+    /// aborted (illegal, privilege violation, line A/F, address error); set after one that
+    /// ran into its own trap (TRAP, TRAPV, CHK, divide by zero), as the manual has it.
+    pub trace_pending: bool,
     /// Level on the interrupt pins, 0-7 (0 = no request). Level sensitive: the system keeps
     /// it up to date; the CPU takes it before an instruction when it is above the mask in
     /// `sr` (level 7 always, once per change to 7).
@@ -112,23 +122,37 @@ impl Cpu {
     }
 
     /// Reset exception: supervisor mode, trace off, mask 7, SSP from vector 0 (address 0)
-    /// and PC from vector 1 (address 4). Clears `stopped` and `halted`.
+    /// and PC from vector 1 (address 4). Clears `stopped`, `halted` and `trace_pending`.
     pub fn reset(&mut self, bus: &mut impl Bus) {
         self.sr = 0x2700;
         self.ssp = vector_at(bus, 0);
         self.pc = vector_at(bus, 4);
         self.stopped = false;
         self.halted = false;
+        self.trace_pending = false;
         self.cyc = 0;
     }
 
-    /// One instruction, interrupt or exception; returns its length in CPU clock cycles.
-    /// While stopped or halted it returns 4 without touching the bus.
+    /// One instruction, or one pending trace exception, or one interrupt; returns its length
+    /// in CPU clock cycles. Order: a pending trace exception first (34 cycles, it also ends
+    /// a STOP), then an interrupt above the mask (44 cycles), then the instruction at `pc`.
+    /// An instruction that began with T set and was not refused or aborted sets
+    /// `trace_pending` for the next call. While stopped or halted it returns 4 without
+    /// touching the bus.
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
         if self.halted {
             return 4;
         }
         self.cyc = 0;
+
+        if self.trace_pending {
+            self.trace_pending = false;
+            self.stopped = false;
+            if let Err(fault) = self.trace(bus) {
+                self.raise(bus, fault, 0, true);
+            }
+            return self.cyc;
+        }
 
         let level = self.irq & 7;
         let became_7 = level == 7 && self.irq_prev != 7;
@@ -156,12 +180,7 @@ impl Cpu {
             Err(fault) => Err(fault),
         };
         match run {
-            Ok(()) if trace => {
-                if let Err(fault) = self.trace(bus) {
-                    self.raise(bus, fault, op, true);
-                }
-            }
-            Ok(()) => {}
+            Ok(()) => self.trace_pending = trace,
             Err(fault) => self.raise(bus, fault, op, false),
         }
         self.cyc
@@ -195,7 +214,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// Trace exception after an instruction: vector 9, 34 cycles on top of the instruction's.
+    /// The pending trace exception, a step of its own: vector 9, 34 cycles.
     fn trace(&mut self, bus: &mut impl Bus) -> Res<()> {
         self.exception(bus, 9)?;
         self.idle(34 - EXCEPTION_BUS_CYCLES);
