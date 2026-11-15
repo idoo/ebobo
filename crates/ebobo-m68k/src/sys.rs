@@ -12,13 +12,14 @@ fn supervisor(cpu: &Cpu) -> Res<()> {
 }
 
 /// Loads `pc` with `target` after `idle` internal cycles. An odd target is the address error of the prefetch that
-/// follows, taken in this step: the frame holds the target as the access address and target - 4 as the PC
-/// (`address_error` stacks `pc - 2`), and the step costs the instruction's own total plus 42, which is `idle` - 4
-/// on top of what the bus accesses so far and `address_error` charge.
-fn jump(cpu: &mut Cpu, target: u32, idle: u32) -> Res<()> {
+/// follows, taken in this step (the MAME suite): the frame holds the target as the access address and `stacked` as
+/// the PC (`address_error` stacks `pc - 2`), nothing has been pushed yet, the SR in the frame is the one the
+/// instruction has already loaded (RTE, RTR), and the step costs the instruction's cycles before the prefetch plus
+/// 54, which is `idle` + 4 on top of what the bus accesses so far and `address_error` charge.
+fn jump(cpu: &mut Cpu, target: u32, idle: u32, stacked: u32) -> Res<()> {
     if target & 1 != 0 {
-        cpu.cyc = cpu.cyc + idle - 4;
-        cpu.pc = target.wrapping_sub(2);
+        cpu.cyc = cpu.cyc + idle + 4;
+        cpu.pc = stacked.wrapping_add(2);
         return Err(Fault::Address { addr: target, write: false, program: true });
     }
     cpu.idle(idle);
@@ -55,9 +56,14 @@ pub(crate) fn exec(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
             cpu.set_a(7, sp.wrapping_add(disp));
             Ok(())
         }
-        // UNLK An: SP = An, An popped. 12 cycles.
+        // UNLK An: SP = An, An popped. 12 cycles. An odd An faults on the pop before SP is loaded: neither register
+        // has moved, and the frame stacks the address after the opcode + 2.
         0x4E58..=0x4E5F => {
             let frame = cpu.a(n);
+            if frame & 1 != 0 {
+                cpu.ae_pc = 2;
+                return Err(Fault::Address { addr: frame, write: false, program: false });
+            }
             cpu.set_a(7, frame);
             let val = cpu.pop32(bus)?;
             cpu.set_a(n, val);
@@ -101,12 +107,12 @@ pub(crate) fn exec(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
             let status = cpu.pop16(bus)?;
             let target = cpu.pop32(bus)?;
             cpu.set_sr(status);
-            jump(cpu, target, 4)
+            jump(cpu, target, 4, cpu.op_pc.wrapping_add(2))
         }
         // RTS: 16 cycles.
         0x4E75 => {
             let target = cpu.pop32(bus)?;
-            jump(cpu, target, 4)
+            jump(cpu, target, 4, cpu.op_pc.wrapping_add(2))
         }
         // TRAPV: vector 7 when V is set (34 cycles), else 4.
         0x4E76 => {
@@ -121,19 +127,20 @@ pub(crate) fn exec(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
             let ccr = cpu.pop16(bus)?;
             let target = cpu.pop32(bus)?;
             cpu.set_ccr(ccr);
-            jump(cpu, target, 4)
+            jump(cpu, target, 4, cpu.op_pc.wrapping_add(2))
         }
-        // JSR <control>: pushes the address of the next instruction.
+        // JSR <control>: pushes the address of the next instruction. An odd target faults before the push, stacking
+        // the address after the extension words.
         0x4E80..=0x4EBF => {
             let target = cpu.ea_addr(bus, mode(op), n)?;
             let ret = cpu.pc;
-            jump(cpu, target, jump_idle(mode(op), n))?;
+            jump(cpu, target, jump_idle(mode(op), n), ret)?;
             cpu.push32(bus, ret)
         }
-        // JMP <control>.
+        // JMP <control>. An odd target stacks the address after the opcode, whatever the extension words.
         0x4EC0..=0x4EFF => {
             let target = cpu.ea_addr(bus, mode(op), n)?;
-            jump(cpu, target, jump_idle(mode(op), n))
+            jump(cpu, target, jump_idle(mode(op), n), cpu.op_pc.wrapping_add(2))
         }
         _ => Err(Fault::Illegal),
     }
