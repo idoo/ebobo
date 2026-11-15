@@ -606,6 +606,8 @@ impl Ui {
                 right: n.right || tapped.right,
                 confirm: n.confirm || tapped.confirm,
                 back: n.back || tapped.back,
+                // Taps only stand for the six keys above.
+                ..n
             };
             synth = InputFrame { nav, ..input.clone() };
             &synth
