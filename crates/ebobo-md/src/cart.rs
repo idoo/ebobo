@@ -191,8 +191,12 @@ fn text(field: &[u8]) -> String {
 /// The regions named by the three bytes at 0x1F0, in the order Americas, Europe, Japan. Two
 /// conventions exist: the letters J, U and E in any position, or one hex digit in the first
 /// position as a bit mask (bit 0 Japan, bit 2 Americas, bit 3 Europe). A lone 'E' is the
-/// letter, as every game that has it is a European release.
+/// letter, as every game that has it is a European release. Some European games spell the
+/// word out ("EUROPE", "EUR"): its U is not the Americas' letter.
 fn regions(codes: &[u8]) -> Vec<Region> {
+    if codes.eq_ignore_ascii_case(b"EUR") {
+        return vec![Region::Europe];
+    }
     let has = |letter: u8| codes.iter().any(|c| c.to_ascii_uppercase() == letter);
     let (mut japan, mut americas, mut europe) = (has(b'J'), has(b'U'), has(b'E'));
     if !(japan || americas || europe) {
@@ -559,7 +563,10 @@ mod tests {
     #[test]
     fn region_codes_in_both_conventions() {
         use Region::{Americas, Europe, Japan};
-        let cases: [(&[u8; 3], &[Region], Region); 16] = [
+        let cases: [(&[u8; 3], &[Region], Region); 19] = [
+            (b"EUR", &[Europe], Europe),
+            (b"eur", &[Europe], Europe),
+            (b"USA", &[Americas], Americas),
             (b"JUE", &[Americas, Europe, Japan], Americas),
             (b"EUJ", &[Americas, Europe, Japan], Americas),
             (b"U  ", &[Americas], Americas),
