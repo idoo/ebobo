@@ -481,7 +481,8 @@ pub struct Ym2612 {
     busy: u8,
     /// CSM keyed channel 3 on at the last timer A overflow; the next tick keys it off.
     csm_keyed: bool,
-    /// 0x2A: DAC sample, unsigned 8 bits.
+    /// 0x2A: DAC sample, unsigned 8 bits. Starts at 0x80, the centre: a sound driver that
+    /// enables the DAC before its first sample byte must not put a full-scale step on channel 6.
     dac: u8,
     /// 0x2B bit 7: the DAC replaces channel 6.
     dac_enabled: bool,
@@ -519,7 +520,7 @@ impl Ym2612 {
             status: 0,
             busy: 0,
             csm_keyed: false,
-            dac: 0,
+            dac: 0x80,
             dac_enabled: false,
             eg_divider: 0,
             eg_counter: 0,
@@ -993,6 +994,9 @@ mod tests {
     #[test]
     fn dac_puts_its_byte_on_channel_6() {
         let mut chip = Ym2612::new();
+        reg(&mut chip, 0, 0x2B, 0x80);
+        assert_eq!(chip.tick(), (0, 0), "enabled before any sample byte: the centre, silence");
+        reg(&mut chip, 0, 0x2B, 0x00);
         reg(&mut chip, 0, 0x2A, 0xFF);
         assert_eq!(chip.tick(), (0, 0), "the DAC is off until 0x2B enables it");
         reg(&mut chip, 0, 0x2B, 0x80);

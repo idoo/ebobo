@@ -38,6 +38,9 @@ LEVEL_TOLERANCE_DB = 1.0
 # above 3.2 kHz may sit this far under (or over) the reference's before the tone counts as off.
 TONE_TOLERANCE_DB = 3.0
 TONE_FROM_BAND = 5
+# The reference's output stage settles with a 60 ms thump at power-on (peak 0.023, the same in
+# every ROM): it is not the game's sound, so the first SKIP_SECONDS of both files are left out.
+SKIP_SECONDS = 0.1
 
 
 def read_wav(path):
@@ -133,6 +136,8 @@ def correlation(a, b):
 
 def measure(path):
     rate, left, right = read_wav(path)
+    skip = int(rate * SKIP_SECONDS)
+    left, right = left[skip:], right[skip:]
     mono = [(l + r) * 0.5 for l, r in zip(left, right)]
     both = left + right
     return {
