@@ -92,11 +92,9 @@ pub struct Enhancer {
     scratch: [Scratch; BANDS],
     /// The result, RGBA bytes.
     out: Vec<u8>,
-    /// Shadow scratch: one row of occluder flags with zero margins, the last rows of their
-    /// horizontal sums, the running column sums, the blurred mask (2 times the source size).
-    pad: Vec<u32>,
-    ring: Vec<u32>,
-    col: Vec<u32>,
+    /// Shadow scratch: the horizontal box sums of the occluders and the blurred mask, both
+    /// 2 times the source size.
+    hsum: Vec<u32>,
     soft: Vec<u32>,
     /// Bands to use, 1..=`BANDS`; 0 means `BANDS`.
     bands: usize,
@@ -148,7 +146,7 @@ impl Enhancer {
 
         if mode == Mode::Depth && top > 0 {
             let mw = 2 * w;
-            soften(&self.x2, mw, 2 * h, &mut self.pad, &mut self.ring, &mut self.col, &mut self.soft);
+            soften(&self.x2, mw, 2 * h, bands, &mut self.scratch, &mut self.hsum, &mut self.soft);
             let soft = &self.soft;
             let area = STRENGTH_FULL;
             banded(&mut self.out, bw * 4, bh, bands, &mut self.scratch, |y0, part, sc| {
@@ -241,46 +239,45 @@ const STRENGTH_FULL: u32 = 200;
 /// Blurs the occluders at 2 times the source size (`x2`, `w`×`h`: the picture after one MMPX
 /// pass, whatever the output scale): `soft[i]` holds, for each layer 1-3 (bits 0-9, 10-19,
 /// 20-29), how many pixels of exactly that layer lie in the 5×5 box around mask pixel i.
-/// Outside the picture nothing occludes.
+/// Outside the picture nothing occludes. Both passes run in row bands: the horizontal sums
+/// (`hsum`) are finished before the vertical pass reads them, so the bands never change a value.
 ///
 /// Blurring the occluder rather than the finished shadow is what keeps the soft edge off the
 /// occluder itself: a pixel only ever looks up the counters of layers above its own.
-fn soften(big: &[u32], w: usize, h: usize, pad: &mut Vec<u32>, ring: &mut Vec<u32>, col: &mut Vec<u32>, soft: &mut Vec<u32>) {
+fn soften(x2: &[u32], w: usize, h: usize, bands: usize, scratch: &mut [Scratch; BANDS], hsum: &mut Vec<u32>, soft: &mut Vec<u32>) {
     let r = MASK_RADIUS;
     let n = 2 * r + 1;
-    pad.clear();
-    pad.resize(w + n, 0);
-    ring.clear();
-    ring.resize(n * w, 0);
-    col.clear();
-    col.resize(w, 0);
+    hsum.resize(w * h, 0);
     soft.resize(w * h, 0);
-    for yy in 0..h + r {
-        // The ring slot holds the horizontal sums of row yy - n, which leaves the window now.
-        let slot = &mut ring[(yy % n) * w..][..w];
-        if yy >= n {
-            for (c, s) in col.iter_mut().zip(slot.iter()) {
-                *c -= *s;
-            }
-        }
-        if yy < h {
-            for (m, &p) in pad[r + 1..r + 1 + w].iter_mut().zip(&big[yy * w..][..w]) {
+    banded(hsum, w, h, bands, scratch, |y0, part, sc| {
+        // Pixel x sits at pad[x + r + 1]; its window is pad[x + 1..=x + n].
+        let pad = &mut sc.words;
+        pad.clear();
+        pad.resize(w + n, 0);
+        for (i, out) in part.chunks_exact_mut(w).enumerate() {
+            for (m, &p) in pad[r + 1..r + 1 + w].iter_mut().zip(&x2[(y0 + i) * w..][..w]) {
                 *m = OCCLUDER[(p >> 24) as usize & 3];
             }
-            // Pixel x sits at pad[x + r + 1]; its window is pad[x + 1..=x + n].
             let mut sum: u32 = pad[..n].iter().sum();
-            for ((o, &add), &sub) in slot.iter_mut().zip(&pad[n..]).zip(&pad[..w]) {
+            for ((o, &add), &sub) in out.iter_mut().zip(&pad[n..]).zip(&pad[..w]) {
                 sum = sum + add - sub;
                 *o = sum;
             }
-            for (c, s) in col.iter_mut().zip(slot.iter()) {
-                *c += *s;
+        }
+    });
+    let hsum = &*hsum;
+    banded(soft, w, h, bands, scratch, |y0, part, _| {
+        for (i, out) in part.chunks_exact_mut(w).enumerate() {
+            let y = y0 + i;
+            let (from, to) = (y.saturating_sub(r), (y + r + 1).min(h));
+            out.copy_from_slice(&hsum[from * w..][..w]);
+            for yy in from + 1..to {
+                for (o, &s) in out.iter_mut().zip(&hsum[yy * w..][..w]) {
+                    *o += s;
+                }
             }
         }
-        if yy >= r {
-            soft[(yy - r) * w..][..w].copy_from_slice(col);
-        }
-    }
+    });
 }
 
 /// Shadow strength of one output row (0..=`STRENGTH_FULL`): a pixel of layer p is shadowed by
