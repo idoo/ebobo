@@ -65,4 +65,4 @@ It signs you in to Cloudflare, deploys and prints the server URL. Everyone who p
 
 ## License
 
-MIT.
+MIT. The HD filter is a port of [MMPX](https://casual-effects.com/research/McGuire2021PixelArt/) by Morgan McGuire and Mara Gagiu (MIT); rollback is [GGRS](https://github.com/gschup/ggrs) (MIT or Apache-2.0), patched in `vendor/ggrs`.
