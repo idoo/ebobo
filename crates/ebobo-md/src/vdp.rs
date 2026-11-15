@@ -98,6 +98,9 @@ pub struct Vdp {
     frame_done: bool,
     m68k_frozen_until: u64,
     dma_busy_until: u64,
+    /// Write FIFO: the master clocks at which the last four data-port writes are taken by the
+    /// chip, oldest first. A write is waiting while its entry is after `clock`.
+    fifo_done: [u64; 4],
     /// HV counter value latched while register 0 bit 1 is on.
     hv_latch: Option<u16>,
 }
@@ -130,6 +133,7 @@ impl Vdp {
             frame_done: false,
             m68k_frozen_until: 0,
             dma_busy_until: 0,
+            fifo_done: [0; 4],
             hv_latch: None,
         }
     }
@@ -346,8 +350,9 @@ impl Vdp {
         self.clock < self.z80_int_until
     }
 
-    /// A 68k→VDP DMA holds the 68000 off the bus until this master clock (at or before the
-    /// chip's position when it does not).
+    /// The 68000 is held off the bus until this master clock (at or before the chip's position
+    /// when it is not): by a 68k→VDP DMA, or by a data-port write made while four writes wait
+    /// in the FIFO, until the oldest of them is taken.
     pub fn m68k_frozen_until(&self) -> u64 {
         self.m68k_frozen_until
     }
@@ -360,12 +365,43 @@ impl Vdp {
         (v as u16) << 8 | timing::h_counter(self.mclk, h40) as u16
     }
 
+    /// Data-port writes waiting in the FIFO now: 0-4.
+    fn fifo_pending(&self) -> usize {
+        self.fifo_done.iter().filter(|&&t| t > self.clock).count()
+    }
+
+    /// A data-port write enters the FIFO. The chip takes it `slots` access slots (one for a
+    /// colour or scroll RAM word, two for a video RAM word: a byte per slot) after the write
+    /// before it, or after now when nothing waits. With four writes waiting the 68000 is held
+    /// until the oldest is taken.
+    fn fifo_push(&mut self, slots: u32) {
+        let oldest = self.fifo_done[0];
+        if oldest > self.clock {
+            self.m68k_frozen_until = self.m68k_frozen_until.max(oldest);
+        }
+        let from = self.clock.max(self.fifo_done[3]);
+        let pos = self.mclk as u64 + (from - self.clock);
+        let lc = timing::LINE_CLOCKS as u64;
+        let start = DmaStart {
+            line: ((self.line as u64 + pos / lc) % self.lines() as u64) as u32,
+            mclk: (pos % lc) as u32,
+            h40: self.h40(),
+            display_on: self.display_on(),
+            active_lines: self.active_lines(),
+            total_lines: self.lines(),
+        };
+        let done = from + timing::slot_after(slots, start);
+        self.fifo_done = [self.fifo_done[1], self.fifo_done[2], self.fifo_done[3], done];
+    }
+
     fn status(&self) -> u16 {
         let h40 = self.h40();
         let vblank = self.line >= self.active_lines() || !self.display_on();
         let hblank = self.mclk >= timing::hblank_start(h40) || self.mclk < timing::hblank_end(h40);
+        let waiting = self.fifo_pending();
         0x3400
-            | 1 << 9
+            | ((waiting == 0) as u16) << 9
+            | ((waiting == 4) as u16) << 8
             | (self.vint_pending as u16) << 7
             | (self.sprite_overflow as u16) << 6
             | (self.sprite_collision as u16) << 5
@@ -443,6 +479,7 @@ impl Vdp {
 
     fn write_data(&mut self, val: u16) {
         self.pending = false;
+        self.fifo_push(if self.code & 0x0F == 0x01 { 2 } else { 1 });
         self.store(val);
         if self.fill_armed {
             self.fill_armed = false;
@@ -630,6 +667,103 @@ mod tests {
         h.finish()
     }
 
+    /// 320-pixel mode, display on, at the start of line 0, a video RAM write command at 0.
+    fn drawing_h40() -> Vdp {
+        let mut v = Vdp::new(false);
+        v.run_to(0, None);
+        set_reg(&mut v, 1, 0x44);
+        set_reg(&mut v, 12, 0x81);
+        set_reg(&mut v, 15, 2);
+        cmd(&mut v, 1, 0, &mut Rec(Vec::new()));
+        v
+    }
+
+    #[test]
+    fn fifo_holds_four_writes_and_the_fifth_stalls() {
+        // 18 slots a line while drawing: 190 master clocks apart, the first at 95.
+        let mut v = drawing_h40();
+        for w in 0..4 {
+            data(&mut v, w);
+        }
+        assert_eq!(v.m68k_frozen_until(), 0);
+        data(&mut v, 4);
+        // A video RAM word is two slots: the oldest is taken at the second slot.
+        assert_eq!(v.m68k_frozen_until(), 285);
+        v.run_to(285, None);
+        data(&mut v, 5);
+        assert_eq!(v.m68k_frozen_until(), 285 + 2 * 190);
+        assert_eq!(&v.vram()[8..12], &[0, 4, 0, 5]);
+
+        // A colour RAM word is one slot.
+        let mut v = drawing_h40();
+        cmd(&mut v, 3, 0, &mut Rec(Vec::new()));
+        for w in 0..5 {
+            data(&mut v, w);
+        }
+        assert_eq!(v.m68k_frozen_until(), 95);
+    }
+
+    #[test]
+    fn fifo_stall_is_short_while_blanked() {
+        // Display off: 205 slots a line, 16 or 17 master clocks apart.
+        let mut v = drawing_h40();
+        set_reg(&mut v, 1, 0x04);
+        cmd(&mut v, 1, 0, &mut Rec(Vec::new()));
+        for w in 0..5 {
+            data(&mut v, w);
+        }
+        assert_eq!(v.m68k_frozen_until(), 25);
+
+        // Vertical blanking with the display on is the same.
+        let mut v = drawing_h40();
+        v.run_to(230 * 3420, None);
+        for w in 0..5 {
+            data(&mut v, w);
+        }
+        assert_eq!(v.m68k_frozen_until(), 230 * 3420 + 25);
+    }
+
+    #[test]
+    fn fifo_status_bits_follow_the_waiting_writes() {
+        let mut v = drawing_h40();
+        assert_eq!(v.read(4, 0) & 0x0300, 0x0200);
+        cmd(&mut v, 1, 0, &mut Rec(Vec::new()));
+        data(&mut v, 1);
+        assert_eq!(v.read(4, 0) & 0x0300, 0x0000);
+        for w in 2..5 {
+            data(&mut v, w);
+        }
+        assert_eq!(v.read(4, 0) & 0x0300, 0x0100);
+        // The four words are taken at 285, 665, 1045 and 1425.
+        v.run_to(285, None);
+        assert_eq!(v.read(4, 285) & 0x0300, 0x0000);
+        v.run_to(1424, None);
+        assert_eq!(v.read(4, 1424) & 0x0300, 0x0000);
+        v.run_to(1425, None);
+        assert_eq!(v.read(4, 1425) & 0x0300, 0x0200);
+    }
+
+    #[test]
+    fn fifo_clone_mid_stall_continues_identically() {
+        let mut a = drawing_h40();
+        for w in 0..5 {
+            data(&mut a, w);
+        }
+        let mut b = a.clone();
+        assert_eq!(hash(&a), hash(&b));
+        for v in [&mut a, &mut b] {
+            let t = v.m68k_frozen_until();
+            v.run_to(t, None);
+            data(v, 5);
+            data(v, 6);
+        }
+        assert_eq!(a.m68k_frozen_until(), b.m68k_frozen_until());
+        // Two more writes at 285 with four waiting: held until the second oldest, 1045.
+        assert_eq!(a.m68k_frozen_until(), 285 + 4 * 190);
+        assert_eq!(a.read(4, 285), b.read(4, 285));
+        assert_eq!(hash(&a), hash(&b));
+    }
+
     #[test]
     fn registers_and_memories_round_trip() {
         let mut v = Vdp::new(false);
@@ -667,6 +801,8 @@ mod tests {
         data(&mut v, 0x0102);
         data(&mut v, 0x0304);
         assert_eq!(&v.vram()[0..6], &[1, 2, 0, 0, 3, 4]);
+        // The two words leave the FIFO within a line; the status is read after that.
+        v.run_to(3420, None);
         ctl(&mut v, 0x4000);
         let s = v.read(4, 0);
         assert_eq!(s & 0x0201, 0x0200);

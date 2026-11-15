@@ -170,3 +170,34 @@ pub fn dma_duration(kind: DmaKind, units: u32, s: DmaStart) -> u64 {
         line = (line + 1) % s.total_lines;
     }
 }
+
+/// Master clocks from the position `s` to the `n`-th access slot after it (`n` ≥ 1): the slots in
+/// which the chip takes a write from its FIFO. A line has as many as a 68k DMA moves units
+/// ([`dma_rate`] of [`DmaKind::Bus`]: 18 while drawing and 205 while blanked in the 320-pixel
+/// mode, 16 and 167 in the 256-pixel mode), spread evenly: slot `k` of a line with `r` slots is
+/// at master clock `(2k + 1) * 3420 / 2r`.
+pub fn slot_after(n: u32, s: DmaStart) -> u64 {
+    let lc = LINE_CLOCKS as u64;
+    let at = s.mclk.min(LINE_CLOCKS - 1) as u64;
+    let mut line = s.line % s.total_lines;
+    let mut base = 0u64;
+    let mut from = at + 1;
+    let mut left = n.max(1);
+    loop {
+        let rate = dma_rate(DmaKind::Bus, s.h40, !s.display_on || line >= s.active_lines) as u64;
+        let mut k = from * rate / lc;
+        while k < rate {
+            let pos = (2 * k + 1) * lc / (2 * rate);
+            if pos >= from {
+                left -= 1;
+                if left == 0 {
+                    return base + pos - at;
+                }
+            }
+            k += 1;
+        }
+        base += lc;
+        from = 0;
+        line = (line + 1) % s.total_lines;
+    }
+}
