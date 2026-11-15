@@ -45,10 +45,10 @@ pub(crate) fn exec(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
             cpu.idle(34 - 4 - EXCEPTION_BUS);
             Ok(())
         }
-        // LINK An,#d16: pushes An (A7: its value after the decrement), An = SP, SP += d16. 16 cycles.
+        // LINK An,#d16: pushes An (A7: its value before the instruction), An = SP, SP += d16. 16 cycles.
         0x4E50..=0x4E57 => {
             let disp = cpu.fetch16(bus)? as i16 as u32;
-            let val = if n == 7 { cpu.a(7).wrapping_sub(4) } else { cpu.a(n) };
+            let val = cpu.a(n);
             cpu.push32(bus, val)?;
             let sp = cpu.a(7);
             cpu.set_a(n, sp);

@@ -39,10 +39,10 @@ fn shift(cpu: &mut Cpu, kind: u16, left: bool, size: Size, v: u32, n: u32) -> u3
             }
         }
         AS => {
-            // Past the operand's width the result is all sign bits, but C and X come out clear, as the test suite
-            // records them (a count equal to the width still leaves the sign bit in C).
+            // The sign bit is shifted in at every step, so past the operand's width the result is all sign bits and
+            // the last bit out, which C and X take, is the sign bit too.
             let s = i64::from(size.sext(v as u32) as i32);
-            ((s >> n) as u64 & mask, Some(n <= bits && s >> (n - 1) & 1 != 0))
+            ((s >> n) as u64 & mask, Some(s >> (n - 1) & 1 != 0))
         }
         LS => (v >> n, Some(v >> (n - 1) & 1 != 0)),
         ROX => {

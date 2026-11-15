@@ -18,8 +18,8 @@ fn jump(cpu: &mut Cpu, target: u32, idle: u32, spent: u32) -> Res<()> {
     Ok(())
 }
 
-/// ADDQ and SUBQ #1-8,<alterable>. Dn: 4 cycles (long 8). An: the whole register, no flags; a byte is illegal; word 8
-/// cycles, long 6 (the manual says 8 for both; SingleStepTests, recorded from the chip, has 6 for every long case).
+/// ADDQ and SUBQ #1-8,<alterable>. Dn: 4 cycles (long 8). An: the whole register, no flags; a byte is illegal; word
+/// and long both 8 cycles, as the manual says and as the single-step cases made from MAME's microcode 68000 record.
 /// Memory: 8 + ea (long 12 + ea), all of it bus accesses.
 fn quick(cpu: &mut Cpu, bus: &mut impl Bus, op: u16, size: Size) -> Res<()> {
     let (m, r) = (mode(op), reg(op));
@@ -34,7 +34,7 @@ fn quick(cpu: &mut Cpu, bus: &mut impl Bus, op: u16, size: Size) -> Res<()> {
     if m == 1 {
         let a = cpu.a(r);
         cpu.set_a(r, if sub { a.wrapping_sub(n) } else { a.wrapping_add(n) });
-        cpu.idle(if size == Size::Long { 2 } else { 4 });
+        cpu.idle(4);
         return Ok(());
     }
     let ea = cpu.ea(bus, m, r, size)?;
