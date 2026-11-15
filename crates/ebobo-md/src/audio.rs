@@ -8,8 +8,8 @@
 //! stage, which also takes the edges off the PSG's square waves), then a box filter that averages
 //! the input over each output period (zero-order hold integrated exactly, fractional overlaps
 //! included), so nothing above the host rate folds back as a loud alias. The two streams are
-//! mixed per output frame, a slow DC blocker removes the PSG's unipolar offset, and a soft limit
-//! keeps the result inside -1.0..=1.0.
+//! mixed per output frame and scaled by [`OUT_GAIN`], a slow DC blocker removes the PSG's unipolar
+//! offset, and a soft limit keeps the result inside -1.0..=1.0.
 
 use crate::{FM_SAMPLE_MCLK, PSG_SAMPLE_MCLK};
 
@@ -17,8 +17,17 @@ use crate::{FM_SAMPLE_MCLK, PSG_SAMPLE_MCLK};
 /// 8191 (unipolar, ±4096 once the DC is gone), one FM channel at full volume ±5355: at 0.5 a PSG
 /// channel sits about 8 dB under an FM channel, near what a Model 1 console's mixer gives.
 const PSG_TO_FM: f32 = 0.5;
-/// Corner of the output low-pass, Hz: the first-order RC filter of the Model 1 output stage.
-const LOWPASS_HZ: f64 = 3390.0;
+/// Corner of the output low-pass, Hz. A Model 1 console's first-order RC output stage sits near
+/// 3.4 kHz; the reference emulator's default filter is much gentler. 5 kHz keeps the first-order
+/// slope of the console and sits halfway between the two in the treble (at 9 kHz, relative to
+/// 1 kHz: Model 1 -8.7 dB, here -6.1 dB, reference about -3.5 dB, measured with
+/// `tools/md-oracle/audio.py`), so the music keeps the console's warmth without sounding muffled.
+const LOWPASS_HZ: f64 = 5000.0;
+/// Gain from the mixed streams (FM ±32767 full scale) to the output, before the limit.
+/// `Ym2612::tick` scales six full-volume channels into ±32767, so music with two or three
+/// channels at once sits far below full scale; 1.6 (+4.1 dB) brings ROM music to the reference
+/// emulator's level within 1 dB (`tools/md-oracle/audio.py`), with typical peaks near 0.4-0.8.
+const OUT_GAIN: f32 = 1.6;
 /// Corner of the DC blocker, Hz.
 const DC_HZ: f64 = 5.0;
 /// Frames one stream may run ahead of the other before the missing one counts as silence.
@@ -184,7 +193,7 @@ impl AudioOut {
             let fm = self.fm.out.get(i).copied().unwrap_or([0.0; 2]);
             let psg = self.psg.out.get(i).map_or(0.0, |p| p[0]);
             for (ch, fm) in fm.into_iter().enumerate() {
-                let x = (fm + psg) / 32768.0;
+                let x = (fm + psg) * (OUT_GAIN / 32768.0);
                 let mut y = x - self.dc_in[ch] + self.dc_r * self.dc_out[ch];
                 if y.abs() < TINY {
                     y = 0.0;
@@ -368,5 +377,61 @@ mod tests {
         let len = out.len();
         audio.drain(&mut out);
         assert_eq!(out.len(), len);
+    }
+
+    /// Amplitude of the left output for an FM sine of `amp` at `hz` (RMS of the settled half × √2).
+    fn fm_sine_amplitude(hz: f64, amp: f64) -> f64 {
+        let mut audio = AudioOut::new(MCLK);
+        feed(&mut audio, 0.0, 0.5, |t| ((t * hz * std::f64::consts::TAU).sin() * amp).round() as i16, |_| 0);
+        let mut out = Vec::new();
+        audio.drain(&mut out);
+        let tail: Vec<f64> = out[out.len() / 2..].iter().step_by(2).map(|&s| f64::from(s)).collect();
+        (tail.iter().map(|s| s * s).sum::<f64>() / tail.len() as f64).sqrt() * std::f64::consts::SQRT_2
+    }
+
+    /// What the chain should pass at `hz`: the one-pole low-pass at the FM rate, times the box
+    /// average over a 48 kHz output period (the DC blocker is flat above 100 Hz).
+    fn expected_gain(hz: f64) -> f64 {
+        let rate = f64::from(MCLK) / FM_SAMPLE_MCLK as f64;
+        let k = 1.0 - (-std::f64::consts::TAU * LOWPASS_HZ / rate).exp();
+        let w = std::f64::consts::TAU * hz / rate;
+        let (re, im) = (1.0 - (1.0 - k) * w.cos(), (1.0 - k) * w.sin());
+        let x = std::f64::consts::PI * hz / 48_000.0;
+        k / re.hypot(im) * (x.sin() / x)
+    }
+
+    #[test]
+    fn fm_level_is_scaled_by_out_gain() {
+        let got = fm_sine_amplitude(200.0, 8000.0);
+        let want = 8000.0 / 32768.0 * f64::from(OUT_GAIN) * expected_gain(200.0);
+        assert!((got / want - 1.0).abs() < 0.02, "{got} vs {want}");
+    }
+
+    #[test]
+    fn lowpass_response_at_1k_and_10k() {
+        let db = |x: f64| 20.0 * x.log10();
+        let base = fm_sine_amplitude(200.0, 8000.0);
+        for (hz, tolerance) in [(1000.0, 0.3), (10_000.0, 0.5)] {
+            let got = db(fm_sine_amplitude(hz, 8000.0) / base);
+            let want = db(expected_gain(hz) / expected_gain(200.0));
+            assert!((got - want).abs() < tolerance, "{hz} Hz: {got:.2} dB vs {want:.2} dB");
+        }
+        // First-order at 5 kHz: about -0.2 dB at 1 kHz, about -7.5 dB at 10 kHz with the box average.
+        assert!(db(expected_gain(1000.0) / expected_gain(200.0)) > -0.5);
+        let ten = db(expected_gain(10_000.0) / expected_gain(200.0));
+        assert!((-9.0..-6.0).contains(&ten), "{ten}");
+    }
+
+    #[test]
+    fn limiter_is_untouched_below_the_knee() {
+        for i in -100..=100 {
+            let x = KNEE * i as f32 / 100.0;
+            assert_eq!(soft_limit(x), x);
+        }
+        assert!(soft_limit(0.9) < 0.9 && soft_limit(0.9) > KNEE);
+        // An FM sine peaking at 0.7 comes out linear: the measured amplitude is the expected one.
+        let amp = 0.7 * 32768.0 / f64::from(OUT_GAIN) / expected_gain(200.0);
+        let got = fm_sine_amplitude(200.0, amp);
+        assert!((got / 0.7 - 1.0).abs() < 0.02, "{got}");
     }
 }
