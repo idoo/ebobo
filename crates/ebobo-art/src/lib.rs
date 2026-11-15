@@ -191,13 +191,23 @@ pub struct Art {
     tick: u64,
 }
 
+/// Reads a game's ROM bytes from its file for the title-screen capture (the caller knows how
+/// to open its containers, a `.zip` for one). Runs on the background thread.
+pub type Loader = Box<dyn Fn(&Path) -> Option<Vec<u8>> + Send>;
+
 impl Art {
-    /// `dir`: the cache folder (created when needed). `online`: downloads are allowed.
+    /// `dir`: the cache folder (created when needed). `online`: downloads are allowed. ROM
+    /// files are read as they are (see [`Art::with_loader`]).
     pub fn new(dir: PathBuf, online: bool) -> Art {
+        Art::with_loader(dir, online, Box::new(|path| fs::read(path).ok()))
+    }
+
+    /// [`Art::new`] with the caller's way of reading a ROM file.
+    pub fn with_loader(dir: PathBuf, online: bool, load: Loader) -> Art {
         let online = Arc::new(AtomicBool::new(online));
         let queue = Arc::new(Queue::default());
         let (sender, done) = mpsc::channel();
-        let worker = Worker { dir, online: online.clone(), done: sender, names: Default::default() };
+        let worker = Worker { dir, online: online.clone(), done: sender, names: Default::default(), load };
         let jobs = queue.clone();
         // Detached: it may be inside a download when the service is dropped. Without a thread
         // (the system refused one) the cards stay without pictures.
@@ -339,6 +349,7 @@ struct Worker {
     online: Arc<AtomicBool>,
     done: Sender<Done>,
     names: [NamesSlot; 2],
+    load: Loader,
 }
 
 impl Worker {
@@ -379,7 +390,7 @@ impl Worker {
         if job.upgrade {
             return None;
         }
-        let title = fs::read(&job.rom).ok().filter(|bytes| ebobo_console::identify(bytes).is_some()).and_then(|bytes| title::capture(&bytes));
+        let title = (self.load)(&job.rom).filter(|bytes| ebobo_console::identify(bytes).is_some()).and_then(|bytes| title::capture(&bytes));
         match title {
             Some(picture) => {
                 let picture = image::fit(picture, MAX_SIDE, MAX_SIDE);
