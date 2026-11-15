@@ -98,9 +98,12 @@ pub struct Vdp {
     frame_done: bool,
     m68k_frozen_until: u64,
     dma_busy_until: u64,
-    /// Write FIFO: the master clocks at which the last four data-port writes are taken by the
-    /// chip, oldest first. A write is waiting while its entry is after `clock`.
+    /// Write FIFO: the master clocks at which the last four data-port writes leave it, oldest
+    /// first (a video RAM word leaves with its first byte; the second is written from a latch
+    /// in the next slot). A write is waiting while its entry is after `clock`.
     fifo_done: [u64; 4],
+    /// Master clock of the last slot the newest FIFO write uses.
+    fifo_tail: u64,
     /// HV counter value latched while register 0 bit 1 is on.
     hv_latch: Option<u16>,
 }
@@ -134,6 +137,7 @@ impl Vdp {
             m68k_frozen_until: 0,
             dma_busy_until: 0,
             fifo_done: [0; 4],
+            fifo_tail: 0,
             hv_latch: None,
         }
     }
@@ -370,16 +374,16 @@ impl Vdp {
         self.fifo_done.iter().filter(|&&t| t > self.clock).count()
     }
 
-    /// A data-port write enters the FIFO. The chip takes it `slots` access slots (one for a
-    /// colour or scroll RAM word, two for a video RAM word: a byte per slot) after the write
-    /// before it, or after now when nothing waits. With four writes waiting the 68000 is held
-    /// until the oldest is taken.
+    /// A data-port write enters the FIFO. The chip takes it in the access slots after the
+    /// write before it (or after now when nothing waits): one slot for a colour or scroll RAM
+    /// word, two for a video RAM word (a byte per slot), and it leaves the FIFO at the first.
+    /// With four writes waiting the 68000 is held until the oldest leaves.
     fn fifo_push(&mut self, slots: u32) {
         let oldest = self.fifo_done[0];
         if oldest > self.clock {
             self.m68k_frozen_until = self.m68k_frozen_until.max(oldest);
         }
-        let from = self.clock.max(self.fifo_done[3]);
+        let from = self.clock.max(self.fifo_tail);
         let pos = self.mclk as u64 + (from - self.clock);
         let lc = timing::LINE_CLOCKS as u64;
         let start = DmaStart {
@@ -390,8 +394,9 @@ impl Vdp {
             active_lines: self.active_lines(),
             total_lines: self.lines(),
         };
-        let done = from + timing::slot_after(slots, start);
-        self.fifo_done = [self.fifo_done[1], self.fifo_done[2], self.fifo_done[3], done];
+        let first = from + timing::slot_after(1, start);
+        self.fifo_tail = from + timing::slot_after(slots, start);
+        self.fifo_done = [self.fifo_done[1], self.fifo_done[2], self.fifo_done[3], first];
     }
 
     fn status(&self) -> u16 {
@@ -687,11 +692,12 @@ mod tests {
         }
         assert_eq!(v.m68k_frozen_until(), 0);
         data(&mut v, 4);
-        // A video RAM word is two slots: the oldest is taken at the second slot.
-        assert_eq!(v.m68k_frozen_until(), 285);
-        v.run_to(285, None);
+        // A video RAM word takes two slots and leaves the FIFO at the first: the oldest at 95,
+        // the next at 475.
+        assert_eq!(v.m68k_frozen_until(), 95);
+        v.run_to(95, None);
         data(&mut v, 5);
-        assert_eq!(v.m68k_frozen_until(), 285 + 2 * 190);
+        assert_eq!(v.m68k_frozen_until(), 95 + 2 * 190);
         assert_eq!(&v.vram()[8..12], &[0, 4, 0, 5]);
 
         // A colour RAM word is one slot.
@@ -712,7 +718,7 @@ mod tests {
         for w in 0..5 {
             data(&mut v, w);
         }
-        assert_eq!(v.m68k_frozen_until(), 25);
+        assert_eq!(v.m68k_frozen_until(), 8);
 
         // Vertical blanking with the display on is the same.
         let mut v = drawing_h40();
@@ -720,7 +726,7 @@ mod tests {
         for w in 0..5 {
             data(&mut v, w);
         }
-        assert_eq!(v.m68k_frozen_until(), 230 * 3420 + 25);
+        assert_eq!(v.m68k_frozen_until(), 230 * 3420 + 8);
     }
 
     #[test]
@@ -734,13 +740,13 @@ mod tests {
             data(&mut v, w);
         }
         assert_eq!(v.read(4, 0) & 0x0300, 0x0100);
-        // The four words are taken at 285, 665, 1045 and 1425.
-        v.run_to(285, None);
-        assert_eq!(v.read(4, 285) & 0x0300, 0x0000);
-        v.run_to(1424, None);
-        assert_eq!(v.read(4, 1424) & 0x0300, 0x0000);
-        v.run_to(1425, None);
-        assert_eq!(v.read(4, 1425) & 0x0300, 0x0200);
+        // The four words leave at 95, 475, 855 and 1235.
+        v.run_to(95, None);
+        assert_eq!(v.read(4, 95) & 0x0300, 0x0000);
+        v.run_to(1234, None);
+        assert_eq!(v.read(4, 1234) & 0x0300, 0x0000);
+        v.run_to(1235, None);
+        assert_eq!(v.read(4, 1235) & 0x0300, 0x0200);
     }
 
     #[test]
@@ -758,9 +764,9 @@ mod tests {
             data(v, 6);
         }
         assert_eq!(a.m68k_frozen_until(), b.m68k_frozen_until());
-        // Two more writes at 285 with four waiting: held until the second oldest, 1045.
-        assert_eq!(a.m68k_frozen_until(), 285 + 4 * 190);
-        assert_eq!(a.read(4, 285), b.read(4, 285));
+        // Two more writes at 95 with four waiting: held until the second oldest, 855.
+        assert_eq!(a.m68k_frozen_until(), 95 + 4 * 190);
+        assert_eq!(a.read(4, 95), b.read(4, 95));
         assert_eq!(hash(&a), hash(&b));
     }
 
