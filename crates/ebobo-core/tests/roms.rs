@@ -152,7 +152,8 @@ fn blargg_text(nes: &Nes) -> String {
 
 fn frame_hash(nes: &Nes) -> u64 {
     nes.frame().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &px| {
-        (h ^ px as u64).wrapping_mul(0x0100_0000_01b3)
+        // Colour only (bits 0-8): the sprite marker bit 15 is not part of the golden hashes.
+        (h ^ (px & 0x1FF) as u64).wrapping_mul(0x0100_0000_01b3)
     })
 }
 

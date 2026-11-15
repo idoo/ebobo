@@ -131,7 +131,9 @@ impl Nes {
     }
 
     /// Last completed picture: `WIDTH * HEIGHT` entries, bits 0-5 palette index,
-    /// bits 6-8 PPUMASK colour emphasis.
+    /// bits 6-8 PPUMASK colour emphasis, bit 15 set when the pixel shown is a sprite's
+    /// (see [`Nes::frame_layers`]; mask it off before using the word as a colour). Bits 9-14
+    /// are 0.
     pub fn frame(&self) -> &[u16] {
         self.bus.frame()
     }
@@ -145,8 +147,9 @@ impl Nes {
     /// (`WIDTH * HEIGHT`): 0 = background, 1 = sprite. For display helpers; not emulated
     /// state.
     pub fn frame_layers(&self, out: &mut [u8]) {
-        // Owner: layers slice (the PPU does not record it yet).
-        out.fill(0);
+        for (o, px) in out.iter_mut().zip(self.bus.frame()) {
+            *o = (px >> 15) as u8;
+        }
     }
 
     /// Output sample rate of [`Nes::drain_audio`]. Fractional so the frontend can nudge it

@@ -3,6 +3,10 @@
 use crate::cart::{Esx, Mirroring, Region};
 use crate::mapper::{Cartridge, Nt};
 
+/// Bit of a frame word set when the pixel shown is a sprite's (it won the priority mux and is
+/// not transparent). Display-only: the frame buffer is not emulated state.
+pub const FRAME_SPRITE: u16 = 0x8000;
+
 /// All PPU state: registers, 2 KiB CIRAM (4 KiB for four-screen), OAM, palette RAM, render
 /// pipeline. Part of the rollback snapshot, so `Clone + Hash`, and the frame buffer is NOT
 /// stored here (it is passed into `tick`).
@@ -688,7 +692,8 @@ impl Ppu {
     // ---------------------------------------------------------------- stepping
 
     /// Advances one dot. Visible pixels go to `fb` (`WIDTH * HEIGHT`, value = palette index
-    /// | emphasis bits << 6). Pattern fetches go through `cart.ppu_read(addr, dot_counter)`.
+    /// | emphasis bits << 6 | [`FRAME_SPRITE`] for a sprite pixel). Pattern fetches go through
+    /// `cart.ppu_read(addr, dot_counter)`.
     #[inline]
     pub fn tick(&mut self, cart: &mut Cartridge, fb: &mut [u16]) {
         let line = self.scanline;
@@ -818,12 +823,12 @@ impl Ppu {
         if skip && !self.rendering() {
             return;
         }
-        let index = if !self.rendering() {
+        let (index, sprite) = if !self.rendering() {
             // Rendering off: the backdrop, or whatever palette entry `v` points at.
             if self.v & 0x3F00 == 0x3F00 {
-                palette_index(self.v)
+                (palette_index(self.v), false)
             } else {
-                0
+                (0, false)
             }
         } else {
             let (mut bg_pixel, mut bg_pal) = (0u8, 0u8);
@@ -867,7 +872,7 @@ impl Ppu {
             let sprite_wins = sp_pixel != 0 && (bg_pixel == 0 || sp_front);
             if sprite_wins && sp_esx {
                 let color = self.esx_pal[((sp_pal << 2) | sp_pixel) as usize];
-                self.write_color(fb, y, x, color);
+                self.write_color(fb, y, x, color, true);
                 return;
             }
             let (pal, pixel) = if bg_pixel == 0 {
@@ -879,24 +884,25 @@ impl Ppu {
             };
 
             if pixel == 0 {
-                0
+                (0, false)
             } else {
-                ((pal << 2) | pixel) as usize & 0x1F
+                (((pal << 2) | pixel) as usize & 0x1F, sprite_wins)
             }
         };
 
         let color = self.palette[index];
-        self.write_color(fb, y, x, color);
+        self.write_color(fb, y, x, color, sprite);
     }
 
-    /// Applies greyscale and emphasis to NES colour `color` and stores it.
+    /// Applies greyscale and emphasis to NES colour `color` and stores it; `sprite` (the pixel
+    /// shown is a sprite's, overlay and ESX sprites included) sets [`FRAME_SPRITE`].
     #[inline]
-    fn write_color(&self, fb: &mut [u16], y: usize, x: usize, color: u8) {
+    fn write_color(&self, fb: &mut [u16], y: usize, x: usize, color: u8, sprite: bool) {
         let mut color = color & 0x3F;
         if self.mask & 1 != 0 {
             color &= 0x30;
         }
-        fb[y * 256 + x] = color as u16 | ((self.mask as u16 & 0xE0) << 1);
+        fb[y * 256 + x] = color as u16 | ((self.mask as u16 & 0xE0) << 1) | if sprite { FRAME_SPRITE } else { 0 };
     }
 
     /// Rasterises the 8 sprite slots into `sp_buf`; lower slots win, as in hardware.
@@ -993,6 +999,10 @@ mod tests {
     fn fb() -> Vec<u16> {
         vec![0u16; WIDTH * 240]
     }
+
+    /// Test ROM (fetched by scripts/fetch-test-roms.sh) that shows sprites, and how long to run it.
+    const LAYERS_ROM: &str = "scrolltest/scroll.nes";
+    const LAYERS_FRAMES: u32 = 60;
 
     fn run_to(ppu: &mut Ppu, cart: &mut Cartridge, fb: &mut [u16], line: i16, dot: u16) {
         for _ in 0..200_000 {
@@ -1286,6 +1296,32 @@ mod tests {
             }
         }
         assert_eq!(f[0] & 0x3F, 0x29, "backdrop colour");
-        assert_eq!(f[0] >> 6, 0b111, "emphasis in bits 6-8");
+        assert_eq!((f[0] & !FRAME_SPRITE) >> 6, 0b111, "emphasis in bits 6-8");
+    }
+
+    /// `frame_layers` marks sprite pixels of a test ROM's picture and reading it changes nothing.
+    #[test]
+    fn frame_layers_marks_sprites() {
+        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/roms"));
+        let Ok(bytes) = std::fs::read(dir.join(LAYERS_ROM)) else { return };
+        let (mut a, mut b) = (crate::Nes::new(&bytes, None).unwrap(), crate::Nes::new(&bytes, None).unwrap());
+        let mut layers = vec![0xFFu8; crate::WIDTH * crate::HEIGHT];
+        for _ in 0..LAYERS_FRAMES {
+            a.run_frame([0; 4]);
+            b.run_frame([0; 4]);
+            a.frame_layers(&mut layers);
+        }
+        let ones = layers.iter().filter(|&&l| l == 1).count();
+        eprintln!("{LAYERS_ROM}: {ones} sprite pixels");
+        assert!(layers.iter().all(|&l| l <= 1));
+        assert!(ones > 0 && ones < layers.len() / 4, "{ones} sprite pixels");
+        for (l, w) in layers.iter().zip(a.frame()) {
+            assert_eq!(*l == 1, w & FRAME_SPRITE != 0);
+        }
+        assert_eq!(a.state_hash(), b.state_hash());
+        let (mut pa, mut pb) = (vec![0u8; layers.len() * 4], vec![0u8; layers.len() * 4]);
+        a.frame_rgba(&mut pa);
+        b.frame_rgba(&mut pb);
+        assert!(pa == pb, "picture differs");
     }
 }
