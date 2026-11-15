@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn enhance_and_ambient_default_for_old_files_and_round_trip() {
         use crate::enhance::Mode;
-        let old: Config = toml::from_str("fullscreen = true\nscale = 2\nscreen = \"fit\"\neffect = \"crt\"\n").unwrap();
+        let old: Config = toml::from_str("fullscreen = true\nscale = 2\nscreen = \"fit\"\neffect = \"crttv\"\n").unwrap();
         assert_eq!((old.enhance, old.ambient), (Mode::Off, true));
         let set: Config = toml::from_str("enhance = \"depth\"\nambient = false\n").unwrap();
         assert_eq!((set.enhance, set.ambient), (Mode::Depth, false));
