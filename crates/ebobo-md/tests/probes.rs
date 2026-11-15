@@ -23,6 +23,12 @@ const KNOWN_DIFF: &[(&str, &str)] = &[
     ("hint_pend", "counts and V bytes match; only H counter bytes differ: access timing inside an instruction"),
     ("fifo_rate", "one write slot off at the start: FIFO slot timing"),
     ("fifo_status", "FIFO empty flag one write early: FIFO slot timing"),
+    ("fifo_pace", "320-pixel mode: writes 1-4 end where the reference's do (nothing held) and the line's slot count matches \
+                   (24 words from H 0x10 end on the same line), but a held write resumes 13-22 H counts early: the chip's \
+                   drawing-line slots sit later in the line than our even spread (resume at H 0x4E/0x66/0x86, ours 0x41/0x59/0x70); \
+                   one word in the FIFO still reads not-empty at the next status read (as fifo_status). Display off and \
+                   vertical blanking agree within the instruction scatter (2-8 H counts)"),
+    ("fifo_pace_h32", "as fifo_pace, 256-pixel mode: held writes resume 3-16 H counts off, not a uniform shift"),
     ("row_point", "HV words read after each write differ by a few H counts (poll phase: access timing inside an instruction); \
                    the rows each write changes match, see tools/md-oracle/row_point.py"),
     ("row_point_c", "as row_point"),
