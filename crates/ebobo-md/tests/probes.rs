@@ -25,6 +25,9 @@ const KNOWN_DIFF: &[(&str, &str)] = &[
     ("boot_phase", "power-on HV word reads V = 0x9F (NTSC) / 0x84 (PAL), H = 0 in the reference although its first blanking \
                     comes 32 / 58 lines later; ours matches the blanking time within 1 poll pass, not the HV word"),
     ("boot_clock", "frame 1 within 2 passes of 210 clocks; ours loses 4 passes a frame (refresh/access timing, as frame_cycles)"),
+    ("dma_rate", "68000 transfers of 128/64/40 words in the picture end on the reference's word; 16-word transfers end 1-2 slots early \
+                  (slots are spread evenly in ours, unevenly in the chip); 1024 words while blanked end about 15 slots early"),
+    ("dma_rate_h32", "as dma_rate, 256-pixel mode"),
 ];
 
 /// Word 0 of the result block when the probe's `main` returned.
