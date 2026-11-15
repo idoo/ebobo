@@ -95,9 +95,15 @@ pub(crate) struct Machine {
     /// the frame loop look at can change, so the VDP is only brought forward then and at port
     /// accesses. Derived, not state: 0 (sync at once) after power-on and after state loads.
     pub vdp_due: u64,
+    /// Master clock by which the Z80 is next caught up (one line after its last catch-up). It
+    /// runs in slices; every access that could see or change what it does catches it up first.
+    /// Derived, not state: 0 after power-on and after state loads.
+    pub z80_due: u64,
 }
 
 const CART_END: u32 = 0x40_0000;
+/// Longest the Z80 runs behind the 68000: one line of master clocks.
+const Z80_SLICE: u64 = 3420;
 const RAM_START: u32 = 0xE0_0000;
 
 /// Cartridge and work RAM: the 68000 memory that a DMA and the Z80's window read.
@@ -169,7 +175,7 @@ impl Machine {
             m68k_refresh: 0,
         };
         let audio = AudioOut::new(if pal { MCLK_PAL } else { MCLK_NTSC });
-        let mut machine = Machine { s, cart, screen: Screen::new(), audio, output: true, vdp_due: 0 };
+        let mut machine = Machine { s, cart, screen: Screen::new(), audio, output: true, vdp_due: 0, z80_due: 0 };
         machine.reset_m68k();
         machine
     }
@@ -178,6 +184,7 @@ impl Machine {
     /// The Z80 is held in reset again, its bus is not requested and its bank register is 0,
     /// as after power-on.
     pub(crate) fn reset(&mut self) {
+        self.run_z80();
         self.sync_sound();
         self.s.ym.reset();
         self.s.z80.reset();
@@ -220,11 +227,13 @@ impl Machine {
     }
 
     /// Runs the Z80 from `s.z80_now` up to `s.now`, its /INT line following the VDP; while
-    /// it is in reset or its bus is taken, time just passes.
+    /// it is in reset or its bus is taken, time just passes. The next catch-up is due one
+    /// line later at the latest.
     ///
     /// The VDP only moves forward, so /INT is the VDP's line as it stands (at most at
     /// `s.now`), not as it was at `z80_now`: the Z80 sees an edge up to one slice late.
     pub(crate) fn run_z80(&mut self) {
+        self.z80_due = self.s.now + Z80_SLICE;
         while self.s.z80_now < self.s.now {
             if !self.s.z80_run || self.s.z80_busreq {
                 self.s.z80_now = self.s.now;
@@ -235,6 +244,15 @@ impl Machine {
             let t_states = cpu.step(&mut Z80View(self));
             self.s.z80 = cpu;
             self.s.z80_now += u64::from(t_states) * Z80_DIV;
+        }
+    }
+
+    /// [`Machine::run_z80`] once its slice is over or the VDP's next event (which may move the
+    /// Z80's /INT line) is reached; call before [`Machine::sync_vdp_if_due`].
+    #[inline]
+    pub(crate) fn run_z80_if_due(&mut self) {
+        if self.s.now >= self.z80_due.min(self.vdp_due) {
+            self.run_z80();
         }
     }
 
@@ -299,6 +317,12 @@ impl Machine {
         let now = self.s.now;
         let State { vdp, ram, cart, .. } = &mut self.s;
         vdp.write(addr, val, now, &mut Mem { cart: &self.cart, cs: cart, ram });
+    }
+
+    /// A byte to the PSG from the 68000 at `s.now`, after the Z80's earlier writes.
+    fn m68k_psg_write(&mut self, val: u8) {
+        self.run_z80();
+        self.psg_write(val, self.s.now);
     }
 
     /// A byte to the PSG at master clock `t`.
@@ -373,7 +397,10 @@ impl ebobo_m68k::Bus for M68kView<'_> {
         let addr = addr & 0xFF_FFFF;
         match addr {
             0x00_0000..=0x3F_FFFF | 0xE0_0000..=0xFF_FFFF => m.mem().read8(addr),
-            0xA0_0000..=0xA0_FFFF if m.z80_bus_granted() => m.zspace_read((addr & 0x7FFF) as u16, m.s.now),
+            0xA0_0000..=0xA0_FFFF if m.z80_bus_granted() => {
+                m.run_z80();
+                m.zspace_read((addr & 0x7FFF) as u16, m.s.now)
+            }
             0xA1_0000..=0xA1_001F => m.s.io.read((addr >> 1) & 0xF, m.s.now),
             // Bit 0 of the even byte is bit 8 of the word: 0 once the bus is granted.
             0xA1_1100 => u8::from(!m.s.z80_busreq),
@@ -403,7 +430,10 @@ impl ebobo_m68k::Bus for M68kView<'_> {
         let addr = addr & 0xFF_FFFF;
         match addr {
             0x00_0000..=0x3F_FFFF | 0xE0_0000..=0xFF_FFFF => m.mem().write8(addr, val),
-            0xA0_0000..=0xA0_FFFF if m.z80_bus_granted() => m.zspace_write((addr & 0x7FFF) as u16, val, m.s.now),
+            0xA0_0000..=0xA0_FFFF if m.z80_bus_granted() => {
+                m.run_z80();
+                m.zspace_write((addr & 0x7FFF) as u16, val, m.s.now)
+            }
             0xA1_0000..=0xA1_001F if addr & 1 != 0 => m.s.io.write((addr >> 1) & 0xF, val, m.s.now),
             0xA1_1100 => m.set_busreq(val & 1 != 0),
             0xA1_1200 => m.set_z80_reset(val & 1 != 0),
@@ -411,7 +441,7 @@ impl ebobo_m68k::Bus for M68kView<'_> {
             _ if is_vdp(addr) => match addr & 0x1F {
                 // The byte goes out on both halves of the data bus.
                 port @ 0x00..=0x07 => m.vdp_write(port & 0x1E, u16::from(val) * 0x0101),
-                0x11 | 0x13 | 0x15 | 0x17 => m.psg_write(val, m.s.now),
+                0x11 | 0x13 | 0x15 | 0x17 => m.m68k_psg_write(val),
                 _ => {}
             },
             _ => {}
@@ -426,7 +456,7 @@ impl ebobo_m68k::Bus for M68kView<'_> {
             0xA1_1200 => m.set_z80_reset(val & 0x0100 != 0),
             _ if is_vdp(addr) => match addr & 0x1E {
                 port @ 0x00..=0x0F => m.vdp_write(port, val),
-                0x10..=0x16 => m.psg_write(val as u8, m.s.now),
+                0x10..=0x16 => m.m68k_psg_write(val as u8),
                 _ => {}
             },
             _ => {
