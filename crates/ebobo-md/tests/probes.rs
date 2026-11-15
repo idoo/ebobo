@@ -13,7 +13,8 @@ const KNOWN_DIFF: &[(&str, &str)] = &[
     ("frame_cycles", "access timing inside an instruction (2 passes in 4202)"),
     ("vcounter", "H counter spacing: access timing inside an instruction"),
     ("blank_edges", "H-blank flag edges and HV sample spacing: access timing inside an instruction, H-blank edges open"),
-    ("hint_lines", "register 10 = 0: a pending interrupt from V = 0xE0 survives to V = 0xFF in ours, not in the reference"),
+    ("hint_lines", "register 10 = 0, first setting right after start-up: ours takes an extra request at V = 0xFF; hint_pend shows latching across blanking matches, so the cause is in the start-up frame (open)"),
+    ("hint_pend", "counts and V bytes match; only H counter bytes differ: access timing inside an instruction"),
     ("fifo_rate", "one write slot off at the start: FIFO slot timing"),
     ("fifo_status", "FIFO empty flag one write early: FIFO slot timing"),
 ];
