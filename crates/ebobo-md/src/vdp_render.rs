@@ -712,7 +712,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs vdp_sprites"]
     fn sprites_through_render_row() {
         let mut f = Fx::new();
         // Sprite table at 0xF000: one 8x8 sprite of pattern 1, palette line 2, high priority, at the top left.
