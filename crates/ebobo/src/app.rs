@@ -822,6 +822,7 @@ impl App {
             saved_ram = console.battery_ram().map(<[u8]>::to_vec).unwrap_or_default();
             save_path = Some(path);
         }
+        let snapshot_bytes = console.encode_state(&console.snapshot()).len();
         let mut solo = Solo {
             console,
             name: entry.name,
@@ -830,7 +831,7 @@ impl App {
             battery_at: Instant::now(),
             slot: 0,
             slot_times: [None; slots::SLOTS as usize],
-            rewind: rewind::Ring::new(rewind::CAPACITY),
+            rewind: rewind::Ring::new(rewind::BUDGET_BYTES, snapshot_bytes),
             since_snapshot: 0,
             rewinding: false,
             ff_on: false,
