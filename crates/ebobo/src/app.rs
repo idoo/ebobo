@@ -18,7 +18,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ebobo_console::{Console, Snapshot};
+use ebobo_art::{Art, Key, Kind};
+use ebobo_console::{Console, Snapshot, System};
 use ebobo_net::{
     GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, NetDiag, NetError, NetEvent, NetSession, NetStats, PeerId,
     Resume, ResumeInfo, ResumeKind, Stage,
@@ -32,7 +33,7 @@ use crate::i18n::Lang;
 use crate::input::{Input, InputFrame, PadEvent, PadInfo, PointerEvent};
 use crate::library::{self, Library, RomEntry};
 use crate::ui::{GameView, Text, Ui, UiAction, UiCtx};
-use crate::video::Video;
+use crate::video::{Frame, GameFrame, PictureRef, Pictures, Video};
 
 use cli::{Parsed, ResumeFrom, ScriptKey, Start};
 
@@ -144,6 +145,8 @@ struct App {
     scratch: Vec<f32>,
     /// The console's last picture, RGBA, at its own size.
     frame: Vec<u8>,
+    /// Size of the game picture in `frame` that `canvas` was last composed over; `None` in the menus.
+    frame_size: Option<(u32, u32)>,
     title_rom: Option<String>,
     quit: bool,
     /// `--autostart N`: host starts once N players are in and the game can start.
@@ -219,7 +222,9 @@ pub fn run(args: Vec<String>) -> i32 {
     app.updater.install_on_quit();
     if let Some(path) = &cli.screenshot {
         // What the screen shows (effects included), else the plain canvas.
-        let (w, h, px) = match app.video.capture(&app.canvas.px, cli.screenshot_size) {
+        let pictures = ArtPictures(app.ui.art());
+        let shot = app.video.capture_frame(&layers(&app.frame, app.frame_size, &app.canvas, &pictures), cli.screenshot_size);
+        let (w, h, px) = match shot {
             Ok(shot) => shot,
             Err(err) => {
                 eprintln!("ebobo: screenshot read-back failed ({err}), writing the 256x240 canvas");
@@ -284,7 +289,9 @@ impl App {
         let mut video = Video::new(&sdl, config.fullscreen, config.scale, config.screen)?;
         video.set_effect(config.effect);
         let lang = Lang::resolve(config.lang.as_deref());
-        let mut ui = Ui::new(lang);
+        let art = Art::new(config::data_dir().join("art"), config.online_art);
+        let shelf = ebobo_art::shelf::Shelf::load(config::data_dir().join("shelf.tsv"));
+        let mut ui = Ui::with_library(lang, art, shelf);
         let audio = match Audio::new(&sdl) {
             Ok(mut audio) => {
                 audio.set_volume(config.volume);
@@ -329,6 +336,7 @@ impl App {
             samples: Vec::with_capacity(4096),
             scratch: Vec::with_capacity(2048),
             frame: Vec::new(),
+            frame_size: None,
             title_rom: None,
             quit: false,
             autostart: cli.autostart,
@@ -403,6 +411,9 @@ impl App {
     fn tick(&mut self, dt: Duration) {
         let video = &self.video;
         let frame = self.input.poll(&mut self.pump, dt, |pos| video.to_canvas(pos));
+        // Finished box art: every tick draws the whole frame, so a new picture shows by itself.
+        self.ui.art_mut().set_online(self.config.online_art);
+        self.ui.art_mut().poll();
         self.ui.tick(&frame, dt);
         if std::mem::take(&mut self.menu_hint) && self.in_game() {
             let hint = if frame.hint_kind.is_some() { Text::MenuHintPad } else { Text::MenuHintKeys };
@@ -516,7 +527,8 @@ impl App {
         // Hidden during play (menus over a game keep it, they take clicks).
         let playing = self.in_game() && !self.ui.is_visible();
         self.video.set_cursor_visible(!playing && self.mouse_at.is_some_and(|t| t.elapsed() < CURSOR_IDLE));
-        if let Err(err) = self.video.present(&self.canvas.px) {
+        let pictures = ArtPictures(self.ui.art());
+        if let Err(err) = self.video.present_frame(&layers(&self.frame, self.frame_size, &self.canvas, &pictures)) {
             eprintln!("ebobo: present: {err}");
         }
         self.update_title();
@@ -840,6 +852,7 @@ impl App {
         for slot in 0..slots::SLOTS {
             solo.slot_times[slot as usize] = slots::saved_at(&solo.slot_path(slot));
         }
+        self.game_started(solo.console.system(), solo.console.crc32());
         self.input.reset_seats();
         self.pads = self.input.pads();
         self.state = State::Solo(Box::new(solo));
@@ -952,6 +965,7 @@ impl App {
                 return self.net_error(&err);
             }
         };
+        self.game_started(console.system(), console.crc32());
         self.input.reset_seats();
         self.pads = self.input.pads();
         self.state = State::Net(Box::new(Net {
@@ -978,6 +992,14 @@ impl App {
         self.ui.hide();
         self.menu_hint = true;
         self.video.power_on();
+    }
+
+    /// A game starts (solo, hosted or joined): the shelf notes it as played now and the pads
+    /// carry that system's buttons.
+    fn game_started(&mut self, system: System, crc32: u32) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        self.ui.shelf_mut().played(Key { system, crc32 }, now);
+        self.input.set_system(system);
     }
 
     /// Keeps a ROM the host sent in this player's own library, so the game is there next time
@@ -1224,13 +1246,16 @@ impl App {
     }
 
     fn compose(&mut self, frame: &InputFrame) {
-        let size = match &self.state {
+        // With a game the canvas starts transparent (the game layer shows through where the
+        // interface draws nothing); the menus have their backdrop.
+        self.frame_size = match &self.state {
             State::Solo(s) => Some(s.console.frame_rgba(&mut self.frame)),
             State::Net(n) => Some(n.console.frame_rgba(&mut self.frame)),
             State::Menu | State::Lobby(_) => None,
-        };
-        match size {
-            Some((w, h)) => game_frame_to_canvas(&mut self.canvas, &self.frame, w, h),
+        }
+        .map(|(w, h)| (w as u32, h as u32));
+        match self.frame_size {
+            Some(_) => self.canvas.clear_transparent(),
             None => self.canvas.clear(BACKDROP),
         }
         let notice = self.net_notice();
@@ -1355,15 +1380,30 @@ impl Net {
     }
 }
 
-/// Where the game's picture reaches the screen: a `w`x`h` RGBA frame becomes the canvas the
-/// interface draws on. A 256x240 frame (the NES) is copied as is; other sizes (the Mega Drive's
-/// 320x224, ...) are not shown yet and leave a black canvas. Stage B (layered picture) replaces this.
-fn game_frame_to_canvas(canvas: &mut Canvas, rgba: &[u8], w: usize, h: usize) {
-    if (w, h) == (canvas::W, canvas::H) {
-        canvas.px.copy_from_slice(&rgba[..w * h * 4]);
-    } else {
-        canvas.clear([0, 0, 0, 255]);
+/// The interface's pictures (box art on the library's cards) for `Video`, by `Placed::id`:
+/// `(system as u64) << 32 | crc32`.
+struct ArtPictures<'a>(&'a Art);
+
+impl Pictures for ArtPictures<'_> {
+    fn picture(&self, id: u64) -> Option<PictureRef<'_>> {
+        let system = match id >> 32 {
+            0 => System::Nes,
+            1 => System::MegaDrive,
+            _ => return None,
+        };
+        let (picture, kind) = self.0.get(Key { system, crc32: id as u32 })?;
+        let stamp = match kind {
+            Kind::BoxArt => 1,
+            Kind::TitleScreen => 2,
+        };
+        Some(PictureRef { w: picture.w, h: picture.h, rgba: &picture.rgba, stamp })
     }
+}
+
+/// The frame to show: the game's picture in `frame` when `size` says one is on screen, the
+/// placed pictures and the interface.
+fn layers<'a>(frame: &'a [u8], size: Option<(u32, u32)>, ui: &'a Canvas, pictures: &'a ArtPictures<'a>) -> Frame<'a> {
+    Frame { game: size.map(|(w, h)| GameFrame { rgba: frame, w, h }), ui, pictures }
 }
 
 fn make_ctx<'a>(

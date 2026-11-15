@@ -40,6 +40,8 @@ pub struct Config {
     pub sprite_limit: SpriteLimit,
     /// Check GitHub for a newer ebobo on start and install it (Settings ▸ Advanced).
     pub auto_update: bool,
+    /// Download box art for the library's cards (Settings ▸ Advanced); off shows only what is cached.
+    pub online_art: bool,
 }
 
 /// "Sprite limit" setting.
@@ -98,6 +100,7 @@ impl Default for Config {
             ff_toggle: false,
             sprite_limit: SpriteLimit::Auto,
             auto_update: true,
+            online_art: true,
         }
     }
 }
@@ -297,6 +300,16 @@ mod tests {
         assert_eq!(old, Config::default());
         let text = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(!text.contains("buttons"));
+    }
+
+    #[test]
+    fn online_art_defaults_on_for_old_files() {
+        let old: Config = toml::from_str("fullscreen = true\nscale = 2\nauto_update = false\n").unwrap();
+        assert!(old.online_art);
+        let off: Config = toml::from_str("online_art = false\n").unwrap();
+        assert!(!off.online_art);
+        let text = toml::to_string_pretty(&Config { online_art: false, ..Config::default() }).unwrap();
+        assert!(!toml::from_str::<Config>(&text).unwrap().online_art);
     }
 
     #[test]

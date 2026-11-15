@@ -77,15 +77,6 @@ impl<'a> Layers<'a> {
     }
 }
 
-/// No pictures: the old byte entry points.
-struct NoPictures;
-
-impl Pictures for NoPictures {
-    fn picture(&self, _id: u64) -> Option<PictureRef<'_>> {
-        None
-    }
-}
-
 /// A cached picture texture.
 struct Pic {
     id: u64,
@@ -247,26 +238,14 @@ impl Video {
 
     /// Shows one frame: the game (if any), the placed pictures and the interface, composed
     /// in the picture rectangle of the game's size (256x240 without a game).
-    #[allow(dead_code)] // Until the app is switched over from `present`.
     pub fn present_frame(&mut self, frame: &Frame) -> Result<(), String> {
         self.show(&Layers::of(frame))
     }
 
     /// The frame as the screen shows it (effects included) composed at `size` (default: the
     /// drawable size): (width, height, RGBA bytes). Screenshots; needs render targets.
-    #[allow(dead_code)] // Until the app is switched over from `capture`.
     pub fn capture_frame(&mut self, frame: &Frame, size: Option<(u32, u32)>) -> Result<(u32, u32, Vec<u8>), String> {
         self.shoot(&Layers::of(frame), size)
-    }
-
-    // Old entry point (interface bytes only, no game); the lead deletes it once the app calls `present_frame`.
-    pub fn present(&mut self, rgba: &[u8]) -> Result<(), String> {
-        self.show(&Layers { game: None, ui: rgba, placed: &[], pictures: &NoPictures })
-    }
-
-    // Old entry point (interface bytes only, no game); the lead deletes it once the app calls `capture_frame`.
-    pub fn capture(&mut self, rgba: &[u8], size: Option<(u32, u32)>) -> Result<(u32, u32, Vec<u8>), String> {
-        self.shoot(&Layers { game: None, ui: rgba, placed: &[], pictures: &NoPictures }, size)
     }
 
     fn show(&mut self, layers: &Layers) -> Result<(), String> {
