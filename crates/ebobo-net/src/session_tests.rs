@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ebobo_core::Nes;
+use ebobo_console::Console;
 
 use super::*;
 
 const PROBE_FRAME: i32 = 900;
 /// Random netplay inputs: pad bits plus both turbo bits (a wrong turbo phase after a rollback
 /// then shows up as a desync); never reset.
-const RANDOM_INPUT: u64 = 0x6FF;
+const RANDOM_INPUT: u64 = 0x6_00FF;
 /// Delays `run_lossy` forces in turn when `shuffle_delay` is set: rises and falls of 1-5 frames.
 const DELAY_CYCLE: [usize; 6] = [4, 1, 6, 2, 5, 3];
 /// Advanced frames between two forced delay changes on one peer.
@@ -39,13 +39,13 @@ impl XorShift {
 }
 
 /// `None` (after a notice) when the test ROMs were not fetched.
-fn nes() -> Option<Nes> {
+fn nes() -> Option<Console> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../ebobo-core/tests/roms/nestest/nestest.nes");
     let Ok(rom) = std::fs::read(path) else {
         println!("test ROMs missing: run scripts/fetch-test-roms.sh");
         return None;
     };
-    Some(Nes::new(&rom, None).expect("load nestest"))
+    Some(Console::new(&rom, None).expect("load nestest"))
 }
 
 fn bind() -> UdpSocket {
@@ -273,7 +273,7 @@ fn run_lossy(n: usize, seed: u64, probe: i32, timeout: Duration, shuffle_delay: 
             s
         })
         .collect();
-    let mut emus: Vec<Nes> = std::iter::once(first).chain((1..n).map(|_| nes().unwrap())).collect();
+    let mut emus: Vec<Console> = std::iter::once(first).chain((1..n).map(|_| nes().unwrap())).collect();
     let mut rngs: Vec<XorShift> = (0..n).map(|i| XorShift(seed ^ (0x9E37_79B9 * (i as u64 + 1)))).collect();
     let mut advanced = vec![0u32; n];
     let mut rollbacks = vec![0u64; n];
@@ -298,7 +298,7 @@ fn run_lossy(n: usize, seed: u64, probe: i32, timeout: Duration, shuffle_delay: 
             } else if i == 0 && advanced[i] == 300 {
                 INPUT_RESET
             } else {
-                (rngs[i].next() & RANDOM_INPUT) as u16
+                (rngs[i].next() & RANDOM_INPUT) as u32
             };
             let out = s.advance(&mut emus[i], input).expect("advance");
             if out.advanced {
@@ -373,7 +373,7 @@ fn session_lossy_soak_4p() {
 #[test]
 fn predictor_repeats_held_and_turbo_not_one_frame_bits() {
     use ggrs::InputPredictor;
-    let held = ebobo_core::pad::A as u16 | ebobo_core::pad::START as u16 | INPUT_TURBO_A | INPUT_TURBO_B;
+    let held = ebobo_console::nes::pad::A as u32 | ebobo_console::nes::pad::START as u32 | INPUT_TURBO_A | INPUT_TURBO_B;
     assert_eq!(PredictHeld::predict(held), held);
     for bit in [INPUT_RESET, INPUT_SAVE, INPUT_LOAD] {
         assert_eq!(PredictHeld::predict(held | bit), held, "bit {bit:#x}");
@@ -381,24 +381,27 @@ fn predictor_repeats_held_and_turbo_not_one_frame_bits() {
     }
     assert_eq!(PredictHeld::predict(held | INPUT_RESET | INPUT_SAVE | INPUT_LOAD), held);
     assert_eq!(PredictHeld::predict(0), 0);
-    assert_eq!(PredictHeld::predict(u16::MAX), u16::MAX & !(INPUT_RESET | INPUT_SAVE | INPUT_LOAD));
+    assert_eq!(PredictHeld::predict(u32::MAX), u32::MAX & !(INPUT_RESET | INPUT_SAVE | INPUT_LOAD));
 }
 
 #[test]
 fn turbo_expansion_follows_frame_phase() {
-    use ebobo_core::pad::{A, B, START};
+    use ebobo_console::nes::pad;
+    const A: u16 = pad::A as u16;
+    const B: u16 = pad::B as u16;
+    const START: u16 = pad::START as u16;
     // Phase on for frames 0, 1, 4, 5, 8, ...; off for 2, 3, 6, 7, ...
     let on: Vec<bool> = (0..8).map(|f| expand_turbo(INPUT_TURBO_A, f) & A != 0).collect();
     assert_eq!(on, [true, true, false, false, true, true, false, false]);
     assert_eq!(expand_turbo(INPUT_TURBO_A, 1001), A, "frame 1001: (1001 / 2) % 2 == 0");
     assert_eq!(expand_turbo(INPUT_TURBO_A, 1002), 0);
     // Held wins over turbo: A stays pressed in the off phase.
-    assert_eq!(expand_turbo(A as u16 | INPUT_TURBO_A, 2), A);
+    assert_eq!(expand_turbo(A as u32 | INPUT_TURBO_A, 2), A);
     assert_eq!(expand_turbo(INPUT_TURBO_A | INPUT_TURBO_B, 4), A | B);
     assert_eq!(expand_turbo(INPUT_TURBO_A | INPUT_TURBO_B, 6), 0);
-    // Other bits pass through untouched; reset and turbo bits never reach the pad byte.
-    assert_eq!(expand_turbo(START as u16 | 0x80 | INPUT_TURBO_B, 2), START | 0x80);
-    assert_eq!(expand_turbo(START as u16 | 0x80 | INPUT_TURBO_B | INPUT_RESET, 0), START | 0x80 | B);
+    // Other bits pass through untouched; reset and turbo bits never reach the pad bits.
+    assert_eq!(expand_turbo(START as u32 | 0x80 | INPUT_TURBO_B, 2), START | 0x80);
+    assert_eq!(expand_turbo(START as u32 | 0x80 | INPUT_TURBO_B | INPUT_RESET, 0), START | 0x80 | B);
 }
 
 /// Feeds `target` to `c` every 100 ms from `t0 + from_ms` to `t0 + to_ms` (exclusive) and returns
@@ -558,10 +561,10 @@ impl Player {
         Player { rng: XorShift(seed), held: 0, held_left: 0, button: 0, button_left: 0, tick: 0 }
     }
 
-    fn next(&mut self, feed: Feed) -> u16 {
-        use ebobo_core::pad;
+    fn next(&mut self, feed: Feed) -> u32 {
+        use ebobo_console::nes::pad;
         if feed == Feed::Random {
-            return (self.rng.next() & RANDOM_INPUT) as u16;
+            return (self.rng.next() & RANDOM_INPUT) as u32;
         }
         self.tick += 1;
         if self.held_left == 0 {
@@ -576,10 +579,10 @@ impl Player {
                 if self.button == 0 { 10 + (self.rng.next() % 51) as u32 } else { 4 + (self.rng.next() % 9) as u32 };
         }
         self.button_left -= 1;
-        let word = (self.held | self.button) as u16;
+        let word = (self.held | self.button) as u32;
         match feed {
             Feed::TurboHeld => word | INPUT_TURBO_B,
-            Feed::TurboFlip if (self.tick / 2) % 2 == 0 => word | pad::B as u16,
+            Feed::TurboFlip if (self.tick / 2) % 2 == 0 => word | pad::B as u32,
             _ => word,
         }
     }
@@ -600,7 +603,7 @@ fn run_paced(profile: Profile, n: usize, delay: usize, max_prediction: usize, se
                 .expect("session")
         })
         .collect();
-    let mut emus: Vec<Nes> = std::iter::once(first).chain((1..n).map(|_| nes().unwrap())).collect();
+    let mut emus: Vec<Console> = std::iter::once(first).chain((1..n).map(|_| nes().unwrap())).collect();
     let mut players: Vec<Player> = (0..n).map(|i| Player::new(seed ^ (0x9E37_79B9 * (i as u64 + 1)))).collect();
     let mut polled = vec![Instant::now(); n];
     let mut st = RunStats::default();
@@ -685,9 +688,9 @@ fn run_paced(profile: Profile, n: usize, delay: usize, max_prediction: usize, se
 
 /// Mean time of one 12-frame rollback on the real core (load, 12 × save + hash + run, the last
 /// frame rendered) and the worst of `reps`.
-fn rollback_cost(nes: &mut Nes, reps: u32) -> (Duration, Duration) {
+fn rollback_cost(nes: &mut Console, reps: u32) -> (Duration, Duration) {
     for f in 0..120u32 {
-        nes.run_frame([f as u8, 0, 0, 0]);
+        nes.run_frame([f as u8 as u16, 0, 0, 0]);
     }
     nes.clear_audio();
     let snap = nes.snapshot();
@@ -698,7 +701,7 @@ fn rollback_cost(nes: &mut Nes, reps: u32) -> (Duration, Duration) {
         for f in 0..12u8 {
             std::hint::black_box((nes.snapshot(), nes.state_hash()));
             nes.set_fast_forward(f < 11);
-            nes.run_frame([f.wrapping_mul(37), 0, 0, 0]);
+            nes.run_frame([f.wrapping_mul(37) as u16, 0, 0, 0]);
         }
         nes.clear_audio();
         let took = started.elapsed();
@@ -872,7 +875,7 @@ fn direct_pair() -> (NetSession, NetSession) {
 }
 
 /// Drives both until running and `frames` frames advanced on each.
-fn warm_up(sa: &mut NetSession, sb: &mut NetSession, na: &mut Nes, nb: &mut Nes, frames: u32) {
+fn warm_up(sa: &mut NetSession, sb: &mut NetSession, na: &mut Console, nb: &mut Console, frames: u32) {
     let (mut fa, mut fb) = (0, 0);
     let deadline = Instant::now() + Duration::from_secs(20);
     while fa < frames || fb < frames {
@@ -976,7 +979,7 @@ fn session_peer_leaving_caught_up_keeps_playing() {
 }
 
 /// Drives both for `frames` more frames on each and returns the `Saved` events of each.
-fn saved_events(sa: &mut NetSession, sb: &mut NetSession, na: &mut Nes, nb: &mut Nes, frames: u32) -> [Vec<NetEvent>; 2] {
+fn saved_events(sa: &mut NetSession, sb: &mut NetSession, na: &mut Console, nb: &mut Console, frames: u32) -> [Vec<NetEvent>; 2] {
     let (mut fa, mut fb) = (0, 0);
     let mut saved = [Vec::new(), Vec::new()];
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -1042,7 +1045,7 @@ const SAVE_DELAY: usize = 2;
 struct Press {
     peer: usize,
     after: u32,
-    bits: u16,
+    bits: u32,
 }
 
 impl Press {
@@ -1051,7 +1054,7 @@ impl Press {
     }
 }
 
-/// The frame procedure of `NetSession::advance`, run on a plain `Nes` without a network over the
+/// The frame procedure of `NetSession::advance`, run on a plain `Console` without a network over the
 /// final input words of every frame.
 struct Reference {
     events: Vec<NetEvent>,
@@ -1063,7 +1066,7 @@ struct Reference {
     at_start: Vec<u64>,
 }
 
-fn reference(log: &[[u16; 4]], start: Option<&ebobo_core::Snapshot>) -> Reference {
+fn reference(log: &[[u32; 4]], start: Option<&ebobo_console::Snapshot>) -> Reference {
     let mut nes = nes().expect("ROMs present");
     if let Some(s) = start {
         nes.restore(s);
@@ -1073,7 +1076,7 @@ fn reference(log: &[[u16; 4]], start: Option<&ebobo_core::Snapshot>) -> Referenc
     for (frame, words) in log.iter().enumerate() {
         let frame = frame as i32;
         r.at_start.push(nes.state_hash());
-        let lowest = |bit: u16| words.iter().position(|w| w & bit != 0);
+        let lowest = |bit: u32| words.iter().position(|w| w & bit != 0);
         // The save a load of this frame finds: the one before a save of this same frame.
         let mut before = None;
         if let Some(slot) = lowest(INPUT_SAVE) {
@@ -1098,7 +1101,7 @@ fn reference(log: &[[u16; 4]], start: Option<&ebobo_core::Snapshot>) -> Referenc
     r
 }
 
-fn state_hash_of(snapshot: &ebobo_core::Snapshot) -> u64 {
+fn state_hash_of(snapshot: &ebobo_console::Snapshot) -> u64 {
     let mut scratch = nes().expect("ROMs present");
     scratch.restore(snapshot);
     scratch.state_hash()
@@ -1107,7 +1110,7 @@ fn state_hash_of(snapshot: &ebobo_core::Snapshot) -> u64 {
 /// What `run_saves` saw; every peer agreed on it.
 struct SaveRun {
     /// Final input words of every frame up to the last frame final on every peer.
-    log: Vec<[u16; 4]>,
+    log: Vec<[u32; 4]>,
     reference: Reference,
     /// Frames re-simulated by all peers together.
     rollback_frames: u64,
@@ -1130,7 +1133,7 @@ fn run_saves(
     seed: u64,
     presses: &[Press],
     probe: i32,
-    start: Option<&ebobo_core::Snapshot>,
+    start: Option<&ebobo_console::Snapshot>,
     observe: &mut dyn FnMut(usize, &NetSession),
 ) -> Option<SaveRun> {
     let first = nes()?;
@@ -1144,7 +1147,7 @@ fn run_saves(
             s
         })
         .collect();
-    let mut emus: Vec<Nes> = std::iter::once(first).chain((1..n).map(|_| nes().unwrap())).collect();
+    let mut emus: Vec<Console> = std::iter::once(first).chain((1..n).map(|_| nes().unwrap())).collect();
     if let Some(s) = start {
         emus.iter_mut().for_each(|e| e.restore(s));
     }
@@ -1181,7 +1184,7 @@ fn run_saves(
                 // Frame debt above 3 ticks is dropped, as the frontend does.
                 next[i] = if now.saturating_duration_since(next[i]) > period * 3 { now + period } else { next[i] + period };
             }
-            let mut input = (rngs[i].next() & RANDOM_INPUT) as u16;
+            let mut input = (rngs[i].next() & RANDOM_INPUT) as u32;
             // Only a running session takes the input; it lands `SAVE_DELAY` after the current frame.
             while s.is_running() && queues[i].last().is_some_and(|p| s.ggrs.current_frame() >= p.after as i32) {
                 input |= queues[i].pop().unwrap().bits;
@@ -1229,14 +1232,14 @@ fn run_saves(
     Some(SaveRun { log, reference: r, rollback_frames, probe_hash })
 }
 
-fn press(peer: usize, after: u32, bits: u16) -> Press {
+fn press(peer: usize, after: u32, bits: u32) -> Press {
     Press { peer, after, bits }
 }
 
 /// Both peers save and load at different frames on a lossy, jittery link with input that
 /// mispredicts nearly every late frame: both report the same saves and loads, hand out the same
 /// saved and checkpoint states, and every one of them, and the state after the loads, is what a
-/// plain `Nes` replaying the final inputs with the same frame procedure has. A snapshot handed out
+/// plain `Console` replaying the final inputs with the same frame procedure has. A snapshot handed out
 /// before the rollback that corrected its frame would differ from the reference. The load on
 /// frame 32 finds no save and does nothing.
 #[test]
@@ -1312,7 +1315,7 @@ fn session_load_inside_save_rollback_window_and_same_frame_save_load() {
 fn session_start_save_is_loaded_before_any_save() {
     let Some(mut nes) = nes() else { return };
     for f in 0..200u32 {
-        nes.run_frame([(f * 7) as u8, (f * 13) as u8, 0, 0]);
+        nes.run_frame([(f * 7) as u8 as u16, (f * 13) as u8 as u16, 0, 0]);
     }
     let start = nes.snapshot();
     let presses = [press(1, 60, INPUT_LOAD), press(0, 200, INPUT_SAVE)];
@@ -1391,7 +1394,7 @@ fn run_uneven_leaver(seed: u64, save_load: bool) -> Option<LeaverRun> {
             s
         })
         .collect();
-    let mut emus: Vec<Nes> = std::iter::once(first).chain((1..3).map(|_| nes().unwrap())).collect();
+    let mut emus: Vec<Console> = std::iter::once(first).chain((1..3).map(|_| nes().unwrap())).collect();
     let mut rngs: Vec<XorShift> = (0..3).map(|i| XorShift(0x1EA7 ^ (0x9E37_79B9 * (i as u64 + 1)))).collect();
     let (mut saves, mut events, mut desyncs) = (vec![None; 2], vec![Vec::new(); 2], Vec::new());
     let (mut paused_at, mut dropped) = (None::<Instant>, false);
@@ -1417,7 +1420,7 @@ fn run_uneven_leaver(seed: u64, save_load: bool) -> Option<LeaverRun> {
             }
             let s = &mut sessions[i];
             s.poll();
-            let mut input = (rngs[i].next() & RANDOM_INPUT) as u16;
+            let mut input = (rngs[i].next() & RANDOM_INPUT) as u32;
             let f = s.ggrs.current_frame();
             if save_load && s.is_running() && i == 0 && s.input_log.len() <= 205 && f == 203 {
                 input |= INPUT_SAVE;

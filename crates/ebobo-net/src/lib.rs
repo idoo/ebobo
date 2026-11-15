@@ -8,7 +8,10 @@
 //!   direct-IP mode.
 //! - `lobby.rs`: lobby protocol on top of the mesh (game info, ROM transfer, ready, start)
 //!   running on a background thread.
-//! - `session.rs`: GGRS P2P session driving an `ebobo_core::Nes`.
+//! - `session.rs`: GGRS P2P session driving an `ebobo_console::Console` (NES or Mega Drive).
+//!
+//! The netplay input is one `u32` per player and frame: the system's own pad bits in bits 0-15
+//! (`INPUT_PAD`) and the `INPUT_*` action bits above them.
 
 mod diag;
 mod lobby;
@@ -27,20 +30,24 @@ pub use mesh::Link;
 pub use transport::{PeerId, RouteKind};
 
 /// Lobby `proto` value; peers with a different one refuse to play together.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_PLAYERS: usize = 4;
 pub const DEFAULT_DIRECT_PORT: u16 = 7777;
-/// Netplay input bit 8: press the console's Reset button on this frame.
-pub const INPUT_RESET: u16 = 0x100;
-/// Netplay input bit 9: turbo A is held. Every peer turns it into A presses from the simulated
+/// Netplay input bits 0-15: the pad, in the system's own pad bits (`ebobo_console::nes::pad` in
+/// the low byte, `ebobo_console::md::pad`).
+pub const INPUT_PAD: u32 = 0xFFFF;
+/// Netplay input bit 16: press the console's Reset button on this frame.
+pub const INPUT_RESET: u32 = 1 << 16;
+/// Netplay input bit 17: turbo A is held. Every peer turns it into A presses from the simulated
 /// frame number (on when `(frame / 2) % 2 == 0`), so a held turbo button is a constant input.
-pub const INPUT_TURBO_A: u16 = 0x200;
-/// Netplay input bit 10: turbo B is held; expanded like `INPUT_TURBO_A`.
-pub const INPUT_TURBO_B: u16 = 0x400;
-/// Netplay input bit 11: save the game for everyone on this frame (one frame, like reset).
-pub const INPUT_SAVE: u16 = 0x800;
-/// Netplay input bit 12: load the shared save for everyone on this frame (one frame).
-pub const INPUT_LOAD: u16 = 0x1000;
+/// NES only: other systems ignore it.
+pub const INPUT_TURBO_A: u32 = 1 << 17;
+/// Netplay input bit 18: turbo B is held; expanded like `INPUT_TURBO_A`.
+pub const INPUT_TURBO_B: u32 = 1 << 18;
+/// Netplay input bit 19: save the game for everyone on this frame (one frame, like reset).
+pub const INPUT_SAVE: u32 = 1 << 19;
+/// Netplay input bit 20: load the shared save for everyone on this frame (one frame).
+pub const INPUT_LOAD: u32 = 1 << 20;
 /// Room code alphabet: no I, O, 0, 1.
 pub const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub const CODE_LEN: usize = 5;

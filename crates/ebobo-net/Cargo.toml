@@ -6,7 +6,7 @@ license.workspace = true
 description = "Rollback netplay for ebobo: rooms, NAT hole punching, relay fallback, GGRS sessions"
 
 [dependencies]
-ebobo-core = { path = "../ebobo-core" }
+ebobo-console = { path = "../ebobo-console" }
 bincode = "1.3"
 # Vendored from https://github.com/gschup/ggrs at 25bd9983dee3ecb0677be03b9e2e23d2bd6d29cb with
 # one change, marked `// ebobo:` in src/: a player leaving with input the others received

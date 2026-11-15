@@ -1,32 +1,32 @@
-//! GGRS P2P session driving an `ebobo_core::Nes` (`docs/PROTOCOL.md` section 5).
+//! GGRS P2P session driving an `ebobo_console::Console` (`docs/PROTOCOL.md` section 5).
 //! Owner: session slice.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ebobo_core::Nes;
+use ebobo_console::{Console, Snapshot, System};
 use ggrs::{DesyncDetection, GgrsError, GgrsEvent, GgrsRequest, InputStatus, P2PSession, PlayerType, SessionBuilder, SessionState};
 
 use crate::lobby::{auto_input_delay, RttEstimator};
 use crate::mesh::Link;
 use crate::transport::{PeerId, RouteKind};
-use crate::{NetError, INPUT_LOAD, INPUT_RESET, INPUT_SAVE, INPUT_TURBO_A, INPUT_TURBO_B};
+use crate::{NetError, INPUT_LOAD, INPUT_PAD, INPUT_RESET, INPUT_SAVE, INPUT_TURBO_A, INPUT_TURBO_B};
 
-/// ggrs configuration: `Input = u16` (pad bits 0-7, `INPUT_RESET` bit 8, `INPUT_TURBO_A` bit 9,
-/// `INPUT_TURBO_B` bit 10, `INPUT_SAVE` bit 11, `INPUT_LOAD` bit 12), `State =
-/// ebobo_core::Snapshot`, `Address = PeerId`.
+/// ggrs configuration: `Input = u32` (pad bits 0-15 `INPUT_PAD`, `INPUT_RESET` bit 16,
+/// `INPUT_TURBO_A` bit 17, `INPUT_TURBO_B` bit 18, `INPUT_SAVE` bit 19, `INPUT_LOAD` bit 20),
+/// `State = ebobo_console::Snapshot`, `Address = PeerId`.
 pub struct EboboConfig;
 
 impl ggrs::Config for EboboConfig {
-    type Input = u16;
+    type Input = u32;
     type InputPredictor = PredictHeld;
-    type State = ebobo_core::Snapshot;
+    type State = Snapshot;
     type Address = PeerId;
 }
 
 /// Bits that act on the one frame they are sent for: reset, save for everyone, load for everyone.
-const ONE_FRAME_BITS: u16 = INPUT_RESET | INPUT_SAVE | INPUT_LOAD;
+const ONE_FRAME_BITS: u32 = INPUT_RESET | INPUT_SAVE | INPUT_LOAD;
 
 /// Repeats the last input (the GGPO standard) without the one-frame bits (`ONE_FRAME_BITS`):
 /// they are never held, so predicting them again would always miss. A set one-frame bit
@@ -34,23 +34,24 @@ const ONE_FRAME_BITS: u16 = INPUT_RESET | INPUT_SAVE | INPUT_LOAD;
 /// repeat.
 pub struct PredictHeld;
 
-impl ggrs::InputPredictor<u16> for PredictHeld {
-    fn predict(previous: u16) -> u16 {
+impl ggrs::InputPredictor<u32> for PredictHeld {
+    fn predict(previous: u32) -> u32 {
         previous & !ONE_FRAME_BITS
     }
 }
 
-/// NES pad byte for netplay input word `input` on simulated frame `frame`: the held pad bits,
-/// plus A / B while their turbo bit is set and the turbo phase `(frame / 2) % 2 == 0` is on.
-/// Every peer derives the phase from the GGRS frame, so re-simulated frames match.
-pub(crate) fn expand_turbo(input: u16, frame: i32) -> u8 {
-    let mut pad = input as u8;
+/// NES pad bits for netplay input word `input` on simulated frame `frame`: the held pad bits
+/// (`INPUT_PAD`), plus A / B while their turbo bit is set and the turbo phase
+/// `(frame / 2) % 2 == 0` is on. Every peer derives the phase from the GGRS frame, so
+/// re-simulated frames match. Only for `System::Nes`: other systems ignore the turbo bits.
+pub(crate) fn expand_turbo(input: u32, frame: i32) -> u16 {
+    let mut pad = (input & INPUT_PAD) as u16;
     if (frame / 2) % 2 == 0 {
         if input & INPUT_TURBO_A != 0 {
-            pad |= ebobo_core::pad::A;
+            pad |= ebobo_console::nes::pad::A as u16;
         }
         if input & INPUT_TURBO_B != 0 {
-            pad |= ebobo_core::pad::B;
+            pad |= ebobo_console::nes::pad::B as u16;
         }
     }
     pad
@@ -67,10 +68,10 @@ pub enum NetEvent {
     Disconnected { peer: PeerId },
     /// States diverged at `frame` (should never happen; shown as a warning).
     Desync { frame: i32 },
-    /// The player on NES controller `slot` saved the game for everyone (`INPUT_SAVE`). Reported
+    /// The player on controller `slot` saved the game for everyone (`INPUT_SAVE`). Reported
     /// once per save, when its frame is confirmed; `take_saved` then returns the state.
     Saved { slot: usize },
-    /// The player on NES controller `slot` loaded the shared save for everyone (`INPUT_LOAD`).
+    /// The player on controller `slot` loaded the shared save for everyone (`INPUT_LOAD`).
     /// Reported once per load, never again when its frame is re-simulated.
     Loaded { slot: usize },
 }
@@ -176,7 +177,7 @@ const START_FRAME: i32 = -1;
 struct SaveRecord {
     frame: i32,
     slot: usize,
-    state: ebobo_core::Snapshot,
+    state: Snapshot,
 }
 
 /// Adaptive input delay: moves `delay` one frame at a time toward the target computed from the
@@ -264,7 +265,7 @@ pub struct NetSession {
     final_through: i32,
     /// One-frame bits handed to `advance` that GGRS has not taken yet; they go out with the
     /// next local input it takes.
-    carry: u16,
+    carry: u32,
     /// GGRS frame of the last `advance` call. GGRS takes one local input per frame: a call
     /// repeated for the same frame (the session waits at the prediction window) is ignored.
     submitted: Option<i32>,
@@ -272,14 +273,14 @@ pub struct NetSession {
     /// would land on a frame that already has an input).
     drops: u32,
     /// The newest final `INPUT_SAVE` state `take_saved` has not handed out yet.
-    saved_ready: Option<ebobo_core::Snapshot>,
+    saved_ready: Option<Snapshot>,
     /// The newest checkpoint, not final yet: (frame, state at the start of it).
-    checkpoint_pending: Option<(i32, ebobo_core::Snapshot)>,
+    checkpoint_pending: Option<(i32, Snapshot)>,
     /// The newest final checkpoint `take_checkpoint` has not handed out yet.
-    checkpoint_ready: Option<ebobo_core::Snapshot>,
+    checkpoint_ready: Option<Snapshot>,
     /// Tests: the input words of every simulated frame, as last simulated.
     #[cfg(test)]
-    input_log: Vec<[u16; 4]>,
+    input_log: Vec<[u32; 4]>,
     /// Tests: frame whose saved state hash is recorded in `probe_hash` (last save wins).
     #[cfg(test)]
     probe: (i32, Option<u64>),
@@ -305,7 +306,7 @@ impl NetSession {
         input_delay: usize,
         delay_auto: bool,
         fps: usize,
-        shared_save: Option<ebobo_core::Snapshot>,
+        shared_save: Option<Snapshot>,
     ) -> Result<NetSession, NetError> {
         let mut session = NetSession::with_tuning(link, slots, input_delay, delay_auto, fps, max_prediction(slots.len()), DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)?;
         session.saves.extend(shared_save.map(|state| SaveRecord { frame: START_FRAME, slot: 0, state }));
@@ -382,7 +383,7 @@ impl NetSession {
         })
     }
 
-    /// NES controller index this machine plays.
+    /// Controller index this machine plays.
     pub fn local_slot(&self) -> usize {
         self.local
     }
@@ -394,13 +395,13 @@ impl NetSession {
 
     /// The newest confirmed `INPUT_SAVE` state not yet taken (identical on every peer), for
     /// the save file. Older untaken ones are gone.
-    pub fn take_saved(&mut self) -> Option<ebobo_core::Snapshot> {
+    pub fn take_saved(&mut self) -> Option<Snapshot> {
         self.saved_ready.take()
     }
 
     /// The newest confirmed periodic checkpoint not yet taken (identical on every peer at the
     /// same frame), for the "last moment" file. Older untaken ones are gone.
-    pub fn take_checkpoint(&mut self) -> Option<ebobo_core::Snapshot> {
+    pub fn take_checkpoint(&mut self) -> Option<Snapshot> {
         self.checkpoint_ready.take()
     }
 
@@ -494,13 +495,13 @@ impl NetSession {
     }
 
     /// Adds the local input and advances one frame, handling GGRS save/load/advance requests on
-    /// `nes`. Audio of re-simulated frames is dropped, only the newest frame's samples remain
-    /// buffered in `nes`.
+    /// `console`. Audio of re-simulated frames is dropped, only the newest frame's samples remain
+    /// buffered in `console`.
     ///
     /// One-frame bits (`INPUT_RESET`, `INPUT_SAVE`, `INPUT_LOAD`) are never lost: when GGRS
     /// does not take this call's input, they are kept for the next one it takes. So pass each
     /// request once, whatever the outcome.
-    pub fn advance(&mut self, nes: &mut Nes, local_input: u16) -> Result<FrameOutcome, NetError> {
+    pub fn advance(&mut self, console: &mut Console, local_input: u32) -> Result<FrameOutcome, NetError> {
         self.carry |= local_input & ONE_FRAME_BITS;
         if !self.is_running() {
             self.poll();
@@ -532,17 +533,17 @@ impl NetSession {
         for request in requests {
             match request {
                 GgrsRequest::SaveGameState { cell, frame } => {
-                    let hash = nes.state_hash();
+                    let hash = console.state_hash();
                     #[cfg(test)]
                     if frame == self.probe.0 {
                         self.probe.1 = Some(hash);
                     }
-                    cell.save(frame, Some(nes.snapshot()), Some(hash as u128));
+                    cell.save(frame, Some(console.snapshot()), Some(hash as u128));
                     self.sim_frame = frame;
                 }
                 GgrsRequest::LoadGameState { cell, frame } => {
                     let snapshot = cell.load().expect("ggrs asked to load a state it never saved");
-                    nes.restore(&snapshot);
+                    console.restore(&snapshot);
                     self.sim_frame = frame;
                     // What was recorded for the frames about to be re-simulated is void.
                     self.saves.retain(|s| s.frame < frame);
@@ -551,17 +552,19 @@ impl NetSession {
                 }
                 GgrsRequest::AdvanceFrame { inputs } => {
                     let frame = self.sim_frame;
-                    let mut pads = [0u8; 4];
+                    // Turbo is an NES feature; other systems ignore the turbo bits.
+                    let turbo = console.system() == System::Nes;
+                    let mut pads = [0u16; 4];
                     let mut reset = false;
                     // Lowest controller that sent the bit.
                     let (mut saver, mut loader) = (None, None);
                     #[cfg(test)]
-                    let mut words = [0u16; 4];
+                    let mut words = [0u32; 4];
                     for (slot, &(input, status)) in inputs.iter().enumerate().take(4) {
                         if status == InputStatus::Disconnected {
                             continue;
                         }
-                        pads[slot] = expand_turbo(input, frame);
+                        pads[slot] = if turbo { expand_turbo(input, frame) } else { (input & INPUT_PAD) as u16 };
                         reset |= input & INPUT_RESET != 0;
                         if input & INPUT_SAVE != 0 {
                             saver.get_or_insert(slot);
@@ -582,26 +585,26 @@ impl NetSession {
                     // In this order: a save and a load on one frame save the state the frame
                     // starts with and load the save before it.
                     if let Some(slot) = saver {
-                        self.saves.push(SaveRecord { frame, slot, state: nes.snapshot() });
+                        self.saves.push(SaveRecord { frame, slot, state: console.snapshot() });
                     }
                     if frame > 0 && frame % CHECKPOINT_EVERY == 0 {
-                        self.checkpoint_pending = Some((frame, nes.snapshot()));
+                        self.checkpoint_pending = Some((frame, console.snapshot()));
                     }
                     if let Some(slot) = loader {
                         if let Some(save) = self.saves.iter().rev().find(|s| s.frame < frame) {
-                            nes.restore(&save.state);
+                            console.restore(&save.state);
                             self.loads.push((frame, slot));
                         }
                     }
                     if reset {
-                        nes.reset();
+                        console.reset();
                     }
                     seen += 1;
                     // Re-simulated frames are never shown or heard: skip pixels and audio.
-                    nes.set_fast_forward(seen <= resimulated);
-                    nes.run_frame(pads);
+                    console.set_fast_forward(seen <= resimulated);
+                    console.run_frame(pads);
                     if seen <= resimulated {
-                        nes.clear_audio();
+                        console.clear_audio();
                     }
                     self.sim_frame += 1;
                 }
