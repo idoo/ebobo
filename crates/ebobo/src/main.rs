@@ -6,6 +6,8 @@ mod canvas;
 mod cards;
 mod config;
 mod crt;
+#[allow(dead_code)]
+mod enhance;
 mod i18n;
 mod input;
 mod library;
