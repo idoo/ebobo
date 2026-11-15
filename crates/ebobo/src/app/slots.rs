@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use ebobo_core::{Nes, StateError};
+use ebobo_console::{Console, StateError};
 
 use crate::ui::Text;
 
@@ -39,8 +39,8 @@ pub fn path(dir: &Path, stem: &str, crc32: u32, slot: u8) -> PathBuf {
 }
 
 /// Writes the state atomically: a temp file next to it, then rename over the old one.
-pub fn save(nes: &Nes, path: &Path) -> io::Result<()> {
-    write(path, &nes.save_state())
+pub fn save(console: &Console, path: &Path) -> io::Result<()> {
+    write(path, &console.save_state())
 }
 
 /// Writes save-state bytes atomically (temp file `<path>.tmp`, then a rename over the old
@@ -56,12 +56,12 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
-pub fn load(nes: &mut Nes, path: &Path) -> Result<(), LoadError> {
+pub fn load(console: &mut Console, path: &Path) -> Result<(), LoadError> {
     let bytes = std::fs::read(path).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => LoadError::Empty,
         _ => LoadError::Io(e),
     })?;
-    nes.load_state(&bytes).map_err(LoadError::State)
+    console.load_state(&bytes).map_err(LoadError::State)
 }
 
 /// When the slot was last written (`None` = empty).
@@ -74,13 +74,13 @@ mod tests {
     use super::*;
 
     /// `None` (after a notice) when the test ROMs were not fetched.
-    fn nestest() -> Option<Nes> {
+    fn nestest() -> Option<Console> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../ebobo-core/tests/roms/nestest/nestest.nes");
         let Ok(rom) = std::fs::read(path) else {
             println!("test ROMs missing: run scripts/fetch-test-roms.sh");
             return None;
         };
-        Some(Nes::new(&rom, None).unwrap())
+        Some(Console::new(&rom, None).unwrap())
     }
 
     fn tmp_dir(name: &str) -> PathBuf {
@@ -96,7 +96,7 @@ mod tests {
         for _ in 0..30 {
             nes.run_frame([0; 4]);
         }
-        let crc = nes.info().crc32;
+        let crc = nes.crc32();
         let p = path(&dir, "nestest", crc, 2);
         assert_eq!(p.file_name().unwrap().to_str().unwrap(), format!("nestest-{crc:08x}.3.state"));
         assert!(saved_at(&p).is_none());

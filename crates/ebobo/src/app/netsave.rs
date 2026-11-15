@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use ebobo_core::Nes;
+use ebobo_console::Console;
 use ebobo_net::{Resume, ResumeKind};
 use sha2::{Digest, Sha256};
 
@@ -44,10 +44,10 @@ pub fn write(dir: &Path, crc32: u32, kind: ResumeKind, bytes: &[u8]) -> io::Resu
 }
 
 /// What a host can start a game from: the last moment, then the save, each only when its
-/// file loads into `scratch` (a fresh `Nes` of the ROM and region the game will run; it is
+/// file loads into `scratch` (a fresh `Console` of the ROM and region the game will run; it is
 /// left in whatever state loaded last). `saved_at` is the file's modification time.
-pub fn candidates(dir: &Path, scratch: &mut Nes) -> Vec<Resume> {
-    let crc32 = scratch.info().crc32;
+pub fn candidates(dir: &Path, scratch: &mut Console) -> Vec<Resume> {
+    let crc32 = scratch.crc32();
     let mut out = Vec::new();
     for kind in [ResumeKind::Last, ResumeKind::Save] {
         let path = path(dir, crc32, kind);
@@ -102,8 +102,8 @@ mod tests {
         rom
     }
 
-    fn nes(tag: u8, frames: u32) -> Nes {
-        let mut nes = Nes::new(&rom(tag), None).unwrap();
+    fn nes(tag: u8, frames: u32) -> Console {
+        let mut nes = Console::new(&rom(tag), None).unwrap();
         for _ in 0..frames {
             nes.run_frame([0; 4]);
         }
@@ -122,7 +122,7 @@ mod tests {
         let mut scratch = nes(1, 0);
         assert!(candidates(&dir, &mut scratch).is_empty(), "missing dir: nothing to continue from");
 
-        let crc = scratch.info().crc32;
+        let crc = scratch.crc32();
         let (saved, last) = (nes(1, 5), nes(1, 9));
         write(&dir, crc, ResumeKind::Save, &saved.save_state()).unwrap();
         write(&dir, crc, ResumeKind::Last, &last.save_state()).unwrap();
