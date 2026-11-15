@@ -1,0 +1,99 @@
+//! Timing probes: the small cartridges of `tools/md-oracle/probes/out/` run in the core and their
+//! result words are compared with what the reference emulator gave (`probes/expect/<name>.txt` for
+//! NTSC, `<name>.pal.txt` for PAL, recorded by `tools/md-oracle/probe.py --record`).
+//! Each probe runs for the frame count in the first line of its source (`| frames: N`).
+//! Every differing probe is printed with its words; the test fails unless the probe is listed in
+//! `KNOWN_DIFF` with a reason.
+
+use ebobo_md::{Md, Region};
+use std::path::{Path, PathBuf};
+
+/// Probes whose difference is understood and accepted for now: (name, reason).
+const KNOWN_DIFF: &[(&str, &str)] = &[];
+
+/// Word 0 of the result block when the probe's `main` returned.
+const DONE: u16 = 0xD0E1;
+
+fn probes_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/md-oracle/probes")
+}
+
+/// Hex words of an expect file; `#` lines are comments.
+fn expected(path: &Path) -> Vec<u16> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| u16::from_str_radix(l, 16).unwrap_or_else(|_| panic!("{}: bad word {l}", path.display())))
+        .collect()
+}
+
+/// The `| frames: N` count of the first line of the probe's source, else 60.
+fn frames_of(dir: &Path, name: &str) -> u32 {
+    let src = std::fs::read_to_string(dir.join(format!("{name}.s"))).unwrap_or_default();
+    src.lines()
+        .next()
+        .and_then(|l| l.trim_start_matches('|').trim().strip_prefix("frames:"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(60)
+}
+
+/// Runs the probe and returns (done word, result words).
+fn run(rom: &[u8], region: Region, frames: u32) -> (u16, Vec<u16>) {
+    let mut md = Md::new(rom, Some(region)).expect("probe image loads");
+    for _ in 0..frames {
+        md.run_frame([0; 4]);
+    }
+    let ram = md.ram();
+    let word = |i: usize| u16::from_be_bytes([ram[2 * i], ram[2 * i + 1]]);
+    let count = (word(1) as usize).min(ram.len() / 2 - 2);
+    (word(0), (0..count).map(|i| word(2 + i)).collect())
+}
+
+#[test]
+fn probes_match_reference() {
+    let dir = probes_dir();
+    let mut bins: Vec<PathBuf> = std::fs::read_dir(dir.join("out"))
+        .expect("probes/out exists")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+        .collect();
+    bins.sort();
+    let (mut ran, mut failed) = (0, Vec::new());
+    for bin in &bins {
+        let name = bin.file_stem().and_then(|s| s.to_str()).expect("utf-8 name").to_string();
+        let rom = std::fs::read(bin).expect("probe image readable");
+        for (suffix, region) in [("", Region::Americas), (".pal", Region::Europe)] {
+            let expect_path = dir.join("expect").join(format!("{name}{suffix}.txt"));
+            if !expect_path.exists() {
+                continue;
+            }
+            ran += 1;
+            let want = expected(&expect_path);
+            let frames = frames_of(&dir, &name);
+            let (done, got) = run(&rom, region, frames);
+            let label = format!("{name}{suffix}");
+            if done == DONE && got == want {
+                println!("{label}: match ({} words)", want.len());
+                continue;
+            }
+            let known = KNOWN_DIFF.iter().find(|(n, _)| *n == label || *n == name);
+            println!(
+                "{label}: DIFFERS{} (ours {}, {frames} frames)",
+                known.map(|(_, why)| format!(" [known: {why}]")).unwrap_or_default(),
+                if done == DONE { "done".to_string() } else { format!("not done, word 0 = {done:04X}") }
+            );
+            println!("   #    ref   ours");
+            for i in 0..want.len().max(got.len()) {
+                let r = want.get(i).map_or("----".to_string(), |w| format!("{w:04X}"));
+                let o = got.get(i).map_or("----".to_string(), |w| format!("{w:04X}"));
+                println!("  {i:2}   {r}   {o}{}", if r == o { "" } else { "  <<" });
+            }
+            if known.is_none() {
+                failed.push(label);
+            }
+        }
+    }
+    println!("{ran} probe runs, {} differ without a known reason", failed.len());
+    assert!(failed.is_empty(), "probes differ from the reference: {}", failed.join(" "));
+}

@@ -2,7 +2,7 @@
 //! flags, same file names and line formats, so outputs can be compared file by file.
 //!
 //! headless <rom> --frames N [--input FILE] [--png-every K DIR] [--png-at F,F,... DIR] [--wav FILE]
-//!          [--hash-every K] [--region ntsc-u|pal|ntsc-j] [--multitap] [--state-hash-every K] [--bench]
+//!          [--hash-every K] [--region ntsc-u|pal|ntsc-j] [--multitap] [--state-hash-every K] [--ram-at F FILE] [--bench]
 //!
 //! Frames count from 1; PNGs and hashes of frame F are taken after the F-th `run_frame`.
 //! Input file lines: `<frame> <p1> <p2> [<p3> <p4>]` (hex masks, bits as `ebobo_md::pad`); each
@@ -13,6 +13,8 @@
 //! rows top to bottom (the bytes of the PNG, as the oracle hashes them).
 //! `--state-hash-every K` prints `frame N state XXXXXXXXXXXXXXXX` (`Md::state_hash`).
 //! `--wav` writes 48 kHz stereo 16-bit audio.
+//! `--ram-at F FILE` writes the 64 KB work RAM after frame F in the 68000's byte order (the
+//! oracle's `--ram-at F FILE --ram-swap`) and prints `frame F ram 65536 bytes -> FILE`.
 //! `--bench` only measures: the frames with fast-forward off, then again from power-on with it
 //! on; frames per second of wall time for each. No files are written.
 
@@ -24,7 +26,7 @@ use std::time::Instant;
 
 const SAMPLE_RATE: u32 = 48_000;
 const USAGE: &str = "usage: headless <rom> --frames N [--input FILE] [--png-every K DIR] [--png-at F,F,... DIR] [--wav FILE] \
-                     [--hash-every K] [--region ntsc-u|pal|ntsc-j] [--multitap] [--state-hash-every K] [--bench]";
+                     [--hash-every K] [--region ntsc-u|pal|ntsc-j] [--multitap] [--state-hash-every K] [--ram-at F FILE] [--bench]";
 
 fn die(msg: &str) -> ! {
     eprintln!("headless: {msg}");
@@ -230,6 +232,7 @@ fn main() {
     let mut hash_every: Option<u32> = None;
     let mut state_hash_every: Option<u32> = None;
     let mut bench = false;
+    let mut ram_at: Option<(u32, String)> = None;
 
     let mut i = 1;
     let next = |i: &mut usize| -> String {
@@ -271,6 +274,10 @@ fn main() {
             "--wav" => wav_path = Some(next(&mut i)),
             "--hash-every" => hash_every = Some(positive("--hash-every", next(&mut i))),
             "--state-hash-every" => state_hash_every = Some(positive("--state-hash-every", next(&mut i))),
+            "--ram-at" => {
+                let f = positive("--ram-at", next(&mut i));
+                ram_at = Some((f, next(&mut i)));
+            }
             "--bench" => bench = true,
             a => die(&format!("unknown argument {a}\n{USAGE}")),
         }
@@ -346,6 +353,10 @@ fn main() {
         }
         if state_hash_every.is_some_and(|k| frame % k == 0) {
             println!("frame {frame} state {:016X}", md.state_hash());
+        }
+        if let Some((_, path)) = ram_at.as_ref().filter(|(f, _)| *f == frame) {
+            std::fs::write(path, md.ram()).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+            println!("frame {frame} ram {} bytes -> {path}", md.ram().len());
         }
     }
     if let Some(wav) = wav {
