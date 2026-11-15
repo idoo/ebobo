@@ -5,9 +5,10 @@
 
 Prints the differing byte ranges (offsets into the RAM at 0xFF0000) with both values, reference
 first. `--first` bisects for the first frame at which any byte below 0xFC00 (not the stack)
-differs. Ours is `target-md-hl/release/examples/headless` (build it first).
+differs. Ours is `$CARGO_TARGET_DIR` (default `target-md-hl`)`/release/examples/headless` (build it first).
 """
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-OURS = ROOT / "target-md-hl/release/examples/headless"
+OURS = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target-md-hl")) / "release/examples/headless"
 STACK = 0xFC00
 
 
