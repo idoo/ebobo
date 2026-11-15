@@ -28,6 +28,9 @@ const KNOWN_DIFF: &[(&str, &str)] = &[
     ("dma_rate", "68000 transfers of 128/64/40 words in the picture end on the reference's word; 16-word transfers end 1-2 slots early \
                   (slots are spread evenly in ours, unevenly in the chip); 1024 words while blanked end about 15 slots early"),
     ("dma_rate_h32", "as dma_rate, 256-pixel mode"),
+    ("cpu_rate", "register, RAM, ROM, I/O, VDP and stack loops within 1-4 passes of the reference; divu, lsl #63 and mulu loops get \
+                  10-13 passes fewer: the reference loses little refresh time during long internal instructions (99.5 % of the frame \
+                  vs 98.3 %), ours holds 2 of every 130 cycles whatever runs; see tools/md-oracle/cpu_rate.py"),
 ];
 
 /// Word 0 of the result block when the probe's `main` returned.
