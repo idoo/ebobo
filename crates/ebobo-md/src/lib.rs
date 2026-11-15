@@ -17,7 +17,8 @@
 //! - `vdp_mem.rs`: the types those four share.
 //! - `ym2612.rs`: FM chip. `psg.rs`, `audio.rs`: PSG chip, mixing and resampling.
 //! - `cart.rs`: ROM image, header, battery RAM, bank switching. `io.rs`: controller ports.
-//! - `system.rs`: memory maps of both CPUs, scheduler, the public [`Md`] machine.
+//! - `bus.rs`: memory maps of both CPUs, the devices behind them, stepping each CPU.
+//! - `system.rs`: the frame loop, snapshots and save states, the public [`Md`] machine.
 //!
 //! Written from published documentation and hardware research, not from another emulator's
 //! code.
@@ -26,6 +27,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "psg")]
 pub mod audio;
+#[cfg(feature = "system")]
+mod bus;
 #[cfg(feature = "cart")]
 pub mod cart;
 #[cfg(feature = "io")]
