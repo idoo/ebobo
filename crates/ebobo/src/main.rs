@@ -3,6 +3,9 @@
 mod app;
 mod audio;
 mod canvas;
+// Not wired into the interface yet.
+#[allow(dead_code)]
+mod cards;
 mod config;
 mod crt;
 mod i18n;
