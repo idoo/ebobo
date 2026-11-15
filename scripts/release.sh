@@ -36,7 +36,7 @@ cache="${CARGO_TARGET_DIR:-$PWD/target-pkg}"
 (cd "$src" && scripts/build-linux.sh)
 
 # Gate: nothing game-derived in the downloads.
-if (cd "$src/dist" && unzip -l ebobo-mac.zip; tar -tzf ebobo-steamdeck.tar.gz) | grep -i -E '\.(nes|chr|zip)$' | grep -v 'ebobo-mac.zip'; then
+if (cd "$src/dist" && unzip -l ebobo-mac.zip; tar -tzf ebobo-steamdeck.tar.gz) | grep -i -E '\.(nes|chr|zip|md|gen|smd|bin)$' | grep -v -E 'ebobo-mac\.zip|README\.md$'; then
     echo "a ROM or tile file ended up in a download, refusing" >&2
     exit 1
 fi

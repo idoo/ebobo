@@ -20,7 +20,7 @@ cat > "$desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=ebobo
-Comment=NES online with friends
+Comment=NES and Mega Drive online with friends
 Exec=$dest/ebobo
 Icon=$dest/ebobo.png
 Terminal=false
@@ -37,12 +37,12 @@ if [ -d "$desk" ]; then
     install -m 755 "$desktop" "$desk/ebobo.desktop"
 fi
 
-# A ROM folder ebobo always scans (EmuDeck's ~/Emulation/roms/nes is scanned too).
+# A ROM folder ebobo always scans (EmuDeck's ~/Emulation/roms folders are scanned too).
 mkdir -p "$HOME/ROMs"
 
 version="$("$dest/ebobo" --version 2>/dev/null || echo ebobo)"
 echo "$version installed to $dest"
-echo "Put .nes or .zip ROMs into ~/ROMs (or EmuDeck's Emulation/roms/nes)."
+echo "Put NES or Mega Drive ROMs (.nes .md .gen .zip) into ~/ROMs (or EmuDeck's Emulation/roms)."
 
 # Steam Game Mode artwork (capsule, hero, logo, icon) for the shortcut. Steam names grid
 # files by the shortcut's appid, which only shortcuts.vdf knows; never fails the install.

@@ -58,6 +58,19 @@ cat > "$app/Contents/Info.plist" <<EOF
             <key>CFBundleTypeRole</key><string>Viewer</string>
             <key>CFBundleTypeExtensions</key><array><string>nes</string></array>
         </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Mega Drive ROM</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>CFBundleTypeExtensions</key><array><string>gen</string><string>smd</string></array>
+        </dict>
+        <dict>
+            <!-- Extensions other apps own (.md is Markdown): never offered in Open With,
+                 but a file dropped on the icon is accepted. -->
+            <key>CFBundleTypeName</key><string>ROM image</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>None</string>
+            <key>CFBundleTypeExtensions</key><array><string>md</string><string>bin</string><string>zip</string></array>
+        </dict>
     </array>
 </dict>
 </plist>
