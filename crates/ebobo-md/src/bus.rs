@@ -43,6 +43,11 @@ use crate::vdp::{DmaSource, Screen, Vdp};
 use crate::ym2612::Ym2612;
 use crate::{FM_SAMPLE_MCLK, M68K_DIV, MCLK_NTSC, MCLK_PAL, PSG_SAMPLE_MCLK, Region, Z80_DIV};
 
+/// Memory refresh: after every `REFRESH_EVERY` cycles the 68000 ran, the bus holds it for
+/// `REFRESH_CYCLES` more.
+const REFRESH_EVERY: u32 = 128;
+const REFRESH_CYCLES: u32 = 2;
+
 /// The whole emulated state of the console.
 #[derive(Clone, Hash, Serialize, Deserialize)]
 pub(crate) struct State {
@@ -71,6 +76,8 @@ pub(crate) struct State {
     pub z80_run: bool,
     /// The Z80's 9-bit bank register: bits 15-23 of the 68000 address its window shows.
     pub z80_bank: u32,
+    /// 68000 cycles run since the bus last held the CPU for memory refresh.
+    pub m68k_refresh: u32,
 }
 
 /// The console: emulated state plus what is not state (the cartridge as built, the picture,
@@ -154,6 +161,7 @@ impl Machine {
             z80_busreq: false,
             z80_run: false,
             z80_bank: 0,
+            m68k_refresh: 0,
         };
         let audio = AudioOut::new(if pal { MCLK_PAL } else { MCLK_NTSC });
         let mut machine = Machine { s, cart, screen: Screen::new(), audio, output: true };
@@ -195,7 +203,15 @@ impl Machine {
         cpu.irq = self.s.vdp.irq_level();
         let cycles = cpu.step(&mut M68kView(self));
         self.s.m68k = cpu;
-        self.s.now += u64::from(cycles) * M68K_DIV;
+        // The console's bus logic holds the 68000 for 2 cycles out of every 130 while it
+        // refreshes the memory chips: programs run about 1.5 % slower than the clock says.
+        let mut total = cycles;
+        self.s.m68k_refresh += cycles;
+        while self.s.m68k_refresh >= REFRESH_EVERY {
+            self.s.m68k_refresh -= REFRESH_EVERY;
+            total += REFRESH_CYCLES;
+        }
+        self.s.now += u64::from(total) * M68K_DIV;
     }
 
     /// Runs the Z80 from `s.z80_now` up to `s.now`, its /INT line following the VDP; while
