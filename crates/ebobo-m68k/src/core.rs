@@ -960,7 +960,7 @@ mod tests {
         assert_eq!(bus.r32(sp + 2), 0x401); // access address
         assert_eq!(bus.r16(sp + 6), 0); // instruction register: nothing was fetched
         assert_eq!(bus.r16(sp + 8), 0x2700); // SR
-        assert_eq!(bus.r32(sp + 10), 0x401); // PC
+        assert_eq!(bus.r32(sp + 10), 0x401 - 2); // PC, one prefetched word behind ours
         assert!(!cpu.halted);
     }
 
@@ -977,7 +977,7 @@ mod tests {
         assert_eq!(bus.r32(sp + 2), 0x0012_2001);
         assert_eq!(bus.r16(sp + 6), 0x3080);
         assert_eq!(bus.r16(sp + 8), 0x8000);
-        assert_eq!(bus.r32(sp + 10), 0x402);
+        assert_eq!(bus.r32(sp + 10), 0x402 - 2);
     }
 
     #[test]

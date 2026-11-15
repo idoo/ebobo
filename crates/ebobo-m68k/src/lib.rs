@@ -267,7 +267,8 @@ impl Cpu {
         self.push32(bus, addr)?;
         self.push16(bus, status)?;
         self.pc = self.read(bus, 12, Size::Long)?;
-        self.cyc = spent + 46;
+        // A fault on the opcode fetch itself has spent nothing yet and still costs 50.
+        self.cyc = spent.max(4) + 46;
         Ok(())
     }
 }
