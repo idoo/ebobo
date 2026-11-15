@@ -295,7 +295,7 @@ impl Cpu {
     /// halted it runs NOPs of 4 T-states (R still counts). An endless run of DD / FD prefixes
     /// does not return, as the chip does not accept interrupts between them.
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
-        let prev_q = self.q;
+        let mut prev_q = self.q;
         self.q = 0;
         let after_ei = self.ei;
         self.ei = false;
@@ -351,8 +351,15 @@ impl Cpu {
         loop {
             let op = self.fetch_m1(bus);
             match op {
-                0xDD => idx = Idx::Ix,
-                0xFD => idx = Idx::Iy,
+                // A prefix is an instruction that leaves the flags alone: SCF and CCF after it see Q = 0.
+                0xDD => {
+                    idx = Idx::Ix;
+                    prev_q = 0;
+                }
+                0xFD => {
+                    idx = Idx::Iy;
+                    prev_q = 0;
+                }
                 0xED => return t + ed::exec(self, bus),
                 0xCB if idx == Idx::Hl => return t + cb::exec(self, bus, None),
                 0xCB => {
