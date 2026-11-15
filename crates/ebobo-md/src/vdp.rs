@@ -913,7 +913,7 @@ mod tests {
     fn dma_rates_while_displaying() {
         let s = DmaStart { line: 0, mclk: 0, h40: true, display_on: true, active_lines: 224, total_lines: 262 };
         assert_eq!(timing::dma_duration(DmaKind::Bus, 18, s), 3420);
-        assert_eq!(timing::dma_duration(DmaKind::Fill, 34, s), 6840);
+        assert_eq!(timing::dma_duration(DmaKind::Fill, 36, s), 6840);
         assert_eq!(timing::dma_duration(DmaKind::Copy, 102, DmaStart { line: 224, ..s }), 3420);
     }
 

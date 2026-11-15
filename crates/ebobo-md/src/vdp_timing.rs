@@ -119,16 +119,18 @@ pub enum DmaKind {
     Copy,
 }
 
-/// Bytes a DMA moves per line (for a 68k transfer to colour or scroll RAM: words).
+/// Bytes a DMA moves per line (for a 68k transfer to colour or scroll RAM: words). A fill moves a
+/// byte per slot like a 68k transfer while drawing (`dma_rate` probe: 256 bytes in 14.45 lines of
+/// the 320-pixel mode, 16.25 of the 256-pixel mode).
 pub fn dma_rate(kind: DmaKind, h40: bool, blanked: bool) -> u32 {
     match (kind, h40, blanked) {
         (DmaKind::Bus, false, false) => 16,
         (DmaKind::Bus, false, true) => 167,
         (DmaKind::Bus, true, false) => 18,
         (DmaKind::Bus, true, true) => 205,
-        (DmaKind::Fill, false, false) => 15,
+        (DmaKind::Fill, false, false) => 16,
         (DmaKind::Fill, false, true) => 166,
-        (DmaKind::Fill, true, false) => 17,
+        (DmaKind::Fill, true, false) => 18,
         (DmaKind::Fill, true, true) => 204,
         (DmaKind::Copy, false, false) => 8,
         (DmaKind::Copy, false, true) => 83,
