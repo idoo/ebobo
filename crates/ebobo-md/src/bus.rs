@@ -90,6 +90,11 @@ pub(crate) struct Machine {
     /// False in fast-forward: no pixels are drawn and the audio output is muted. Emulated
     /// state is the same either way.
     pub output: bool,
+    /// Master clock at which the VDP next changes its interrupt lines or frame-done
+    /// ([`Vdp::next_event`] after the last [`Machine::sync_vdp`]). Before it nothing the CPUs or
+    /// the frame loop look at can change, so the VDP is only brought forward then and at port
+    /// accesses. Derived, not state: 0 (sync at once) after power-on and after state loads.
+    pub vdp_due: u64,
 }
 
 const CART_END: u32 = 0x40_0000;
@@ -164,7 +169,7 @@ impl Machine {
             m68k_refresh: 0,
         };
         let audio = AudioOut::new(if pal { MCLK_PAL } else { MCLK_NTSC });
-        let mut machine = Machine { s, cart, screen: Screen::new(), audio, output: true };
+        let mut machine = Machine { s, cart, screen: Screen::new(), audio, output: true, vdp_due: 0 };
         machine.reset_m68k();
         machine
     }
@@ -193,7 +198,7 @@ impl Machine {
     /// pins (the acknowledge clears the VDP's request); advances `s.now` by its length.
     /// While a DMA holds the bus, moves `s.now` to the end of the hold instead.
     pub(crate) fn step_m68k(&mut self) {
-        self.sync_vdp();
+        self.sync_vdp_if_due();
         let frozen = self.s.vdp.m68k_frozen_until();
         if frozen > self.s.now {
             self.s.now = frozen;
@@ -233,9 +238,20 @@ impl Machine {
         }
     }
 
-    /// Brings the VDP to `s.now`, drawing into the screen when `output` is on.
+    /// Brings the VDP to `s.now`, drawing into the screen when `output` is on, and takes the
+    /// time of its next event.
     pub(crate) fn sync_vdp(&mut self) {
         self.s.vdp.run_to(self.s.now, if self.output { Some(&mut self.screen) } else { None });
+        self.vdp_due = self.s.vdp.next_event();
+    }
+
+    /// [`Machine::sync_vdp`] once `s.now` has reached the VDP's next event; before that the
+    /// lines and flags it would change are already as they will be at `s.now`.
+    #[inline]
+    pub(crate) fn sync_vdp_if_due(&mut self) {
+        if self.s.now >= self.vdp_due {
+            self.sync_vdp();
+        }
     }
 
     /// Runs the YM2612 and the PSG up to `s.now`, one sample period at a time in time order,

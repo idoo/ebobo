@@ -221,11 +221,13 @@ impl Md {
         loop {
             self.m.step_m68k();
             self.m.run_z80();
-            self.m.sync_vdp();
+            self.m.sync_vdp_if_due();
             if self.m.s.vdp.take_frame_done() || self.m.s.now.wrapping_sub(start) >= limit {
                 break;
             }
         }
+        // The state between frames has the VDP at `now` (the hash and snapshots include it).
+        self.m.sync_vdp();
         self.m.sync_sound();
     }
 
@@ -297,6 +299,7 @@ impl Md {
 
     pub fn restore(&mut self, snapshot: &Snapshot) {
         self.m.s.clone_from(&snapshot.state);
+        self.m.vdp_due = 0;
     }
 
     /// Stable hash of the emulated state, identical across machines for identical state.
@@ -371,6 +374,7 @@ impl Md {
             return Err(StateError::Corrupt);
         }
         self.m.s = state;
+        self.m.vdp_due = 0;
         self.m.audio.clear();
         Ok(())
     }
