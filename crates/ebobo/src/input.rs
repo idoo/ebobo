@@ -1,9 +1,16 @@
 //! Keyboard and gamepads → console pads, menu navigation and hotkeys. Owner: platform slice.
+//!
+//! The pad bits follow the running system (`Input::set_system`): a NES pad
+//! (`ebobo_console::nes::pad`, with turbo A / B on the shoulders) or a six-button Mega Drive pad
+//! (`ebobo_console::md::pad`, no turbo). Menu navigation, hotkeys, seats and the ways into the
+//! menu are the same on both.
 
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use ebobo_console::System;
+use ebobo_console::md::pad as md_pad;
 use ebobo_console::nes::pad;
 use sdl2::controller::{Axis, Button, GameController};
 use sdl2::event::{Event, WindowEvent};
@@ -14,6 +21,9 @@ use sdl2::{GameControllerSubsystem, JoystickSubsystem};
 /// Menu navigation, edge-triggered. Directions auto-repeat while held (400 ms delay, then
 /// every 80 ms). Keyboard: arrows, Enter = confirm, Esc/Backspace = back. Gamepad: D-pad or
 /// left stick, South (A on Xbox/Deck, Cross on PlayStation) = confirm, East (B / Circle) = back.
+/// Tabs (no repeat): left / right shoulder or Shift+Tab / Tab = previous / next. North (Y /
+/// Triangle; not while Back is held, that is the screenshot combo) or Space = `fav`, West (X /
+/// Square) = `search`. Face buttons count by position on every pad, Nintendo ones too.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Nav {
     pub up: bool,
@@ -22,6 +32,10 @@ pub struct Nav {
     pub right: bool,
     pub confirm: bool,
     pub back: bool,
+    pub prev_tab: bool,
+    pub next_tab: bool,
+    pub fav: bool,
+    pub search: bool,
 }
 
 /// A spot in the window, before mapping to the UI canvas (`Video::to_canvas`).
@@ -47,8 +61,9 @@ pub enum PointerEvent {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputFrame {
-    /// Pad bits per seat that are plainly held (never turbo presses), 16 bits wide; the NES
-    /// bits (`ebobo_console::nes::pad`) are the low byte. [0] = keyboard merged
+    /// Pad bits per seat that are plainly held (never turbo presses), 16 bits wide, of the
+    /// system set with `Input::set_system`: NES bits (`ebobo_console::nes::pad`) in the low
+    /// byte, or Mega Drive bits (`ebobo_console::md::pad`). [0] = keyboard merged
     /// with the gamepad in seat 1, [1..4] = the gamepads in seats 2-4. A gamepad without a seat
     /// feeds nothing; it takes the lowest free seat the first time it presses a game button
     /// (a turbo button counts) while seating is on (`set_seating`).
@@ -56,7 +71,14 @@ pub struct InputFrame {
     /// (Nintendo pads: East and West = A, South and North = B, so the printed A and B match).
     /// Back/Share = Select, Start/Options = Start, D-pad and left stick = D-pad. Keyboard:
     /// arrows, X = A, Z = B, Enter = Start, Right Shift = Select.
+    /// Mega Drive, by position on every pad: West (X, Square) = A, South (A, Cross) = B, East
+    /// (B, Circle) = C, North (Y, Triangle) = Y, left shoulder = X, right shoulder = Z, Start =
+    /// Start, Back/Share = Mode, D-pad and left stick = D-pad. Keyboard: arrows, Z X C = A B C,
+    /// A S D = X Y Z, Enter = Start, Right Shift = Mode.
+    /// Back+Start (Select+Start, Mode+Start) held together are hidden from the game: that is
+    /// the menu hold.
     pub pads: [u16; 4],
+    /// NES only (always zero on the Mega Drive, whose shoulders are buttons).
     /// Per seat, the `pad::A` / `pad::B` bits whose turbo button is held: left shoulder =
     /// turbo B, right shoulder = turbo A; keyboard (seat 1) S = turbo A, A = turbo B. Held
     /// state, not presses: solo expands it with `solo_pads`, netplay sends it as held bits
@@ -316,6 +338,95 @@ fn keyboard_bits(pressed: impl Fn(Scancode) -> bool) -> (u8, u8) {
     (bits, turbo)
 }
 
+/// Positional gamepad → held Mega Drive bits, the same on every kind of pad: West = A,
+/// South = B, East = C, North = Y, left shoulder = X, right shoulder = Z, Start = Start,
+/// Back = Mode, D-pad and left stick = directions.
+fn md_pad_bits(b: &PadButtons) -> u16 {
+    let (up, down, left, right) = b.dirs();
+    let map = [
+        (up, md_pad::UP),
+        (down, md_pad::DOWN),
+        (left, md_pad::LEFT),
+        (right, md_pad::RIGHT),
+        (b.west, md_pad::A),
+        (b.south, md_pad::B),
+        (b.east, md_pad::C),
+        (b.l1, md_pad::X),
+        (b.north, md_pad::Y),
+        (b.r1, md_pad::Z),
+        (b.start, md_pad::START),
+        (b.back, md_pad::MODE),
+    ];
+    map.iter().filter(|(on, _)| *on).fold(0, |bits, (_, bit)| bits | bit)
+}
+
+/// Keyboard → held Mega Drive bits: arrows, Z X C = A B C, A S D = X Y Z, Enter = Start,
+/// Right Shift = Mode.
+fn md_keyboard_bits(pressed: impl Fn(Scancode) -> bool) -> u16 {
+    let map = [
+        (Scancode::Up, md_pad::UP),
+        (Scancode::Down, md_pad::DOWN),
+        (Scancode::Left, md_pad::LEFT),
+        (Scancode::Right, md_pad::RIGHT),
+        (Scancode::Z, md_pad::A),
+        (Scancode::X, md_pad::B),
+        (Scancode::C, md_pad::C),
+        (Scancode::A, md_pad::X),
+        (Scancode::S, md_pad::Y),
+        (Scancode::D, md_pad::Z),
+        (Scancode::Return, md_pad::START),
+        (Scancode::RShift, md_pad::MODE),
+    ];
+    map.iter().filter(|(sc, _)| pressed(*sc)).fold(0, |bits, (_, bit)| bits | bit)
+}
+
+/// Gamepad → (held bits of `system`, NES turbo bits; zero on the Mega Drive).
+fn game_bits(system: System, b: &PadButtons, kind: PadKind) -> (u16, u8) {
+    match system {
+        System::MegaDrive => (md_pad_bits(b), 0),
+        _ => {
+            let (held, turbo) = pad_bits(b, kind);
+            (u16::from(held), turbo)
+        }
+    }
+}
+
+/// Keyboard → (held bits of `system`, NES turbo bits; zero on the Mega Drive).
+fn key_bits(system: System, pressed: impl Fn(Scancode) -> bool) -> (u16, u8) {
+    match system {
+        System::MegaDrive => (md_keyboard_bits(pressed), 0),
+        _ => {
+            let (held, turbo) = keyboard_bits(pressed);
+            (u16::from(held), turbo)
+        }
+    }
+}
+
+/// A gamepad button going down → `Nav` presses. `back_held`: Back is down on that pad, which
+/// makes North the screenshot combo instead of `fav`.
+fn nav_button(nav: &mut Nav, button: Button, back_held: bool) {
+    match button {
+        Button::A => nav.confirm = true,
+        Button::B => nav.back = true,
+        Button::Y if !back_held => nav.fav = true,
+        Button::X => nav.search = true,
+        Button::LeftShoulder => nav.prev_tab = true,
+        Button::RightShoulder => nav.next_tab = true,
+        _ => {}
+    }
+}
+
+/// A key going down (not an auto-repeat) → the tab and favourite presses: Tab = next tab,
+/// Shift+Tab = previous tab, Space = `fav`.
+fn nav_key(nav: &mut Nav, sc: Scancode, shift: bool) {
+    match sc {
+        Scancode::Tab if shift => nav.prev_tab = true,
+        Scancode::Tab => nav.next_tab = true,
+        Scancode::Space => nav.fav = true,
+        _ => {}
+    }
+}
+
 /// Turbo phase: on for 2 polls, off for 2 polls.
 #[derive(Default)]
 struct Turbo {
@@ -395,6 +506,16 @@ fn mask_combo(bits: u16) -> u16 {
         bits & !combo
     } else {
         bits
+    }
+}
+
+/// `mask_combo` for the bits of `system`: on the Mega Drive the pair is Mode+Start.
+fn mask_menu_combo(system: System, bits: u16) -> u16 {
+    let combo = md_pad::MODE | md_pad::START;
+    match system {
+        System::MegaDrive if bits & combo == combo => bits & !combo,
+        System::MegaDrive => bits,
+        _ => mask_combo(bits),
     }
 }
 
@@ -711,6 +832,8 @@ pub struct Input {
     steam_mtime: Option<SystemTime>,
     /// Time since the modification time was last checked.
     steam_checked: Duration,
+    /// System whose pad bits `poll` builds.
+    system: System,
 }
 
 impl Input {
@@ -757,6 +880,7 @@ impl Input {
                 .map(PathBuf::from),
             steam_mtime: None,
             steam_checked: Duration::ZERO,
+            system: System::Nes,
         };
         let n = input.joy.num_joysticks().unwrap_or(0);
         for i in 0..n {
@@ -863,6 +987,12 @@ impl Input {
         }
     }
 
+    /// The system of the game being played (NES until set): `InputFrame::pads` carries its pad
+    /// bits from the next poll on. Navigation, hotkeys and seats do not change.
+    pub fn set_system(&mut self, system: System) {
+        self.system = system;
+    }
+
     /// Lets gamepads take seats: on while a game runs with the menu hidden.
     pub fn set_seating(&mut self, on: bool) {
         self.seating = on;
@@ -900,8 +1030,13 @@ impl Input {
                 Event::ControllerButtonDown { which, button, .. } => {
                     f.pad.used = true;
                     match button {
-                        Button::A => f.nav.confirm = true,
-                        Button::B => f.nav.back = true,
+                        Button::A | Button::B | Button::X | Button::Y | Button::LeftShoulder | Button::RightShoulder => {
+                            let back_held = self.pads.iter().any(|p| p.id() == which && p.ctrl.button(Button::Back));
+                            nav_button(&mut f.nav, button, back_held);
+                        }
+                        _ => {}
+                    }
+                    match button {
                         Button::Y => f.pad.shift = true,
                         Button::X => f.pad.layout = true,
                         Button::Start => f.pad.start = true,
@@ -928,6 +1063,7 @@ impl Input {
                     let cmd = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD);
                     let ctrl = keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD);
                     let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
+                    let shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
                     if !repeat {
                         f.key_used = true;
                         self.hint = None;
@@ -962,6 +1098,7 @@ impl Input {
                             }
                         }
                         Scancode::Return | Scancode::KpEnter if !repeat => f.nav.confirm = true,
+                        Scancode::Tab | Scancode::Space if !repeat => nav_key(&mut f.nav, sc, shift),
                         _ => {}
                     }
                 }
@@ -1004,8 +1141,7 @@ impl Input {
 
         f.turbo_on = self.turbo.tick();
         let ks = events.keyboard_state();
-        let (held, turbo) = keyboard_bits(|sc| ks.is_scancode_pressed(sc));
-        (f.pads[0], f.turbo[0]) = (u16::from(held), turbo);
+        (f.pads[0], f.turbo[0]) = key_bits(self.system, |sc| ks.is_scancode_pressed(sc));
         f.rewind = ks.is_scancode_pressed(Scancode::Backspace) && !self.text_on;
         f.fast_forward = ks.is_scancode_pressed(Scancode::Tab);
         let mut dirs = [
@@ -1035,8 +1171,8 @@ impl Input {
             f.screenshot |= shot && !p.shot;
             p.shot = shot;
             // Both combos hide plain buttons only; turbo bits are A/B and pass through.
-            let (held, turbo) = pad_bits(&mask_shot_combo(&b), p.info.kind);
-            let held = mask_combo(u16::from(held));
+            let (held, turbo) = game_bits(self.system, &mask_shot_combo(&b), p.info.kind);
+            let held = mask_menu_combo(self.system, held);
             if p.info.slot.is_none() && self.seating && (held != 0 || turbo != 0) {
                 if let Some(slot) = self.seats.sit(p.ctrl.instance_id(), &p.key) {
                     p.info.slot = Some(slot);
@@ -1349,6 +1485,215 @@ mod tests {
         let fired: Vec<usize> = frames.iter().enumerate().filter(|(_, f)| f.menu).map(|(i, _)| i).collect();
         assert_eq!(fired, [37]);
         assert!(frames.iter().all(|f| f.pads == [0; 4]));
+    }
+
+    #[test]
+    fn input_mega_drive_pad_mapping() {
+        let cases: [(fn(&mut PadButtons), u16); 14] = [
+            (|b| b.up = true, md_pad::UP),
+            (|b| b.down = true, md_pad::DOWN),
+            (|b| b.left = true, md_pad::LEFT),
+            (|b| b.right = true, md_pad::RIGHT),
+            (|b| b.west = true, md_pad::A),
+            (|b| b.south = true, md_pad::B),
+            (|b| b.east = true, md_pad::C),
+            (|b| b.l1 = true, md_pad::X),
+            (|b| b.north = true, md_pad::Y),
+            (|b| b.r1 = true, md_pad::Z),
+            (|b| b.start = true, md_pad::START),
+            (|b| b.back = true, md_pad::MODE),
+            (|b| (b.lx, b.ly) = (-0.6, 0.7), md_pad::LEFT | md_pad::DOWN),
+            (|b| (b.lt, b.rt) = (1.0, 1.0), 0),
+        ];
+        // By position on every pad, Nintendo ones included; never any turbo.
+        for kind in [PadKind::Xbox, PadKind::Nintendo, PadKind::PlayStation, PadKind::SteamDeck, PadKind::Generic] {
+            for (i, (press, bits)) in cases.iter().enumerate() {
+                let mut b = PadButtons::default();
+                press(&mut b);
+                assert_eq!(game_bits(System::MegaDrive, &b, kind), (*bits, 0), "case {i} {kind:?}");
+            }
+            let all = PadButtons { west: true, south: true, east: true, north: true, l1: true, r1: true, ..Default::default() };
+            let six = md_pad::A | md_pad::B | md_pad::C | md_pad::X | md_pad::Y | md_pad::Z;
+            assert_eq!(game_bits(System::MegaDrive, &all, kind), (six, 0));
+        }
+        // The screenshot combo hides Mode and Y; triggers stay hotkeys.
+        let b = PadButtons { back: true, north: true, west: true, lt: 1.0, ..Default::default() };
+        assert_eq!(game_bits(System::MegaDrive, &mask_shot_combo(&b), PadKind::Xbox), (md_pad::A, 0));
+        assert_eq!(pad_hotkeys(&b), (true, false, true));
+    }
+
+    #[test]
+    fn input_nes_bits_do_not_change_with_the_dispatch() {
+        let w = |bits: u8| u16::from(bits);
+        let b = PadButtons { south: true, west: true, l1: true, r1: true, back: true, up: true, ..Default::default() };
+        assert_eq!(game_bits(System::Nes, &b, PadKind::Xbox), (w(pad::A | pad::B | pad::SELECT | pad::UP), pad::A | pad::B));
+        let b = PadButtons { east: true, ..Default::default() };
+        assert_eq!(game_bits(System::Nes, &b, PadKind::Nintendo), (w(pad::A), 0));
+        assert_eq!(game_bits(System::Nes, &b, PadKind::Xbox), (w(pad::B), 0));
+        let keys = |sc: Scancode| matches!(sc, Scancode::X | Scancode::S | Scancode::A | Scancode::Return);
+        assert_eq!(key_bits(System::Nes, keys), (w(pad::A | pad::START), pad::A | pad::B));
+        // The same keys are B, X, Y and Start on the Mega Drive.
+        assert_eq!(key_bits(System::MegaDrive, keys), (md_pad::B | md_pad::X | md_pad::Y | md_pad::START, 0));
+    }
+
+    #[test]
+    fn input_mega_drive_keyboard_map() {
+        for (key, bit) in [
+            (Scancode::Up, md_pad::UP),
+            (Scancode::Down, md_pad::DOWN),
+            (Scancode::Left, md_pad::LEFT),
+            (Scancode::Right, md_pad::RIGHT),
+            (Scancode::Z, md_pad::A),
+            (Scancode::X, md_pad::B),
+            (Scancode::C, md_pad::C),
+            (Scancode::A, md_pad::X),
+            (Scancode::S, md_pad::Y),
+            (Scancode::D, md_pad::Z),
+            (Scancode::Return, md_pad::START),
+            (Scancode::RShift, md_pad::MODE),
+            (Scancode::LShift, 0),
+            (Scancode::Tab, 0),
+        ] {
+            assert_eq!(key_bits(System::MegaDrive, |sc| sc == key), (bit, 0), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn input_mode_start_is_masked_on_the_mega_drive() {
+        let md = System::MegaDrive;
+        let b = PadButtons { back: true, start: true, south: true, ..Default::default() };
+        let (held, _) = game_bits(md, &b, PadKind::Xbox);
+        assert_eq!(held, md_pad::MODE | md_pad::START | md_pad::B);
+        assert_eq!(mask_menu_combo(md, held), md_pad::B);
+        assert_eq!(mask_menu_combo(md, md_pad::START | md_pad::C), md_pad::START | md_pad::C);
+        assert_eq!(mask_menu_combo(md, md_pad::MODE), md_pad::MODE);
+        // Mega Drive bits that equal NES Select+Start (LEFT | RIGHT here) are left alone, and
+        // the NES pair is masked as before.
+        let nes_combo = u16::from(pad::START | pad::SELECT);
+        assert_eq!(mask_menu_combo(md, nes_combo), nes_combo);
+        assert_eq!(mask_menu_combo(System::Nes, nes_combo | u16::from(pad::A)), u16::from(pad::A));
+        assert_eq!(mask_menu_combo(System::Nes, md_pad::MODE | md_pad::START), md_pad::MODE | md_pad::START);
+    }
+
+    #[test]
+    fn input_nav_presses_from_buttons_and_keys() {
+        let button = |b: Button, back_held: bool| {
+            let mut n = Nav::default();
+            nav_button(&mut n, b, back_held);
+            n
+        };
+        assert_eq!(button(Button::A, false), Nav { confirm: true, ..Default::default() });
+        assert_eq!(button(Button::B, false), Nav { back: true, ..Default::default() });
+        assert_eq!(button(Button::Y, false), Nav { fav: true, ..Default::default() });
+        assert_eq!(button(Button::X, false), Nav { search: true, ..Default::default() });
+        assert_eq!(button(Button::LeftShoulder, false), Nav { prev_tab: true, ..Default::default() });
+        assert_eq!(button(Button::RightShoulder, true), Nav { next_tab: true, ..Default::default() });
+        // Back+North is the screenshot, not a favourite.
+        assert_eq!(button(Button::Y, true), Nav::default());
+        assert_eq!(button(Button::Start, false), Nav::default());
+        assert_eq!(button(Button::DPadUp, false), Nav::default());
+
+        let key = |sc: Scancode, shift: bool| {
+            let mut n = Nav::default();
+            nav_key(&mut n, sc, shift);
+            n
+        };
+        assert_eq!(key(Scancode::Tab, false), Nav { next_tab: true, ..Default::default() });
+        assert_eq!(key(Scancode::Tab, true), Nav { prev_tab: true, ..Default::default() });
+        assert_eq!(key(Scancode::Space, false), Nav { fav: true, ..Default::default() });
+        assert_eq!(key(Scancode::Space, true), Nav { fav: true, ..Default::default() });
+        assert_eq!(key(Scancode::F, false), Nav::default());
+    }
+
+    /// Needs SDL: run with `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy`, `--ignored` and
+    /// `--test-threads=1` (SDL lives on one thread).
+    #[test]
+    #[ignore]
+    fn input_virtual_pad_nav_presses_and_mega_drive_bits() {
+        use sdl2::sys;
+        let sdl = sdl2::init().unwrap();
+        let mut input = Input::new(&sdl).unwrap();
+        let mut pump = sdl.event_pump().unwrap();
+        let id = unsafe {
+            let index = sys::SDL_JoystickAttachVirtual(sys::SDL_JoystickType::SDL_JOYSTICK_TYPE_GAMECONTROLLER, 6, 15, 0);
+            assert!(index >= 0);
+            sys::SDL_JoystickGetDeviceInstanceID(index)
+        };
+        let mut poll = |input: &mut Input| input.poll(&mut pump, MS(16), |_| None);
+        let press = |button: Button, down: bool| unsafe {
+            let joy = sys::SDL_JoystickFromInstanceID(id);
+            assert!(!joy.is_null());
+            assert_eq!(sys::SDL_JoystickSetVirtualButton(joy, button as i32, down as u8), 0);
+        };
+        for _ in 0..20 {
+            if !input.pads.is_empty() {
+                break;
+            }
+            poll(&mut input);
+        }
+        assert_eq!(input.pads.len(), 1);
+
+        // One press = one frame of the edge, however long the button stays down. The on-screen
+        // keyboard's `PadPress` is filled from the same presses.
+        for (button, want) in [
+            (Button::Y, Nav { fav: true, ..Default::default() }),
+            (Button::X, Nav { search: true, ..Default::default() }),
+            (Button::LeftShoulder, Nav { prev_tab: true, ..Default::default() }),
+            (Button::RightShoulder, Nav { next_tab: true, ..Default::default() }),
+        ] {
+            press(button, true);
+            let f = poll(&mut input);
+            assert_eq!(f.nav, want, "{button:?}");
+            assert_eq!((f.pad.shift, f.pad.layout), (button == Button::Y, button == Button::X));
+            assert_eq!(poll(&mut input).nav, Nav::default());
+            press(button, false);
+            assert_eq!(poll(&mut input).nav, Nav::default());
+        }
+        // Back+North: a screenshot and no favourite.
+        press(Button::Back, true);
+        poll(&mut input);
+        press(Button::Y, true);
+        let f = poll(&mut input);
+        assert!(f.screenshot && !f.nav.fav);
+        press(Button::Y, false);
+        press(Button::Back, false);
+        poll(&mut input);
+
+        // Mega Drive: the same pad gives six-button bits, the shoulders are X and Z, no turbo.
+        input.set_system(System::MegaDrive);
+        input.set_seating(true);
+        for (button, bit) in [
+            (Button::X, md_pad::A),
+            (Button::A, md_pad::B),
+            (Button::B, md_pad::C),
+            (Button::LeftShoulder, md_pad::X),
+            (Button::Y, md_pad::Y),
+            (Button::RightShoulder, md_pad::Z),
+            (Button::Start, md_pad::START),
+            (Button::Back, md_pad::MODE),
+            (Button::DPadUp, md_pad::UP),
+            (Button::DPadDown, md_pad::DOWN),
+            (Button::DPadLeft, md_pad::LEFT),
+            (Button::DPadRight, md_pad::RIGHT),
+        ] {
+            press(button, true);
+            let f = poll(&mut input);
+            assert_eq!((f.pads, f.turbo, f.seated), ([bit, 0, 0, 0], [0; 4], 1), "{button:?}");
+            assert_eq!(f.solo_pads(), f.pads);
+            press(button, false);
+            poll(&mut input);
+        }
+        // Mode+Start: the menu after 0.6 s, and the game sees neither meanwhile.
+        press(Button::Back, true);
+        press(Button::Start, true);
+        let frames: Vec<InputFrame> = (0..60).map(|_| poll(&mut input)).collect();
+        assert_eq!(frames.iter().filter(|f| f.menu).count(), 1);
+        assert!(frames.iter().all(|f| f.pads == [0; 4]));
+        press(Button::Start, false);
+        assert_eq!(poll(&mut input).pads[0], md_pad::MODE);
+        // Back to the NES: Back alone is Select again.
+        input.set_system(System::Nes);
+        assert_eq!(poll(&mut input).pads[0], u16::from(pad::SELECT));
     }
 
     #[test]
