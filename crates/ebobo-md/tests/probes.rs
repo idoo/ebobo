@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 /// Probes whose difference is understood and accepted for now: (name, reason).
 const KNOWN_DIFF: &[(&str, &str)] = &[
+    ("int_cost", "cost of one horizontal interrupt within 0.3 cycle of the reference in 7 of 8 cases (every-8th-line case 1.3, 2 passes) \
+      with the E-clock acknowledge wait; loop counts differ by 0-3 passes"),
     ("frame_cycles", "access timing inside an instruction (2 passes in 4202)"),
     ("vcounter", "H counter spacing: access timing inside an instruction"),
     ("int_boot", "only word 0, the status word read at power-on (0x3A08 vs 0x3608): bits 15-10 are not driven by the VDP and show \

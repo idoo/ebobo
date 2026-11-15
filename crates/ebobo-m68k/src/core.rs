@@ -552,17 +552,19 @@ impl Cpu {
 mod tests {
     use super::*;
 
-    /// 64 KB of RAM mirrored over the whole address space; counts the accesses and logs the acknowledged levels.
+    /// 64 KB of RAM mirrored over the whole address space; counts the accesses, logs the acknowledged levels and
+    /// answers `ack_wait` for the acknowledge's E-clock wait.
     struct Ram {
         mem: Vec<u8>,
         hits: u32,
         last: u32,
         acks: Vec<u8>,
+        ack_wait: u32,
     }
 
     impl Ram {
         fn new() -> Ram {
-            Ram { mem: vec![0; 0x1_0000], hits: 0, last: 0, acks: Vec::new() }
+            Ram { mem: vec![0; 0x1_0000], hits: 0, last: 0, acks: Vec::new(), ack_wait: 0 }
         }
 
         fn r16(&self, addr: u32) -> u16 {
@@ -613,6 +615,10 @@ mod tests {
         fn int_ack(&mut self, level: u8) -> u8 {
             self.acks.push(level);
             24 + level
+        }
+
+        fn int_ack_wait(&mut self) -> u32 {
+            self.ack_wait
         }
     }
 
@@ -1022,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_respects_the_mask_and_costs_44() {
+    fn interrupt_respects_the_mask_and_costs_44_plus_the_ack_wait() {
         let (mut cpu, mut bus) = machine();
         bus.w16(0x400, 0x4E71);
         bus.w16(0x11C0, 0x4E71);
@@ -1031,7 +1037,9 @@ mod tests {
         assert_eq!(cpu.step(&mut bus), 4);
         assert!(bus.acks.is_empty());
         cpu.set_sr(0x2300);
-        assert_eq!(cpu.step(&mut bus), 44);
+        // The Mega Drive's autovector acknowledge waits 6 cycles plus 0-9 for the E clock.
+        bus.ack_wait = 6 + 9;
+        assert_eq!(cpu.step(&mut bus), 44 + 15);
         assert_eq!(bus.acks, [4]);
         assert_eq!((cpu.pc, cpu.sr, cpu.ssp), (0x11C0, 0x2400, 0x7FFA));
         assert_eq!((bus.r16(0x7FFA), bus.r32(0x7FFC)), (0x2300, 0x402));

@@ -471,6 +471,16 @@ impl ebobo_m68k::Bus for M68kView<'_> {
         self.0.s.vdp.irq_ack(level);
         24 + level
     }
+
+    /// The autovector acknowledge is a VPA cycle: it starts with the E clock (68000 clock / 10,
+    /// in phase with master clock 0) and takes 10 CPU cycles plus the wait for the next E
+    /// period, against the 4 of an ordinary bus cycle. Measured by the probe `int_cost`
+    /// (tools/md-oracle/int_cost.py): every case within about a cycle of the reference.
+    fn int_ack_wait(&mut self) -> u32 {
+        const E_PERIOD: u64 = 10 * M68K_DIV;
+        let to_e = (E_PERIOD - self.0.s.now % E_PERIOD) % E_PERIOD;
+        6 + to_e.div_ceil(M68K_DIV) as u32
+    }
 }
 
 /// The Z80's side of the machine.

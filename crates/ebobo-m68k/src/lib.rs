@@ -51,6 +51,12 @@ pub trait Bus {
     fn int_ack(&mut self, level: u8) -> u8 {
         24 + level
     }
+    /// CPU cycles the acknowledge cycle of an autovectored interrupt waits beyond the 4 of an
+    /// ordinary bus cycle: it is synchronised to the E clock (the CPU clock / 10), so the wait
+    /// depends on the E clock's phase when the interrupt is accepted. The default is none.
+    fn int_ack_wait(&mut self) -> u32 {
+        0
+    }
     /// The RESET instruction pulsed the reset line of the external devices.
     fn reset_devices(&mut self) {}
 }
@@ -214,15 +220,17 @@ impl Cpu {
     }
 
     /// Interrupt acceptance: S on, T off, the mask raised to `level`, the acknowledge cycle,
-    /// PC and the old SR pushed, PC from the vector the bus named. 44 cycles.
+    /// PC and the old SR pushed, PC from the vector the bus named. 44 cycles plus the
+    /// acknowledge's E-clock wait ([`Bus::int_ack_wait`]).
     fn interrupt(&mut self, bus: &mut impl Bus, level: u8) -> Res<()> {
         let old = self.sr;
         self.sr = (old & !(sr::T | sr::INT_MASK)) | sr::S | (u16::from(level) << 8);
+        let wait = bus.int_ack_wait();
         let vector = bus.int_ack(level);
         self.push32(bus, self.pc)?;
         self.push16(bus, old)?;
         self.pc = self.read(bus, u32::from(vector) * 4, Size::Long)?;
-        self.cyc = 44;
+        self.cyc = 44 + wait;
         Ok(())
     }
 
