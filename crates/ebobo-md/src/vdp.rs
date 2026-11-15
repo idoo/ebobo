@@ -113,8 +113,13 @@ pub struct Vdp {
 
 impl Vdp {
     /// Power-on state. `pal`: 313 lines at 50 Hz instead of 262 at 60 Hz.
+    /// The chip powers on part-way through a frame, not at line 0: the reference machine's first
+    /// vertical blanking comes 32 lines (NTSC) / 58 lines (PAL) after the 68000's first instruction
+    /// (probes `boot_phase`, `boot_clock`), so the counters start at line 191 + 780 clocks
+    /// (NTSC) / 164 + 720 clocks (PAL); the line points before that position count as passed.
     pub fn new(pal: bool) -> Vdp {
-        Vdp {
+        let (line, mclk) = if pal { (164, 720) } else { (191, 780) };
+        let mut v = Vdp {
             regs: [0; 24],
             vram: vec![0; 0x10000],
             cram: vec![0; 64],
@@ -130,8 +135,8 @@ impl Vdp {
             odd_frame: false,
             pal,
             clock: 0,
-            line: 0,
-            mclk: 0,
+            line,
+            mclk,
             fired: 0,
             vint_pending: false,
             hint_pending: false,
@@ -143,7 +148,9 @@ impl Vdp {
             fifo_done: [0; 4],
             fifo_tail: 0,
             hv_latch: None,
-        }
+        };
+        v.fired = v.points().iter().filter(|&&(_, p)| p <= mclk).fold(0, |f, &(bit, _)| f | bit);
+        v
     }
 
     fn h40(&self) -> bool {
