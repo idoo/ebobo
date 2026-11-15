@@ -29,6 +29,7 @@ use ebobo_net::{
 use crate::audio::Audio;
 use crate::canvas::{self, Canvas, Font};
 use crate::config::{self, Config};
+use crate::enhance::{Enhancer, Mode};
 use crate::i18n::Lang;
 use crate::input::{Input, InputFrame, PadEvent, PadInfo, PointerEvent};
 use crate::library::{self, Library, RomEntry};
@@ -147,6 +148,10 @@ struct App {
     frame: Vec<u8>,
     /// Size of the game picture in `frame` that `canvas` was last composed over; `None` in the menus.
     frame_size: Option<(u32, u32)>,
+    /// Which layer every pixel of `frame` came from (filled only while an enhancement is on).
+    layers: Vec<u8>,
+    /// Magnifies and shades `frame` for display when `Config::enhance` is not `Off`.
+    enhancer: Enhancer,
     title_rom: Option<String>,
     quit: bool,
     /// `--autostart N`: host starts once N players are in and the game can start.
@@ -197,7 +202,7 @@ pub fn run(args: Vec<String>) -> i32 {
             return 1;
         }
     };
-    app.begin(cli.start.clone());
+    app.begin(cli.start.clone(), cli.library);
 
     let started = Instant::now();
     let exit_after = cli.exit_after.map(Duration::from_secs_f64);
@@ -223,7 +228,8 @@ pub fn run(args: Vec<String>) -> i32 {
     if let Some(path) = &cli.screenshot {
         // What the screen shows (effects included), else the plain canvas.
         let pictures = ArtPictures(app.ui.art());
-        let shot = app.video.capture_frame(&layers(&app.frame, app.frame_size, &app.canvas, &pictures), cli.screenshot_size);
+        let game = shown_game(&mut app.enhancer, app.config.enhance, &app.frame, &app.layers, app.frame_size);
+        let shot = app.video.capture_frame(&Frame { game, ui: &app.canvas, pictures: &pictures }, cli.screenshot_size);
         let (w, h, px) = match shot {
             Ok(shot) => shot,
             Err(err) => {
@@ -288,8 +294,10 @@ impl App {
         let pump = sdl.event_pump()?;
         let mut video = Video::new(&sdl, config.fullscreen, config.scale, config.screen)?;
         video.set_effect(config.effect);
+        video.set_ambient(config.ambient);
         let lang = Lang::resolve(config.lang.as_deref());
-        let art = Art::new(config::data_dir().join("art"), config.online_art);
+        let art_dir = config::data_dir().join("art");
+        let art = Art::with_loader(art_dir, config.online_art, Box::new(|path| library::load_rom_file(path).ok()));
         let shelf = ebobo_art::shelf::Shelf::load(config::data_dir().join("shelf.tsv"));
         let mut ui = Ui::with_library(lang, art, shelf);
         let audio = match Audio::new(&sdl) {
@@ -337,6 +345,8 @@ impl App {
             scratch: Vec::with_capacity(2048),
             frame: Vec::new(),
             frame_size: None,
+            layers: Vec::new(),
+            enhancer: Enhancer::new(),
             title_rom: None,
             quit: false,
             autostart: cli.autostart,
@@ -353,9 +363,12 @@ impl App {
         })
     }
 
-    /// Initial state from the command line.
-    fn begin(&mut self, start: Start) {
+    /// Initial state from the command line; `library` opens the library over the main menu.
+    fn begin(&mut self, start: Start, library: bool) {
         self.ui.show_main();
+        if library {
+            self.ui.show_library();
+        }
         let file = |app: &mut App, path: PathBuf| match app.library.add_file(&path) {
             Ok(entry) => Some(entry),
             Err(err) => {
@@ -528,7 +541,8 @@ impl App {
         let playing = self.in_game() && !self.ui.is_visible();
         self.video.set_cursor_visible(!playing && self.mouse_at.is_some_and(|t| t.elapsed() < CURSOR_IDLE));
         let pictures = ArtPictures(self.ui.art());
-        if let Err(err) = self.video.present_frame(&layers(&self.frame, self.frame_size, &self.canvas, &pictures)) {
+        let game = shown_game(&mut self.enhancer, self.config.enhance, &self.frame, &self.layers, self.frame_size);
+        if let Err(err) = self.video.present_frame(&Frame { game, ui: &self.canvas, pictures: &pictures }) {
             eprintln!("ebobo: present: {err}");
         }
         self.update_title();
@@ -779,6 +793,7 @@ impl App {
         }
         self.video.set_screen_mode(self.config.screen);
         self.video.set_effect(self.config.effect);
+        self.video.set_ambient(self.config.ambient);
         if let Some(audio) = &mut self.audio {
             audio.set_volume(self.config.volume);
         }
@@ -1254,6 +1269,14 @@ impl App {
             State::Menu | State::Lobby(_) => None,
         }
         .map(|(w, h)| (w as u32, h as u32));
+        // Layers only for the frame that is shown, and only when an enhancement uses them.
+        if self.config.enhance != Mode::Off {
+            match &self.state {
+                State::Solo(s) => _ = s.console.frame_layers(&mut self.layers),
+                State::Net(n) => _ = n.console.frame_layers(&mut self.layers),
+                State::Menu | State::Lobby(_) => {}
+            }
+        }
         match self.frame_size {
             Some(_) => self.canvas.clear_transparent(),
             None => self.canvas.clear(BACKDROP),
@@ -1400,10 +1423,21 @@ impl Pictures for ArtPictures<'_> {
     }
 }
 
-/// The frame to show: the game's picture in `frame` when `size` says one is on screen, the
-/// placed pictures and the interface.
-fn layers<'a>(frame: &'a [u8], size: Option<(u32, u32)>, ui: &'a Canvas, pictures: &'a ArtPictures<'a>) -> Frame<'a> {
-    Frame { game: size.map(|(w, h)| GameFrame { rgba: frame, w, h, scale: 1 }), ui, pictures }
+/// The game's picture as the screen shows it: `frame` (`size` when a game is on screen), run
+/// through the enhancer with `layers` unless `mode` is `Off`, which shows it as it is.
+fn shown_game<'a>(
+    enhancer: &'a mut Enhancer,
+    mode: Mode,
+    frame: &'a [u8],
+    layers: &[u8],
+    size: Option<(u32, u32)>,
+) -> Option<GameFrame<'a>> {
+    let (w, h) = size?;
+    if mode == Mode::Off || layers.len() < (w * h) as usize {
+        return Some(GameFrame { rgba: frame, w, h, scale: 1 });
+    }
+    let e = enhancer.apply(mode, frame, layers, w as usize, h as usize);
+    Some(GameFrame { rgba: e.rgba, w: e.w as u32, h: e.h as u32, scale: e.scale })
 }
 
 fn make_ctx<'a>(

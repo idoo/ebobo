@@ -42,6 +42,10 @@ pub struct Config {
     pub auto_update: bool,
     /// Download box art for the library's cards (Settings ▸ Advanced); off shows only what is cached.
     pub online_art: bool,
+    /// Picture enhancement (HD smoothing, depth shadows); `Off` = the console's own pixels.
+    pub enhance: crate::enhance::Mode,
+    /// Ambient light: the bars around a game's picture glow softly in its colours.
+    pub ambient: bool,
 }
 
 /// "Sprite limit" setting.
@@ -101,6 +105,8 @@ impl Default for Config {
             sprite_limit: SpriteLimit::Auto,
             auto_update: true,
             online_art: true,
+            enhance: crate::enhance::Mode::Off,
+            ambient: true,
         }
     }
 }
@@ -321,6 +327,20 @@ mod tests {
             let text = toml::to_string_pretty(&Config { effect: e, ..Config::default() }).unwrap();
             let back: Config = toml::from_str(&text).unwrap();
             assert_eq!(back.effect, e);
+        }
+    }
+
+    #[test]
+    fn enhance_and_ambient_default_for_old_files_and_round_trip() {
+        use crate::enhance::Mode;
+        let old: Config = toml::from_str("fullscreen = true\nscale = 2\nscreen = \"fit\"\neffect = \"crt\"\n").unwrap();
+        assert_eq!((old.enhance, old.ambient), (Mode::Off, true));
+        let set: Config = toml::from_str("enhance = \"depth\"\nambient = false\n").unwrap();
+        assert_eq!((set.enhance, set.ambient), (Mode::Depth, false));
+        for mode in Mode::ALL {
+            let text = toml::to_string_pretty(&Config { enhance: mode, ambient: false, ..Config::default() }).unwrap();
+            let back: Config = toml::from_str(&text).unwrap();
+            assert_eq!((back.enhance, back.ambient), (mode, false));
         }
     }
 }

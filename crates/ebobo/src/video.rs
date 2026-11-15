@@ -27,9 +27,10 @@ const MAX_PICTURES: usize = 64;
 /// Largest side of a game frame or a picture, pixels.
 const MAX_SIDE: u32 = 4096;
 /// Brightness of the ambient light at the picture's edge (1 = the blurred picture itself).
-const AMBIENT: f32 = 0.3;
-/// How much of the ambient light is left at the output's outer edge.
-const AMBIENT_EDGE: f32 = 0.12;
+const AMBIENT: f32 = 0.55;
+/// How much of the ambient light is left at the output's outer edge (0.55 × 0.27 ≈ 15 % of
+/// the blurred picture).
+const AMBIENT_EDGE: f32 = 0.27;
 /// Rings of quads the ambient light's falloff is drawn with.
 const SHADE_RINGS: u32 = 8;
 
@@ -312,9 +313,7 @@ impl Video {
     }
 
     /// Ambient light: the bars around a game's picture glow softly in its colours. Applies
-    /// from the next frame; nothing in the menus or when the picture fills the output. On
-    /// from `new` until the app passes `Config::ambient`.
-    #[allow(dead_code)]
+    /// from the next frame; nothing in the menus or when the picture fills the output.
     pub fn set_ambient(&mut self, on: bool) {
         self.ambient = on;
     }
@@ -785,8 +784,8 @@ fn draw_ambient(c: &mut WindowCanvas, haze: &Texture, shade: &Shade) -> Result<(
 
 /// The ambient light's falloff around the picture rectangle `dest` in an `out`-sized output:
 /// `SHADE_RINGS` + 1 rectangles from the picture's edge to the output's, four corners each
-/// (x, y, black's alpha), and the triangles between neighbours. The light drops fast next to
-/// the picture and slowly further out, down to `AMBIENT_EDGE` of itself.
+/// (x, y, black's alpha), and the triangles between neighbours. The light falls evenly from
+/// the picture's edge to the output's, down to `AMBIENT_EDGE` of itself.
 fn shade_rings(dest: Rect, out: (u32, u32)) -> (Vec<(f32, f32, u8)>, Vec<u32>) {
     let n = SHADE_RINGS;
     let (l, t, r, b) = (dest.x() as f32, dest.y() as f32, dest.right() as f32, dest.bottom() as f32);
@@ -794,7 +793,7 @@ fn shade_rings(dest: Rect, out: (u32, u32)) -> (Vec<(f32, f32, u8)>, Vec<u32>) {
     let mut verts = Vec::with_capacity(((n + 1) * 4) as usize);
     for i in 0..=n {
         let f = i as f32 / n as f32;
-        let a = ((1.0 - AMBIENT_EDGE) * (1.0 - (1.0 - f) * (1.0 - f)) * 255.0).round() as u8;
+        let a = ((1.0 - AMBIENT_EDGE) * f * 255.0).round() as u8;
         let (x0, y0, x1, y1) = (l * (1.0 - f), t * (1.0 - f), r + (ow - r) * f, b + (oh - b) * f);
         verts.extend([(x0, y0, a), (x1, y0, a), (x1, y1, a), (x0, y1, a)]);
     }
@@ -1109,6 +1108,11 @@ mod tests {
         assert_eq!((outer[0].0, outer[0].1, outer[2].0, outer[2].1), (0.0, 0.0, 1280.0, 800.0));
         assert_eq!(outer[0].2, ((1.0 - AMBIENT_EDGE) * 255.0).round() as u8);
         assert!(v.windows(2).all(|p| p[1].2 >= p[0].2));
+        // About 55 % of the blurred picture next to the picture, about 15 % at the output's edge.
+        assert_eq!(AMBIENT, 0.55);
+        assert!((AMBIENT * AMBIENT_EDGE - 0.15).abs() < 0.005);
+        let half = &v[(SHADE_RINGS / 2 * 4) as usize..];
+        assert_eq!(half[0].2, ((1.0 - AMBIENT_EDGE) * 0.5 * 255.0).round() as u8);
     }
 
     #[test]

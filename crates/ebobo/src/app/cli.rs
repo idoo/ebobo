@@ -2,8 +2,9 @@
 
 use std::path::PathBuf;
 
-use crate::config::Config;
+use crate::config::{Config, ScreenMode};
 use crate::crt::Effect;
+use crate::enhance::Mode;
 
 pub const USAGE: &str = "\
 usage: ebobo [ROM] [options]
@@ -22,6 +23,10 @@ usage: ebobo [ROM] [options]
   --screenshot PATH    write a PNG of the screen (effects included) when the app exits
   --screenshot-size WxH  size of that PNG (default: the window's drawable size)
   --effect NAME        picture effect: off, crt, pvm, lcd
+  --enhance MODE       picture enhancement: off, hd, depth (HD smoothing plus depth shadows)
+  --ambient on|off     ambient light in the bars around the game's picture
+  --screen MODE        screen mode: stretch, fit (aspect kept), pixel (integer scale)
+  --library            start in the library of games (for screenshots and checks)
   --exit-after SECONDS quit after this many seconds
   --autostart N        host: start the game once N players are in the room
   --resume FROM        host: start from new, last (the last moment) or save instead of the
@@ -77,6 +82,11 @@ pub struct Cli {
     pub screenshot: Option<PathBuf>,
     pub screenshot_size: Option<(u32, u32)>,
     pub effect: Option<Effect>,
+    pub enhance: Option<Mode>,
+    pub ambient: Option<bool>,
+    pub screen: Option<ScreenMode>,
+    /// `--library`: open the library over the main menu (only without a game to start).
+    pub library: bool,
     pub exit_after: Option<f64>,
     pub autostart: Option<usize>,
     pub resume: Option<ResumeFrom>,
@@ -111,6 +121,15 @@ impl Cli {
         }
         if let Some(effect) = self.effect {
             config.effect = effect;
+        }
+        if let Some(enhance) = self.enhance {
+            config.enhance = enhance;
+        }
+        if let Some(ambient) = self.ambient {
+            config.ambient = ambient;
+        }
+        if let Some(screen) = self.screen {
+            config.screen = screen;
         }
     }
 }
@@ -165,6 +184,28 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                     .ok_or_else(|| format!("bad size: {raw}"))?;
                 cli.screenshot_size = Some(size);
             }
+            "--enhance" => {
+                let raw = value(flag)?;
+                cli.enhance = Some(Mode::parse(&raw).ok_or_else(|| format!("bad enhancement: {raw} (off, hd, depth)"))?);
+            }
+            "--ambient" => {
+                let raw = value(flag)?;
+                cli.ambient = Some(match raw.trim().to_ascii_lowercase().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(format!("bad --ambient: {raw} (on, off)")),
+                });
+            }
+            "--screen" => {
+                let raw = value(flag)?;
+                cli.screen = Some(match raw.trim().to_ascii_lowercase().as_str() {
+                    "stretch" => ScreenMode::Stretch,
+                    "fit" => ScreenMode::Fit,
+                    "pixel" => ScreenMode::Pixel,
+                    _ => return Err(format!("bad screen mode: {raw} (stretch, fit, pixel)")),
+                });
+            }
+            "--library" => cli.library = true,
             "--effect" => {
                 let raw = value(flag)?;
                 cli.effect = Some(Effect::parse(&raw).ok_or_else(|| format!("bad effect: {raw} (off, crt, pvm, lcd)"))?);
@@ -196,12 +237,15 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             _ if flag.starts_with('-') && flag.len() > 1 => return Err(format!("unknown option: {flag}")),
             _ => set_start(&mut cli, Start::Solo(arg.into()))?,
         }
-        if inline.is_some() && matches!(flag, "--relay" | "--fullscreen" | "--windowed") {
+        if inline.is_some() && matches!(flag, "--relay" | "--fullscreen" | "--windowed" | "--library") {
             return Err(format!("{flag} takes no value"));
         }
     }
     if cli.port.is_some() && !matches!(cli.start, Start::Listen(_)) {
         return Err("--port only works with --listen".into());
+    }
+    if cli.library && cli.start != Start::Menu {
+        return Err("--library starts in the library: give no ROM, --host, --join, --listen or --connect".into());
     }
     Ok(Parsed::Run(cli))
 }
@@ -314,6 +358,38 @@ mod tests {
         assert_eq!(cli.screenshot_size, Some((1280, 800)));
         assert!(p(&["--effect", "vhs"]).is_err());
         assert!(p(&["--screenshot-size", "0x5"]).is_err());
+    }
+
+    #[test]
+    fn picture_and_library_options() {
+        let cli = run(&["--enhance", "HD", "--ambient=off", "--screen", "fit", "--library"]);
+        assert_eq!((cli.enhance, cli.ambient, cli.screen, cli.library), (Some(Mode::Hd), Some(false), Some(ScreenMode::Fit), true));
+        assert_eq!(run(&["--enhance=depth"]).enhance, Some(Mode::Depth));
+        assert_eq!(run(&["--enhance", "off"]).enhance, Some(Mode::Off));
+        assert_eq!(run(&["--ambient", "on"]).ambient, Some(true));
+        assert_eq!(run(&["--screen", "pixel"]).screen, Some(ScreenMode::Pixel));
+        assert_eq!(run(&["--screen", "Stretch"]).screen, Some(ScreenMode::Stretch));
+        let mut config = Config::default();
+        run(&["--enhance", "depth", "--ambient", "off", "--screen", "pixel"]).apply(&mut config);
+        assert_eq!((config.enhance, config.ambient, config.screen), (Mode::Depth, false, ScreenMode::Pixel));
+        let mut kept = Config::default();
+        run(&[]).apply(&mut kept);
+        assert_eq!(kept, Config::default());
+        for bad in [
+            &["--enhance", "4k"][..],
+            &["--enhance"],
+            &["--ambient", "yes"],
+            &["--ambient"],
+            &["--screen", "zoom"],
+            &["--screen"],
+            &["--library=1"],
+            &["--library", "a.nes"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
+        for flag in ["--enhance", "--ambient", "--screen", "--library"] {
+            assert!(USAGE.contains(flag), "{flag}");
+        }
     }
 
     #[test]
