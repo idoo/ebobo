@@ -19,12 +19,15 @@ pub(crate) fn exec(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
 /// word is sign-extended, the whole register is written, no flag changes.
 /// Cycles: only the bus accesses and the 2 of an indexed mode or of a -(An) source, which the helpers charge.
 ///
-/// What an odd destination (address error on the write) shows of the chip's order:
-/// - (An)+ is stepped only after the write: a faulting write leaves An as it was.
-/// - -(An): the prefetch of the next opcode (4 cycles) comes before the write, so the stacked PC is one word further
-///   on; a long goes out low word first, and An has been stepped by 2 only when that word faults.
+/// What an odd destination (address error on the write) shows of the chip's order (MAME microcode suite):
+/// - (An), (An)+: the frame's PC is `pc + 2`; (An)+ is stepped only after the write, so a faulting write leaves An.
+///   A long has set no flags yet from a register or immediate source; from a memory source N and Z come from the low
+///   word (V, C cleared).
+/// - -(An): the prefetch of the next opcode (4 cycles) comes before the write; the frame's PC is `pc + 2`. A long goes
+///   out low word first, and a fault there leaves An unstepped. A word stacks the next opcode as instruction register.
+/// - d16(An), d8(An,Xn): the frame's PC is `pc`; a long from a register or immediate keeps V and C.
 /// - (xxx).l after a memory source: the low address word is taken from the prefetch queue, and its bus read (and
-///   `pc` passing it) comes only after the write.
+///   `pc` passing it) comes only after the write; a long faulting there has N and Z from the low word.
 fn mov(cpu: &mut Cpu, bus: &mut impl Bus, op: u16, size: Size) -> Res<()> {
     let (smode, sreg) = (mode(op), reg(op));
     let dmode = ((op >> 6) & 7) as u8;
@@ -42,6 +45,8 @@ fn mov(cpu: &mut Cpu, bus: &mut impl Bus, op: u16, size: Size) -> Res<()> {
     }
     let late_ext = dmode == 7 && dreg == 1 && matches!(src, Ea::Mem(_));
     let dst = if late_ext {
+        // No `operand` call for this destination: drop the source's fault notes.
+        (cpu.ae_pc, cpu.ae_program, cpu.ae_restore) = (0, false, None);
         let hi = u32::from(cpu.fetch16(bus)?);
         // Already in the prefetch queue: no bus cycle until the queue is refilled after the write.
         let lo = u32::from(bus.read16(cpu.pc & 0x00FF_FFFF));
@@ -54,30 +59,59 @@ fn mov(cpu: &mut Cpu, bus: &mut impl Bus, op: u16, size: Size) -> Res<()> {
         }
         dst
     };
+    // The flags before MOVE touches them: some faulting writes come before the flags are (all) set.
+    let old_ccr = cpu.ccr();
+    let from_mem = matches!(src, Ea::Mem(_));
+    let long = matches!(size, Size::Long);
     cpu.nz(val, size);
     match dst {
         Ea::Mem(addr) if dmode == 4 => {
-            let written = if matches!(size, Size::Long) {
-                cpu.write(bus, addr.wrapping_add(2), Size::Word, val & 0xFFFF)
-                    .inspect_err(|_| cpu.set_a(dreg, addr.wrapping_add(2)))
-                    .and_then(|()| cpu.write(bus, addr, Size::Word, val >> 16))
+            let written = if long {
+                cpu.write(bus, addr.wrapping_add(2), Size::Word, val & 0xFFFF).and_then(|()| cpu.write(bus, addr, Size::Word, val >> 16))
             } else {
                 cpu.store(bus, dst, size, val)
             };
             written.inspect_err(|_| {
-                cpu.pc = cpu.pc.wrapping_add(2);
+                cpu.ae_pc = 2;
                 cpu.cyc += 4;
+                if long {
+                    cpu.set_a(dreg, addr.wrapping_add(4));
+                } else {
+                    // The prefetched next opcode is in the instruction register by the time the word goes out.
+                    cpu.ae_ir = Some(bus.read16(cpu.pc & 0x00FF_FFFF));
+                }
             })
         }
-        Ea::Mem(_) if dmode == 3 => {
-            cpu.store(bus, dst, size, val)?;
-            // A byte on A7 steps by 2, which keeps the stack even.
-            let by = if byte && dreg == 7 { 2 } else { size.bytes() };
-            cpu.set_a(dreg, cpu.a(dreg).wrapping_add(by));
+        Ea::Mem(_) if dmode == 2 || dmode == 3 => {
+            cpu.store(bus, dst, size, val).inspect_err(|_| {
+                cpu.ae_pc = 2;
+                if long {
+                    cpu.set_ccr(old_ccr);
+                    if from_mem {
+                        cpu.nz(val & 0xFFFF, Size::Word);
+                    }
+                }
+            })?;
+            if dmode == 3 {
+                // A byte on A7 steps by 2, which keeps the stack even.
+                let by = if byte && dreg == 7 { 2 } else { size.bytes() };
+                cpu.set_a(dreg, cpu.a(dreg).wrapping_add(by));
+            }
             Ok(())
         }
+        Ea::Mem(_) if dmode == 5 || dmode == 6 => cpu.store(bus, dst, size, val).inspect_err(|_| {
+            cpu.ae_pc = 0;
+            if long && !from_mem {
+                cpu.set_ccr((cpu.ccr() & !3) | (old_ccr & 3));
+            }
+        }),
         _ => {
-            cpu.store(bus, dst, size, val)?;
+            cpu.store(bus, dst, size, val).inspect_err(|_| {
+                if late_ext && long {
+                    cpu.set_ccr(old_ccr);
+                    cpu.nz(val & 0xFFFF, Size::Word);
+                }
+            })?;
             if late_ext {
                 cpu.fetch16(bus)?;
             }
