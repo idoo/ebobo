@@ -31,6 +31,7 @@ mod line4;
 mod logic;
 mod moves;
 mod shift;
+mod sys;
 
 /// The 68000's view of the machine.
 pub trait Bus {

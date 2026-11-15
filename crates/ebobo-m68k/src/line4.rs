@@ -1,13 +1,13 @@
-//! Line 4: LEA, PEA, CLR, NEG, NEGX, NOT, TST, TAS, NBCD, EXT, SWAP, MOVEM, CHK, JMP, JSR, RTS, RTE, RTR, TRAP, TRAPV,
-//! LINK, UNLK, MOVE to and from SR, CCR and USP, STOP, RESET, NOP and ILLEGAL.
+//! Line 4 without its 0x4E00-0x4EFF block: NEGX, CLR, NEG, NOT, TST, TAS, NBCD, EXT, SWAP, PEA, LEA, CHK, MOVEM,
+//! MOVE from SR, MOVE to CCR, MOVE to SR and ILLEGAL. The 0x4Exx block (TRAP, LINK, UNLK, MOVE USP, RESET, NOP,
+//! STOP, RTE, RTS, TRAPV, RTR, JSR, JMP) is `sys.rs`.
 
 use crate::core::{Fault, Res};
-use crate::{Bus, Cpu};
+use crate::{Bus, Cpu, sys};
 
-pub(crate) fn exec(_cpu: &mut Cpu, _bus: &mut impl Bus, op: u16) -> Res<()> {
-    match op {
-        // NOP: 4 cycles, all of them the opcode fetch `step` already made.
-        0x4E71 => Ok(()),
-        _ => Err(Fault::Illegal),
+pub(crate) fn exec(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
+    if op & 0xFF00 == 0x4E00 {
+        return sys::exec(cpu, bus, op);
     }
+    Err(Fault::Illegal)
 }
