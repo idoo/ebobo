@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ebobo_core::{cart, Region};
+use ebobo_console::Region;
 use serde_json::{json, Value};
 
 use crate::mesh::{Link, Mesh, MeshConfig, MeshEvent, MeshRole};
@@ -23,13 +23,22 @@ const CTRL_RETRY: Duration = Duration::from_millis(200);
 const PING_EVERY: Duration = Duration::from_millis(250);
 /// RTT samples a peer needs before the auto input delay trusts `srtt + 2 * rttvar`.
 const WARM_SAMPLES: u32 = 8;
-const ROM_WINDOW: u32 = 32;
+/// ROM chunks in flight per guest: 64 KB a round trip. The host sends and the guest reads once a
+/// `TICK`, so a round is the round trip plus up to two ticks: a 4 MB ROM (4096 chunks, 64 rounds)
+/// takes 2.6-3.1 s at 40 ms and 9.6-10.1 s at 150 ms, the largest one (`MAX_ROM`) twice that. 64
+/// datagrams of 1 KB also fit a default Linux UDP receive buffer (208 KB) between two guest ticks.
+const ROM_WINDOW: u32 = 64;
+/// No ack progress for this long: everything past the last acked byte is sent again. A transfer
+/// has no deadline of its own; it runs for as long as the route lives.
 const ROM_RETRY: Duration = Duration::from_millis(300);
+/// The host hands the game over when every guest acked `start` or this passed. It starts counting
+/// at the start, when every guest already holds the ROM, so the ROM's size does not matter to it.
 const START_ACK_WAIT: Duration = Duration::from_secs(3);
 /// Largest ROM a guest accepts over the wire.
 const MAX_ROM: usize = 8 * 1024 * 1024;
 /// Largest saved game (`Resume::state`) a host sends and a guest accepts. NES states are
-/// 20-100 KB; the cap keeps a broken peer from making a guest allocate without bound and fits
+/// 20-100 KB, Mega Drive states about 300 KB (5 round trips at `STATE_WINDOW`, well inside
+/// `STATE_WAIT`); the cap keeps a broken peer from making a guest allocate without bound and fits
 /// the chunk index (`u16`) and the ack bitmap (128 bytes) in one packet.
 const MAX_STATE: usize = 1024 * 1024;
 /// A start from a save is called off (`NetError::SaveTransfer` on the host, the lobby stays
@@ -95,7 +104,7 @@ pub struct Resume {
     pub kind: ResumeKind,
     /// When it was saved, Unix seconds; shown to every player in the lobby.
     pub saved_at: u64,
-    /// `ebobo_core::Nes::save_state` bytes for the host's ROM.
+    /// `ebobo_console::Console::save_state` bytes for the host's ROM.
     pub state: Vec<u8>,
 }
 
@@ -144,7 +153,7 @@ pub struct GameStart {
     /// The live mesh: routes, relay, in-game route health and roaming.
     pub link: Link,
     pub me: PeerId,
-    /// `slots[i]` = peer id on NES controller i+1.
+    /// `slots[i]` = peer id on controller i+1 of the console.
     pub slots: Vec<PeerId>,
     /// Player names by slot.
     pub names: Vec<String>,
@@ -157,8 +166,8 @@ pub struct GameStart {
     pub delay_auto: bool,
     pub four_score: bool,
     /// Region the host announced (header region of its ROM); every peer must emulate it.
-    pub region: ebobo_core::Region,
-    /// `ebobo_core::Nes::save_state` bytes every peer loads before the first frame (the host's
+    pub region: Region,
+    /// `ebobo_console::Console::save_state` bytes every peer loads before the first frame (the host's
     /// `Resume::state`); `None` = power-on.
     pub state: Option<Vec<u8>>,
     /// What `state` is (kind and age), as the host announced it with the start; `None` with it.
@@ -582,18 +591,10 @@ fn run(cfg: LobbyConfig, shared: Arc<Mutex<LobbyStatus>>, cmds: Receiver<Cmd>, g
     };
     let mut w = Worker::new(shared, game_tx, nickname.clone(), input_delay, rom_lookup, host_rom.is_some());
     if let Some((bytes, name)) = host_rom {
-        match cart::parse(&bytes) {
-            Ok(info) => {
-                w.host_rom = Some(HostRom {
-                    bytes,
-                    name,
-                    crc: info.crc32,
-                    region: info.region,
-                    four_score: info.four_score,
-                })
-            }
-            Err(e) => {
-                w.fail(NetError::BadRom(format!("{e:?}")));
+        match ebobo_console::identify(&bytes) {
+            Some(id) => w.host_rom = Some(HostRom { bytes, name, crc: id.crc32, region: id.region, four_score: id.multitap }),
+            None => {
+                w.fail(NetError::BadRom("not a ROM of a console ebobo knows".into()));
                 w.publish();
                 idle(&cmds);
                 return;
@@ -643,13 +644,6 @@ fn idle(cmds: &Receiver<Cmd>) {
         if matches!(cmd, Cmd::Leave) {
             return;
         }
-    }
-}
-
-fn region_str(r: Region) -> &'static str {
-    match r {
-        Region::Ntsc => "ntsc",
-        Region::Pal => "pal",
     }
 }
 
@@ -835,7 +829,7 @@ impl Worker {
             "core": self.version,
             "name": self.nickname,
             "rom": {"crc32": format!("{:08x}", hr.crc), "size": hr.bytes.len(), "name": hr.name},
-            "region": region_str(hr.region),
+            "region": hr.region.code(),
             "four_score": hr.four_score,
         });
         self.send_ctrl(to, msg);
@@ -1047,15 +1041,15 @@ impl Worker {
         if let Some(name) = v["name"].as_str().filter(|n| !n.is_empty()) {
             self.peers.entry(host).or_insert_with(Peer::new).name = name.to_string();
         }
-        self.game = Some(GameInfo {
-            crc,
-            rom_name: v["rom"]["name"].as_str().unwrap_or("").to_string(),
-            region: if v["region"].as_str() == Some("pal") { Region::Pal } else { Region::Ntsc },
-        });
+        let Some(region) = v["region"].as_u64().and_then(|c| u8::try_from(c).ok()).and_then(Region::from_code) else {
+            self.fail(NetError::BadRom("game message without a known region".into()));
+            return;
+        };
+        self.game = Some(GameInfo { crc, rom_name: v["rom"]["name"].as_str().unwrap_or("").to_string(), region });
         if self.rom.is_some() {
             return;
         }
-        let found = (self.rom_lookup)(crc).filter(|b| cart::parse(b).is_ok_and(|i| i.crc32 == crc));
+        let found = (self.rom_lookup)(crc).filter(|b| ebobo_console::identify(b).is_some_and(|i| i.crc32 == crc));
         let have = found.is_some();
         if let Some(bytes) = found {
             self.rom = Some(bytes);
@@ -1106,7 +1100,7 @@ impl Worker {
             return;
         }
         if rx.left == 0 && !rx.verified {
-            if cart::crc32(&[&rx.buf]) != rx.crc {
+            if ebobo_console::crc32(&[&rx.buf]) != rx.crc {
                 self.refuse_state();
                 return;
             }
@@ -1157,7 +1151,7 @@ impl Worker {
         }
         let bytes = self.rx.take().map(|r| r.buf).unwrap_or_default();
         let crc = self.game.as_ref().map(|g| g.crc);
-        if cart::parse(&bytes).is_ok_and(|i| Some(i.crc32) == crc) {
+        if ebobo_console::identify(&bytes).is_some_and(|i| Some(i.crc32) == crc) {
             self.rom = Some(bytes);
             self.my_rom = RomState::Have;
             let name = self.nickname.clone();
@@ -1348,7 +1342,7 @@ impl Worker {
         self.next_offer = self.next_offer.wrapping_add(1);
         self.offer = Some(Offer {
             id,
-            crc: cart::crc32(&[&resume.state]),
+            crc: ebobo_console::crc32(&[&resume.state]),
             state: resume.state.clone(),
             deadline: Instant::now() + STATE_WAIT,
             tx: self.peers.keys().map(|p| (*p, StateTx::new(chunks))).collect(),
@@ -1359,7 +1353,7 @@ impl Worker {
     /// of a finished transfer); hands over once every guest acked it or `START_ACK_WAIT` passed.
     fn launch(&mut self, state: Option<(u32, u32, Vec<u8>)>) {
         let (Some(me), Some(hr)) = (self.me, self.host_rom.as_ref()) else { return };
-        let frame_ms = if hr.region == Region::Pal { 20.0 } else { 16.64 };
+        let frame_ms = if hr.region.is_pal() { 20.0 } else { 16.64 };
         let header_four = hr.four_score;
         let worst = self.peers.values().filter_map(|p| p.ctrl.delay_rtt()).fold(0.0, f64::max);
         let delay = match self.input_delay {

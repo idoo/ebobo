@@ -46,10 +46,16 @@ fn take_all(lobbies: &mut [&mut Lobby], secs: u64) -> Vec<GameStart> {
 
 fn direct_pair(guest_has_rom: bool) {
     let Some(rom) = nestest() else { return };
+    direct_pair_with(rom, "nestest.nes", guest_has_rom, 20);
+}
+
+/// Host and guest over loopback UDP in direct mode; the guest holds `rom` or receives it within
+/// `secs`, then both start with the same bytes.
+fn direct_pair_with(rom: Vec<u8>, rom_name: &str, guest_has_rom: bool, secs: u64) {
     let port = free_port();
     let mut host = Lobby::start(cfg(
         "Host",
-        LobbyMode::HostDirect { port, rom: rom.clone(), rom_name: "nestest.nes".into() },
+        LobbyMode::HostDirect { port, rom: rom.clone(), rom_name: rom_name.into() },
         Box::new(|_| None),
     ));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -62,7 +68,7 @@ fn direct_pair(guest_has_rom: bool) {
             guest_has_rom.then(|| r2.clone())
         }),
     ));
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(secs);
     let mut seen_receiving = false;
     loop {
         let (h, g) = (host.status(), guest.status());
@@ -95,7 +101,7 @@ fn direct_pair(guest_has_rom: bool) {
         assert!(!g.four_score);
         assert!(g.state.is_none(), "no resume: power-on");
         assert_eq!(g.names, vec!["Host".to_string(), "Guest".to_string()]);
-        assert_eq!(g.rom_name, "nestest.nes");
+        assert_eq!(g.rom_name, rom_name);
     }
     assert_eq!(hg.input_delay, gg.input_delay);
     assert_eq!(host.status().stage, Stage::Starting);
@@ -112,6 +118,50 @@ fn lobby_direct_transfers_rom() {
 #[test]
 fn lobby_direct_guest_has_rom() {
     direct_pair(true);
+}
+
+/// A synthetic iNES image of 4 MB (255 × 16 KB PRG, 16 KB CHR, mapper 0, NTSC) with patterned
+/// bytes: Mega Drive size, without any game in it.
+fn big_rom() -> Vec<u8> {
+    let mut rom = vec![b'N', b'E', b'S', 0x1A, 255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    rom.extend(noise(255 * 16384 + 2 * 8192, 0xB16));
+    rom
+}
+
+/// 4096 ROM chunks (64 windows) reach the guest over a real route, intact and verified.
+#[test]
+fn lobby_direct_transfers_four_megabyte_rom() {
+    let rom = big_rom();
+    assert_eq!(rom.len(), 4 * 1024 * 1024 + 16);
+    let id = ebobo_console::identify(&rom).expect("a ROM");
+    assert_eq!(id.region, Region::Ntsc);
+    let started = Instant::now();
+    direct_pair_with(rom, "big.nes", false, 60);
+    println!("4 MB ROM handed over in {:?}", started.elapsed());
+}
+
+/// The `game` message carries the region as its one-byte code; a code no console has is a
+/// malformed message: the guest fails, holds no game info and asks for no ROM.
+#[test]
+fn game_message_with_unknown_region_is_refused() {
+    let msg = |region: Value| {
+        json!({"t": "game", "proto": PROTOCOL_VERSION, "core": local_version("T"), "name": "H",
+            "rom": {"crc32": "1a2b3c4d", "size": 16, "name": "t.nes"}, "region": region, "four_score": false})
+    };
+    for (code, region) in [(0, Region::Ntsc), (1, Region::Pal), (2, Region::Japan)] {
+        assert_eq!(Region::from_code(region.code()), Some(region));
+        let mut w = bare_worker(false, 1);
+        w.on_game(&msg(json!(code)));
+        assert_eq!(w.game.as_ref().map(|g| g.region), Some(region));
+        assert_ne!(w.stage, Stage::Failed);
+    }
+    for bad in [json!(3), json!(255), json!(256), json!("ntsc"), Value::Null] {
+        let mut w = bare_worker(false, 1);
+        w.on_game(&msg(bad.clone()));
+        assert_eq!(w.stage, Stage::Failed, "region {bad}");
+        assert!(w.game.is_none());
+        assert_eq!(w.my_rom, RomState::Unknown);
+    }
 }
 
 /// Three players through the real server, optionally all relayed, optionally from a saved game:
@@ -341,7 +391,7 @@ fn state_packets_round_trip_and_fit() {
 fn state_transfer_survives_loss_duplicates_and_reordering() {
     for (n, &len) in [1usize, STATE_CHUNK_DATA, STATE_CHUNK_DATA + 1, 60_000, MAX_STATE].iter().enumerate() {
         let state = noise(len, 0xABCD + n as u64);
-        let crc = cart::crc32(&[&state]);
+        let crc = ebobo_console::crc32(&[&state]);
         let mut rng = 0x1234_5678_9ABC_DEF0u64 + n as u64;
         let mut roll = move |m: u64| {
             rng ^= rng << 13;
@@ -412,7 +462,7 @@ fn state_transfer_clean_link_sends_each_chunk_once() {
 #[test]
 fn state_damaged_or_truncated_is_refused() {
     let state = noise(5000, 11);
-    let crc = cart::crc32(&[&state]);
+    let crc = ebobo_console::crc32(&[&state]);
     let chunks = state_chunks(state.len());
 
     let mut damaged = state.clone();

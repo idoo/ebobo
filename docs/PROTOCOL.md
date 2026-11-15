@@ -1,6 +1,6 @@
-# ebobo network protocol (v3)
+# ebobo network protocol (v4)
 
-Up to 4 players. Peer 0 is the host (NES controller 1 by default), guests get ids 1..3.
+Up to 4 players. Peer 0 is the host (controller 1 by default), guests get ids 1..3.
 GGRS runs as a full mesh: every peer exchanges inputs with every other peer, each pair over
 its own route (direct UDP when hole punching works, otherwise relayed through the signaling
 server's WebSocket).
@@ -214,9 +214,12 @@ counter starting at 1), after RTO = clamp(SRTT + 4·RTTVAR, 200 ms, 1 s); the re
 copy and processes each seq once. RTT samples come only from acks of first transmissions (Karn's
 rule) and feed an RFC 6298 estimator per peer (alpha 1/8, beta 1/4).
 
-ROM transfer: sender keeps up to 32 chunks in flight from `next`, retransmits from the last
-acked `next` after 300 ms without progress; receiver acks the highest contiguous byte count on
-every chunk.
+ROM transfer: sender keeps up to 64 chunks (64 KB) in flight from `next`, retransmits from the
+last acked `next` after 300 ms without progress; receiver acks the highest contiguous byte count
+on every chunk. A ROM is at most 8 MiB. Both sides work the link every 4 ms, so a round is the
+round trip plus up to 8 ms: a 4 MiB ROM (64 rounds) takes about 3 s at 40 ms round trip and
+10 s at 150 ms (with 32 chunks it took 5.6 and 19.7 s). A transfer has no deadline; it runs
+while the route lives.
 
 State transfer (a game started from a save, section 4): the state is cut into 1024-byte chunks;
 chunk `index` starts at byte `index * 1024` and only the last one is shorter. Every chunk
@@ -231,14 +234,19 @@ a chunk that stays unacked for that peer's CTRL RTO. A state is at most 1 MiB.
 Host → each guest, as soon as the route is up:
 
 ```json
-{"t":"game","proto":3,"core":"0.1.0","name":"Ivan","rom":{"crc32":"1a2b3c4d","size":131088,"name":"Test Game (USA).nes"},"region":"ntsc","four_score":false}
+{"t":"game","proto":4,"core":"0.1.0","name":"Ivan","rom":{"crc32":"1a2b3c4d","size":131088,"name":"Test Game (USA).nes"},"region":0,"four_score":false}
 ```
 
-Guest → host: `{"t":"rom","have":true,"name":"Sasha","proto":3,"ver":"0.1.0"}` (the guest
+`region` is the console region as one byte: 0 NTSC, 1 PAL, 2 Japan (a NES plays Japan as
+NTSC). A `game` without a known region code is malformed: the guest fails as for a missing
+`crc32`. The ROM's CRC-32 (`ebobo_console::identify`) names both the game and its system (NES
+or Mega Drive); there is no separate system field.
+
+Guest → host: `{"t":"rom","have":true,"name":"Sasha","proto":4,"ver":"0.1.0"}` (the guest
 looked the CRC up in its library; `name` is the guest's nickname, needed in direct-IP mode where
 no server announces it; `ver` is the guest's ebobo version). If `have` is false the host streams
-the raw ROM file (header included) with ROM_CHUNK; the guest verifies the PRG+CHR CRC-32 and
-answers the same `rom` message with `have: true`, or `{"t":"error","msg":"rom_crc"}`.
+the raw ROM file (header included) with ROM_CHUNK; the guest identifies the file, checks its
+CRC-32 and answers the same `rom` message with `have: true`, or `{"t":"error","msg":"rom_crc"}`.
 
 Versions: peers play together only with the same `proto` **and** the same ebobo version
 (`core` in `game`, `ver` in `rom`), so e.g. a Mac and a Steam Deck build of different releases
@@ -272,7 +280,7 @@ present peers. Host sends `{"t":"lock"}` to the server, then to every guest:
 {"t":"start","slots":[0,1,2],"delay":2,"auto":true,"four_score":true}
 ```
 
-`slots[i]` = peer id playing NES controller i+1. `delay` = GGRS input delay every peer starts
+`slots[i]` = peer id playing controller i+1. `delay` = GGRS input delay every peer starts
 with, chosen by the host: its setting (1-6), or auto. Auto: L = ceil(R / 2 / frame_ms) is the
 one-way latency in frames; delay = clamp(min(L, 3) + max(L - 9, 0), 1, 6). The first 3 frames of
 latency are hidden by delay (no rollbacks), the next 6 are left to rollback, the rest is delay
@@ -285,7 +293,7 @@ the same rule. `four_score` = true when more than 2 slots are used or the ROM he
 Each peer starts GGRS when it receives (guests) or sends (host) `start`.
 
 Start from a saved game: when the host's `resume` is set, pressing start first sends the state
-(an `ebobo_core::Nes::save_state` blob) to every guest with STATE_CHUNK (section 3). Until every
+(an `ebobo_console::Console::save_state` blob) to every guest with STATE_CHUNK (section 3). Until every
 present guest holds all of it nothing else changes: the room stays unlocked, and a guest that
 leaves is dropped from the transfer. Then the host locks the room and sends `start` with one
 more field, `"state":{"id":7,"size":61234,"crc32":"1a2b3c4d","kind":"last","saved_at":1794690000}`
@@ -310,21 +318,23 @@ of them holds of its input, and upstream had by then discarded inputs that frame
 (a crash). For that, a peer whose connection status changed while it sends no input (it waits
 at the prediction window) sends the status alone, as a GGRS input message without input bytes,
 at most every 24 ms, and repeats it every 64 ms.
-`ggrs::Config`: `Input = u16`, `State =
-ebobo_core::Snapshot`, `Address = PeerId(u8)`. Players = `slots.len()`, local handle = own slot
-index, every other slot is `PlayerType::Remote(PeerId)`. FPS = 60 (NTSC) / 50 (PAL). The
+`ggrs::Config`: `Input = u32`, `State =
+ebobo_console::Snapshot`, `Address = PeerId(u8)`. Players = `slots.len()`, local handle = own slot
+index, every other slot is `PlayerType::Remote(PeerId)`. FPS = 60 (NTSC, Japan) / 50 (PAL). The
 session takes the `Link` from `GameStart.link` (the lobby's live mesh, section 2), or
 `Link::udp(socket, me, peers)` for fixed UDP routes without a server; every GGRS poll also
 drives its signaling, route health, punching, relay mirroring and roaming. A BYE from a peer
 disconnects its player.
 Max prediction 10 with two players and 16 with more (the confirmed frame then lags one more
-network hop), desync detection every 60 frames (checksum = `Nes::state_hash` truncated to
+network hop), desync detection every 60 frames (checksum = `Console::state_hash` truncated to
 u128), disconnect timeout 20 s, notify after 1.5 s. A frame whose combined input has any reset
-bit runs `Nes::reset()` before `run_frame`.
+bit runs `Console::reset()` before `run_frame`.
 
-Input word: bits 0-7 = NES pad held, bit 8 = reset request (one frame), bit 9 = turbo A held,
-bit 10 = turbo B held, bit 11 = save for everyone (one frame), bit 12 = load for everyone (one
-frame). Turbo travels as a held bit; every peer expands it from the GGRS frame number f being
+Input word (32 bits): bits 0-15 (`INPUT_PAD = 0xFFFF`) = pad held, in the system's own layout
+(`ebobo_core::pad` for the NES, which uses bits 0-7; `ebobo_md::pad` for the Mega Drive), bit 16
+= reset request (one frame), bit 17 = turbo A held, bit 18 = turbo B held, bit 19 = save for
+everyone (one frame), bit 20 = load for everyone (one frame); bits 21-31 are 0. Turbo travels as
+a held bit; every peer expands it from the GGRS frame number f being
 simulated: the turbo phase is on when `(f / 2) % 2 == 0` (2 frames on, 2 off). A pad button is
 pressed when its bit is held, or when its turbo bit is set and the phase is on. Disconnected
 players read as all released.
