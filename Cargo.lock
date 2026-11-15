@@ -278,7 +278,7 @@ name = "ebobo-net"
 version = "0.3.6"
 dependencies = [
  "bincode",
- "ebobo-core",
+ "ebobo-console",
  "getrandom 0.3.4",
  "ggrs",
  "rustls",
