@@ -5,10 +5,6 @@
 //! mask multiplied → copied or warped onto the screen with vignette vertex colours. Masks
 //! and meshes are rebuilt only when the destination size changes.
 
-/// Source picture rows/columns the scanlines and mask cells align to.
-const SRC_W: f32 = 256.0;
-const SRC_H: f32 = 240.0;
-
 /// Switchable picture effect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -89,25 +85,26 @@ pub struct Mask {
     pub glow: f32,
 }
 
-/// Source-row phase (0..1 within a source row) of destination row `y` out of `dh`.
-fn row_phase(y: u32, dh: u32) -> f32 {
-    let f = (y as f32 + 0.5) * SRC_H / dh as f32;
+/// Source-row phase (0..1 within a source row) of destination row `y` out of `dh`, for a
+/// source of `sh` rows.
+fn row_phase(y: u32, dh: u32, sh: u32) -> f32 {
+    let f = (y as f32 + 0.5) * sh as f32 / dh as f32;
     f - f.floor()
 }
 
-fn col_phase(x: u32, dw: u32) -> f32 {
-    let f = (x as f32 + 0.5) * SRC_W / dw as f32;
+fn col_phase(x: u32, dw: u32, sw: u32) -> f32 {
+    let f = (x as f32 + 0.5) * sw as f32 / dw as f32;
     f - f.floor()
 }
 
 /// Scanline multiplier for one destination row (same for every column).
-fn scanline(effect: Effect, y: u32, dh: u32) -> f32 {
+fn scanline(effect: Effect, y: u32, dh: u32, sh: u32) -> f32 {
     // Less than 2 destination rows per source row: scanlines would alias into bands.
-    let rows = dh as f32 / SRC_H;
+    let rows = dh as f32 / sh as f32;
     if rows < 2.0 {
         return 1.0;
     }
-    let d = row_phase(y, dh) - 0.5; // -0.5..0.5 from the beam centre
+    let d = row_phase(y, dh, sh) - 0.5; // -0.5..0.5 from the beam centre
     match effect {
         // Soft Gaussian beam; the gap between rows keeps ~half the light.
         Effect::CrtTv => 0.5 + 0.5 * (-(d / 0.3).powi(2)).exp(),
@@ -119,15 +116,15 @@ fn scanline(effect: Effect, y: u32, dh: u32) -> f32 {
         Effect::Lcd => {
             // Thin dark line at the bottom of each source row (about one destination pixel).
             let line = (1.0 / rows).min(0.2);
-            if row_phase(y, dh) > 1.0 - line { 0.72 } else { 1.0 }
+            if row_phase(y, dh, sh) > 1.0 - line { 0.72 } else { 1.0 }
         }
         Effect::Off => 1.0,
     }
 }
 
 /// Per-channel mask for one destination column (and row, for the slot mask stagger).
-fn phosphor(effect: Effect, x: u32, y: u32, dw: u32) -> [f32; 3] {
-    let cols = dw as f32 / SRC_W;
+fn phosphor(effect: Effect, x: u32, y: u32, dw: u32, sw: u32) -> [f32; 3] {
+    let cols = dw as f32 / sw as f32;
     match effect {
         // 3-pixel triads need ≥ 2 px per source column to not swamp the picture.
         Effect::CrtTv if cols >= 2.0 => {
@@ -150,24 +147,26 @@ fn phosphor(effect: Effect, x: u32, y: u32, dw: u32) -> [f32; 3] {
         }
         Effect::Lcd => {
             let line = (1.0 / cols).min(0.2);
-            if cols >= 2.0 && col_phase(x, dw) > 1.0 - line { [0.72; 3] } else { [1.0; 3] }
+            if cols >= 2.0 && col_phase(x, dw, sw) > 1.0 - line { [0.72; 3] } else { [1.0; 3] }
         }
         _ => [1.0; 3],
     }
 }
 
-/// Builds the mask for `effect` at `dw`×`dh` (empty for `Off`).
-pub fn mask(effect: Effect, dw: u32, dh: u32) -> Mask {
-    if effect == Effect::Off || dw == 0 || dh == 0 {
+/// Builds the mask for `effect` at `dw`×`dh` over a source picture of `sw`×`sh` pixels
+/// (the game's size; 256x240 in the menus): scanlines follow its rows, cells its columns.
+/// Empty for `Off`.
+pub fn mask(effect: Effect, dw: u32, dh: u32, sw: u32, sh: u32) -> Mask {
+    if effect == Effect::Off || dw == 0 || dh == 0 || sw == 0 || sh == 0 {
         return Mask { rgba: Vec::new(), glow: 0.0 };
     }
     let mut rgba = vec![0u8; (dw * dh * 4) as usize];
     let mut sum = 0.0f64;
     for y in 0..dh {
-        let s = scanline(effect, y, dh);
+        let s = scanline(effect, y, dh, sh);
         let row = &mut rgba[(y * dw * 4) as usize..((y + 1) * dw * 4) as usize];
         for x in 0..dw {
-            let p = phosphor(effect, x, y, dw);
+            let p = phosphor(effect, x, y, dw, sw);
             let px = &mut row[(x * 4) as usize..(x * 4 + 4) as usize];
             for c in 0..3 {
                 let v = (s * p[c]).clamp(0.0, 1.0);
@@ -332,7 +331,7 @@ mod tests {
             assert_eq!(warp(x, y, p.curve), (x, y));
             assert_eq!(unwarp(x, y, p.curve), (x, y));
         }
-        assert!(mask(Effect::Off, 1280, 800).rgba.is_empty());
+        assert!(mask(Effect::Off, 1280, 800, 256, 240).rgba.is_empty());
         for e in [Effect::Pvm, Effect::Lcd] {
             assert_eq!(e.params().curve, 0.0, "{e:?} is flat");
         }
@@ -347,7 +346,7 @@ mod tests {
                 let (u, v) = warp(x, y, k);
                 let (bx, by) = unwarp(u, v, k);
                 // Within 1 canvas pixel (and far better).
-                assert!(((bx - x) * SRC_W).abs() < 1.0 && ((by - y) * SRC_H).abs() < 1.0, "{x},{y}");
+                assert!(((bx - x) * 256.0).abs() < 1.0 && ((by - y) * 240.0).abs() < 1.0, "{x},{y}");
                 assert!((bx - x).abs() < 1e-3 && (by - y).abs() < 1e-3);
             }
         }
@@ -364,14 +363,14 @@ mod tests {
     fn scanlines_follow_source_rows() {
         for dh in [800u32, 720] {
             for effect in [Effect::CrtTv, Effect::Pvm, Effect::Lcd] {
-                let m = mask(effect, 1024, dh);
+                let m = mask(effect, 1024, dh, 256, 240);
                 let at = |y: u32| m.rgba[(y * 1024 * 4) as usize + 4 * 7]; // any column
                 // The brightest row of every source row is near its centre, the darkest at
                 // its edges, whatever the fractional scale.
                 for src in 0..240u32 {
                     let rows: Vec<u32> = (0..dh).filter(|&y| ((y as f32 + 0.5) * 240.0 / dh as f32) as u32 == src).collect();
                     let best = *rows.iter().max_by_key(|&&y| (at(y), u32::MAX - y)).unwrap();
-                    let phase = row_phase(best, dh);
+                    let phase = row_phase(best, dh, 240);
                     if effect == Effect::Lcd {
                         assert!(phase < 0.8, "{effect:?} dh {dh} src {src}: line not at row end");
                     } else {
@@ -409,8 +408,22 @@ mod tests {
     fn brightness_stays_close_to_off() {
         for (dw, dh) in [(1280u32, 800u32), (853, 800), (768, 720), (256, 240)] {
             for effect in [Effect::CrtTv, Effect::Pvm, Effect::Lcd] {
-                let gain = mid_grey_gain(&mask(effect, dw, dh));
+                let gain = mid_grey_gain(&mask(effect, dw, dh, 256, 240));
                 assert!((gain - 1.0).abs() < 0.1, "{effect:?} {dw}x{dh}: {gain}");
+            }
+        }
+    }
+
+    #[test]
+    fn scanlines_count_the_game_lines() {
+        // A column too narrow for phosphor cells: only the scanlines shape it.
+        for sh in [224u32, 240] {
+            for effect in [Effect::CrtTv, Effect::Pvm] {
+                let m = mask(effect, 64, 1920, 256, sh);
+                let at = |y: u32| m.rgba[(y * 64 * 4) as usize];
+                // One bright beam per source line.
+                let beams = (0..1920).filter(|&y| at(y) >= 200 && (y == 0 || at(y - 1) < 200)).count();
+                assert_eq!(beams, sh as usize, "{effect:?} {sh}");
             }
         }
     }

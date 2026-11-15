@@ -1,33 +1,127 @@
 //! Window and frame presentation. Owner: platform slice.
+//!
+//! A frame is three layers, bottom to top: the game at its own size, the pictures the
+//! interface placed (box art), the 256x240 interface canvas with alpha. They are composed
+//! into one source picture the size of the destination rectangle; the picture effect, if
+//! any, then runs on that.
 
 use std::time::Instant;
 
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::{FPoint, Rect};
-use sdl2::render::{BlendMode, Canvas, Texture, TextureCreator, Vertex, VertexIndices};
-use sdl2::video::{FullscreenType, Window, WindowContext};
+use sdl2::render::{BlendMode, Texture, TextureCreator, Vertex, VertexIndices, WindowCanvas};
+use sdl2::video::{FullscreenType, WindowContext};
 
+use crate::canvas::{Canvas, Placed};
 use crate::config::ScreenMode;
 use crate::crt::{self, Effect};
 use crate::input::WindowPos;
 
+/// The interface canvas.
 const W: u32 = 256;
 const H: u32 = 240;
 /// Largest integer prescale for non-integer modes (8x = 2048x1920, enough for 4K).
 const MAX_PRESCALE: u32 = 8;
+/// Picture textures kept; the least recently drawn goes first.
+const MAX_PICTURES: usize = 64;
+/// Largest side of a game frame or a picture, pixels.
+const MAX_SIDE: u32 = 4096;
 
-/// SDL window + renderer + streaming 256x240 texture.
+/// One frame to show: the layers, bottom to top.
+pub struct Frame<'a> {
+    /// The console's picture; `None` in the menus.
+    pub game: Option<GameFrame<'a>>,
+    /// The interface: 256x240, straight alpha, with the pictures it placed.
+    pub ui: &'a Canvas,
+    /// Where the placed pictures' pixels come from.
+    pub pictures: &'a dyn Pictures,
+}
+
+/// The console's frame at its own size: `w * h * 4` RGBA bytes.
+pub struct GameFrame<'a> {
+    pub rgba: &'a [u8],
+    pub w: u32,
+    pub h: u32,
+}
+
+/// A picture's pixels (`w * h * 4` RGBA bytes); `stamp` changes when the pixels do.
+pub struct PictureRef<'a> {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: &'a [u8],
+    pub stamp: u32,
+}
+
+/// The pictures the interface can place, by `Placed::id`.
+pub trait Pictures {
+    /// The picture, or `None` while it is not there (then only the box's back is drawn).
+    fn picture(&self, id: u64) -> Option<PictureRef<'_>>;
+}
+
+/// A frame's layers as `compose` takes them.
+struct Layers<'a> {
+    game: Option<&'a GameFrame<'a>>,
+    ui: &'a [u8],
+    placed: &'a [Placed],
+    pictures: &'a dyn Pictures,
+}
+
+impl<'a> Layers<'a> {
+    fn of(frame: &'a Frame<'a>) -> Layers<'a> {
+        Layers { game: frame.game.as_ref(), ui: &frame.ui.px, placed: &frame.ui.placed, pictures: frame.pictures }
+    }
+
+    /// Size of the source picture: the game's, else the interface's.
+    fn size(&self) -> (u32, u32) {
+        self.game.map_or((W, H), |g| (g.w, g.h))
+    }
+}
+
+/// No pictures: the old byte entry points.
+struct NoPictures;
+
+impl Pictures for NoPictures {
+    fn picture(&self, _id: u64) -> Option<PictureRef<'_>> {
+        None
+    }
+}
+
+/// A cached picture texture.
+struct Pic {
+    id: u64,
+    stamp: u32,
+    w: u32,
+    h: u32,
+    tex: Texture,
+    /// `Video::tick` of the last frame it was available for; drawn only in that frame.
+    used: u64,
+}
+
+/// SDL window + renderer + the layer textures.
 pub struct Video {
     // `unsafe_textures`: the textures are freed with the renderer; keep the creator alive.
-    texture: Texture,
-    /// Integer prescale target for non-integer modes: the picture is drawn into it with
-    /// nearest-neighbour, then scaled to the screen with linear filtering (sharp, no
-    /// shimmering). `None` until needed, or when render targets fail.
-    prescaled: Option<(Texture, u32)>,
-    /// Render targets work on this renderer (else plain nearest scaling).
+    /// The interface: streaming 256x240, alpha blended.
+    ui: Texture,
+    /// The game: streaming, recreated when its size (w, h) changes.
+    game: Option<(Texture, u32, u32)>,
+    /// Integer prescale targets for non-integer scales, keyed by (w, h, factor): the layer is
+    /// drawn into it with nearest-neighbour, then scaled to the picture with linear filtering
+    /// (sharp, no shimmering). `None` until needed.
+    ui_pre: Option<(Texture, (u32, u32, u32))>,
+    game_pre: Option<(Texture, (u32, u32, u32))>,
+    /// The composed source picture (w, h = the destination rectangle's size).
+    source: Option<(Texture, u32, u32)>,
+    /// Picture textures by id, at most `MAX_PICTURES`.
+    pics: Vec<Pic>,
+    /// Frames composed.
+    tick: u64,
+    /// Source size of the last presented frame (`to_canvas` maps through its rectangle).
+    shown: (u32, u32),
+    /// Render targets work on this renderer (else the layers go straight to the output
+    /// with nearest scaling).
     targets: bool,
     _creator: TextureCreator<WindowContext>,
-    canvas: Canvas<Window>,
+    canvas: WindowCanvas,
     mouse: sdl2::mouse::MouseUtil,
     /// Mouse cursor currently shown.
     cursor: bool,
@@ -35,15 +129,15 @@ pub struct Video {
     screen: ScreenMode,
     /// Picture effect; `Off` draws exactly the plain path.
     effect: Effect,
-    /// Effect textures for the current effect and destination rect.
+    /// Effect textures for the current effect, destination rect and source size.
     fx: Option<Fx>,
     /// Power-on animation start (tube effects only).
     power: Option<Instant>,
 }
 
-/// GPU resources of one effect at one destination rect; rebuilt when either changes.
+/// GPU resources of one effect at one destination rect and source size; rebuilt when any changes.
 struct Fx {
-    key: (Effect, Rect),
+    key: (Effect, Rect, (u32, u32)),
     params: crt::Params,
     /// Destination-sized target the picture, bleed, mask and glow are composed in.
     scene: Texture,
@@ -51,10 +145,12 @@ struct Fx {
     mask: Texture,
     /// Additive glow weight compensating the mask's darkening.
     glow: f32,
-    /// Two-step linear downscale of the picture: the blurred glow copy.
+    /// The blurred glow copy: the source picture back at the source's resolution, then two
+    /// linear downscales.
+    base: Texture,
     mid: Texture,
     small: Texture,
-    /// Previous frames blended in (LCD ghosting).
+    /// Previous frames blended in (LCD ghosting), destination-sized.
     ghost: Texture,
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
@@ -66,6 +162,7 @@ impl Fx {
         unsafe {
             self.scene.destroy();
             self.mask.destroy();
+            self.base.destroy();
             self.mid.destroy();
             self.small.destroy();
             self.ghost.destroy();
@@ -80,7 +177,7 @@ impl Video {
         let video = sdl.video()?;
         sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
         let scale = scale.clamp(1, 6);
-        let make = |accelerated: bool| -> Result<Canvas<Window>, String> {
+        let make = |accelerated: bool| -> Result<WindowCanvas, String> {
             let mut builder = video.window("ebobo", W * scale, H * scale);
             builder.position_centered().resizable().allow_highdpi();
             if fullscreen {
@@ -91,7 +188,7 @@ impl Video {
             canvas.build().map_err(|e| e.to_string())
         };
         // Broken or missing GPU drivers (VMs, odd desktop sessions) must not stop the game:
-        // a 256x240 picture is cheap to scale on the CPU.
+        // a small picture is cheap to scale on the CPU.
         let mut canvas = match make(true) {
             Ok(canvas) => canvas,
             Err(e) => {
@@ -104,15 +201,21 @@ impl Video {
         canvas.present();
         let targets = canvas.render_target_supported();
         let creator = canvas.texture_creator();
-        let texture = creator
+        let ui = creator
             .create_texture_streaming(PixelFormatEnum::ABGR8888, W, H)
             .map_err(|e| e.to_string())?;
         let mouse = sdl.mouse();
         // Hidden until the mouse moves (`set_cursor_visible`).
         mouse.show_cursor(false);
         Ok(Video {
-            texture,
-            prescaled: None,
+            ui,
+            game: None,
+            ui_pre: None,
+            game_pre: None,
+            source: None,
+            pics: Vec::with_capacity(MAX_PICTURES),
+            tick: 0,
+            shown: (W, H),
             targets,
             _creator: creator,
             canvas,
@@ -142,18 +245,40 @@ impl Video {
         }
     }
 
-    /// Shows one 256x240 RGBA8888 picture (game plus UI overlay already composited).
+    /// Shows one frame: the game (if any), the placed pictures and the interface, composed
+    /// in the picture rectangle of the game's size (256x240 without a game).
+    #[allow(dead_code)] // Until the app is switched over from `present`.
+    pub fn present_frame(&mut self, frame: &Frame) -> Result<(), String> {
+        self.show(&Layers::of(frame))
+    }
+
+    /// The frame as the screen shows it (effects included) composed at `size` (default: the
+    /// drawable size): (width, height, RGBA bytes). Screenshots; needs render targets.
+    #[allow(dead_code)] // Until the app is switched over from `capture`.
+    pub fn capture_frame(&mut self, frame: &Frame, size: Option<(u32, u32)>) -> Result<(u32, u32, Vec<u8>), String> {
+        self.shoot(&Layers::of(frame), size)
+    }
+
+    // Old entry point (interface bytes only, no game); the lead deletes it once the app calls `present_frame`.
     pub fn present(&mut self, rgba: &[u8]) -> Result<(), String> {
+        self.show(&Layers { game: None, ui: rgba, placed: &[], pictures: &NoPictures })
+    }
+
+    // Old entry point (interface bytes only, no game); the lead deletes it once the app calls `capture_frame`.
+    pub fn capture(&mut self, rgba: &[u8], size: Option<(u32, u32)>) -> Result<(u32, u32, Vec<u8>), String> {
+        self.shoot(&Layers { game: None, ui: rgba, placed: &[], pictures: &NoPictures }, size)
+    }
+
+    fn show(&mut self, layers: &Layers) -> Result<(), String> {
         // Computed every frame from the drawable size, so resizes and fullscreen toggles apply.
         let out = self.canvas.output_size()?;
-        self.compose(rgba, out, None)?;
+        self.compose(layers, out, None)?;
+        self.shown = layers.size();
         self.canvas.present();
         Ok(())
     }
 
-    /// The picture as the screen shows it (effects included) composed at `size` (default:
-    /// the drawable size): (width, height, RGBA bytes). Screenshots; needs render targets.
-    pub fn capture(&mut self, rgba: &[u8], size: Option<(u32, u32)>) -> Result<(u32, u32, Vec<u8>), String> {
+    fn shoot(&mut self, layers: &Layers, size: Option<(u32, u32)>) -> Result<(u32, u32, Vec<u8>), String> {
         let (w, h) = match size {
             Some(size) => size,
             None => self.canvas.output_size()?,
@@ -162,42 +287,59 @@ impl Video {
             ._creator
             .create_texture_target(PixelFormatEnum::ABGR8888, w, h)
             .map_err(|e| e.to_string())?;
-        let px = self.compose(rgba, (w, h), Some(&mut shot));
+        let px = self.compose(layers, (w, h), Some(&mut shot));
         // SAFETY: not used again; the renderer is alive.
         unsafe { shot.destroy() };
         Ok((w, h, px?.ok_or_else(|| "no pixels".to_string())?))
     }
 
-    /// Draws `rgba` into an `out`-sized output: the window, or `shot` (then read back).
-    fn compose(&mut self, rgba: &[u8], out: (u32, u32), shot: Option<&mut Texture>) -> Result<Option<Vec<u8>>, String> {
-        if rgba.len() < (W * H * 4) as usize {
-            return Err(format!("frame too small: {} bytes", rgba.len()));
+    /// Draws the layers into an `out`-sized output: the window, or `shot` (then read back).
+    fn compose(&mut self, layers: &Layers, out: (u32, u32), shot: Option<&mut Texture>) -> Result<Option<Vec<u8>>, String> {
+        if layers.ui.len() < (W * H * 4) as usize {
+            return Err(format!("frame too small: {} bytes", layers.ui.len()));
         }
-        let dest = dest_rect(self.screen, out.0, out.1);
-        self.texture
-            .update(None, &rgba[..(W * H * 4) as usize], (W * 4) as usize)
+        if let Some(g) = layers.game {
+            if g.w == 0 || g.h == 0 || g.w > MAX_SIDE || g.h > MAX_SIDE {
+                return Err(format!("game frame {}x{}", g.w, g.h));
+            }
+            if g.rgba.len() < (g.w * g.h * 4) as usize {
+                return Err(format!("game frame too small: {} bytes for {}x{}", g.rgba.len(), g.w, g.h));
+            }
+        }
+        let size = layers.size();
+        let dest = dest_rect(self.screen, out.0, out.1, size.0, size.1);
+        self.ui
+            .update(None, &layers.ui[..(W * H * 4) as usize], (W * 4) as usize)
             .map_err(|e| e.to_string())?;
-        let k = prescale(dest.width(), dest.height());
-        let pre = k > 1 && self.draw_prescaled(k);
-        let fx = self.effect != Effect::Off && self.draw_fx(dest, pre);
+        if let Some(g) = layers.game {
+            self.upload_game(g)?;
+        }
+        self.tick += 1;
+        self.sync_pictures(layers.placed, layers.pictures);
+        let composed = self.targets && self.draw_source(dest, layers.game.is_some(), size, layers.placed);
+        let fx = composed && self.effect != Effect::Off && self.draw_fx(dest, size);
         let power = self.power.and_then(|t| crt::power_on(t.elapsed().as_secs_f32() * 1000.0));
         if power.is_none() {
             self.power = None;
         }
-        let src = match &self.prescaled {
-            Some((target, _)) if pre => target,
-            _ => &self.texture,
-        };
-        let fx = if fx { self.fx.as_ref() } else { None };
-        let draw = |c: &mut Canvas<Window>| -> Result<(), String> {
+        let Video { canvas, ui, game, source, pics, fx: effect, tick, .. } = self;
+        let fx = if fx { effect.as_ref() } else { None };
+        let mut source = if composed { source.as_mut().map(|(t, ..)| t) } else { None };
+        let mut game = if layers.game.is_some() { game.as_mut().map(|(t, ..)| t) } else { None };
+        let mut draw = |c: &mut WindowCanvas| -> Result<(), String> {
             c.set_draw_color(Color::RGB(0, 0, 0));
             c.clear();
-            match fx {
-                Some(fx) if fx.params.curve > 0.0 || fx.params.vignette > 0.0 => {
+            match (fx, source.as_deref_mut()) {
+                (Some(fx), _) if fx.params.curve > 0.0 || fx.params.vignette > 0.0 => {
                     c.render_geometry(&fx.vertices, Some(&fx.scene), VertexIndices::U32(&fx.indices))?
                 }
-                Some(fx) => c.copy(&fx.scene, None, dest)?,
-                None => c.copy(src, None, dest)?,
+                (Some(fx), _) => c.copy(&fx.scene, None, dest)?,
+                (None, Some(source)) => {
+                    source.set_blend_mode(BlendMode::None);
+                    c.copy(source, None, dest)?
+                }
+                // No render targets: the layers straight to the output, nearest.
+                (None, None) => draw_layers(c, dest, game.as_deref_mut(), ui, layers.placed, pics, *tick)?,
             }
             if let Some((open, flash)) = power {
                 draw_power(c, dest, open, flash)?;
@@ -205,10 +347,10 @@ impl Video {
             Ok(())
         };
         match shot {
-            None => draw(&mut self.canvas).map(|_| None),
+            None => draw(canvas).map(|_| None),
             Some(target) => {
                 let mut px = Ok(None);
-                self.canvas
+                canvas
                     .with_texture_canvas(target, |c| {
                         px = draw(c).and_then(|_| c.read_pixels(None, PixelFormatEnum::ABGR8888).map(Some));
                     })
@@ -218,13 +360,116 @@ impl Video {
         }
     }
 
-    /// Composes the effect scene for `dest` (picture, bleed, mask, glow); false when render
-    /// targets fail (then the plain picture is drawn).
-    fn draw_fx(&mut self, dest: Rect, pre: bool) -> bool {
+    /// Uploads the game's pixels, recreating its texture when the size changed.
+    fn upload_game(&mut self, g: &GameFrame) -> Result<(), String> {
+        if self.game.as_ref().map(|(_, w, h)| (*w, *h)) != Some((g.w, g.h)) {
+            let made = self
+                ._creator
+                .create_texture_streaming(PixelFormatEnum::ABGR8888, g.w, g.h)
+                .map_err(|e| e.to_string())?;
+            if let Some((old, ..)) = self.game.replace((made, g.w, g.h)) {
+                // SAFETY: the old texture is not used again; the renderer is alive.
+                unsafe { old.destroy() };
+            }
+        }
+        let (texture, ..) = self.game.as_mut().expect("created above");
+        texture
+            .update(None, &g.rgba[..(g.w * g.h * 4) as usize], (g.w * 4) as usize)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Brings the textures of the placed pictures up to date: uploads a missing one or one
+    /// whose stamp changed, and marks every available one as drawn this frame. A full cache
+    /// drops its least recently drawn picture; a picture that is not available is left alone.
+    fn sync_pictures(&mut self, placed: &[Placed], pictures: &dyn Pictures) {
+        for p in placed {
+            let Some(r) = pictures.picture(p.id) else { continue };
+            if r.w == 0 || r.h == 0 || r.w > MAX_SIDE || r.h > MAX_SIDE || r.rgba.len() < (r.w * r.h * 4) as usize {
+                continue;
+            }
+            let pixels = &r.rgba[..(r.w * r.h * 4) as usize];
+            if let Some(i) = self.pics.iter().position(|pic| pic.id == p.id) {
+                let pic = &mut self.pics[i];
+                if (pic.w, pic.h) == (r.w, r.h) {
+                    if pic.stamp == r.stamp || pic.tex.update(None, pixels, (r.w * 4) as usize).is_ok() {
+                        pic.stamp = r.stamp;
+                        pic.used = self.tick;
+                    }
+                    continue;
+                }
+                // SAFETY: removed from the cache, not used again; the renderer is alive.
+                unsafe { self.pics.swap_remove(i).tex.destroy() };
+            } else if self.pics.len() >= MAX_PICTURES {
+                let Some(oldest) = oldest(self.pics.iter().map(|pic| pic.used), self.tick) else { continue };
+                // SAFETY: removed from the cache, not used again; the renderer is alive.
+                unsafe { self.pics.swap_remove(oldest).tex.destroy() };
+            }
+            // Pictures are scaled with linear filtering (nearest without render targets).
+            sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", if self.targets { "1" } else { "0" });
+            let made = self._creator.create_texture_static(PixelFormatEnum::ABGR8888, r.w, r.h);
+            sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
+            let Ok(mut tex) = made else { continue };
+            if tex.update(None, pixels, (r.w * 4) as usize).is_err() {
+                // SAFETY: not used again; the renderer is alive.
+                unsafe { tex.destroy() };
+                continue;
+            }
+            tex.set_blend_mode(BlendMode::Blend);
+            self.pics.push(Pic { id: p.id, stamp: r.stamp, w: r.w, h: r.h, tex, used: self.tick });
+        }
+    }
+
+    /// Composes the source picture for `dest` (game, pictures, interface); false when render
+    /// targets fail (then the layers are drawn straight to the output).
+    fn draw_source(&mut self, dest: Rect, game: bool, size: (u32, u32), placed: &[Placed]) -> bool {
+        match self.try_source(dest, game, size, placed) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("ebobo: no render target ({e}), using nearest scaling");
+                self.targets = false;
+                false
+            }
+        }
+    }
+
+    fn try_source(&mut self, dest: Rect, game: bool, size: (u32, u32), placed: &[Placed]) -> Result<(), String> {
+        let (dw, dh) = (dest.width(), dest.height());
+        let Video { canvas, _creator: creator, ui, game: game_tex, ui_pre, game_pre, source, pics, tick, .. } = self;
+        let mut game_src: Option<&mut Texture> = None;
+        if game {
+            let (texture, ..) = game_tex.as_mut().ok_or("no game texture")?;
+            let k = prescale(dw, dh, size.0, size.1);
+            game_src = Some(if k > 1 { prescale_into(canvas, creator, game_pre, texture, size, k)? } else { texture });
+        }
+        let k = prescale(dw, dh, W, H);
+        let ui_src = if k > 1 { prescale_into(canvas, creator, ui_pre, ui, (W, H), k)? } else { ui };
+        if source.as_ref().map(|(_, w, h)| (*w, *h)) != Some((dw, dh)) {
+            // Linear: the glow copy is a downscale of it; everything else copies it 1:1.
+            let made = make_target(creator, dw, dh, true)?;
+            if let Some((old, ..)) = source.replace((made, dw, dh)) {
+                // SAFETY: the old target is not used again; the renderer is alive.
+                unsafe { old.destroy() };
+            }
+        }
+        let (target, ..) = source.as_mut().expect("created above");
+        let mut drawn = Ok(());
+        canvas
+            .with_texture_canvas(target, |c| {
+                c.set_draw_color(Color::RGB(0, 0, 0));
+                c.clear();
+                drawn = draw_layers(c, Rect::new(0, 0, dw, dh), game_src, ui_src, placed, pics, *tick);
+            })
+            .map_err(|e| e.to_string())?;
+        drawn
+    }
+
+    /// Composes the effect scene for `dest` from the source picture (bleed, mask, glow);
+    /// false when render targets fail (then the plain source picture is drawn).
+    fn draw_fx(&mut self, dest: Rect, size: (u32, u32)) -> bool {
         if !self.targets {
             return false;
         }
-        let key = (self.effect, dest);
+        let key = (self.effect, dest, size);
         if self.fx.as_ref().map(|fx| fx.key) != Some(key) {
             if let Some(old) = self.fx.take() {
                 // SAFETY: replaced below; the renderer is alive.
@@ -239,12 +484,13 @@ impl Video {
                 }
             }
         }
-        let Video { canvas, texture, prescaled, fx, .. } = self;
+        let Video { canvas, source, fx, .. } = self;
+        let Some((source, ..)) = source.as_mut() else { return false };
         let fx = fx.as_mut().expect("made above");
         let p = fx.params;
         let (dw, dh) = (dest.width(), dest.height());
         let mut ok = true;
-        let mut run = |target: &mut Texture, f: &mut dyn FnMut(&mut Canvas<Window>) -> Result<(), String>| {
+        let mut run = |target: &mut Texture, f: &mut dyn FnMut(&mut WindowCanvas) -> Result<(), String>| {
             if let Err(e) = canvas.with_texture_canvas(target, |c| {
                 if let Err(e) = f(c) {
                     eprintln!("ebobo: picture effect: {e}");
@@ -256,22 +502,19 @@ impl Video {
         };
         // LCD ghosting: the new frame over the previous ones.
         if p.ghost > 0.0 {
-            texture.set_blend_mode(BlendMode::Blend);
-            texture.set_alpha_mod(((1.0 - p.ghost) * 255.0) as u8);
-            run(&mut fx.ghost, &mut |c| c.copy(texture, None, None));
-            texture.set_alpha_mod(255);
-            // Back to SDL's default for an alpha format, which the plain path relies on.
-            texture.set_blend_mode(BlendMode::Blend);
+            source.set_blend_mode(BlendMode::Blend);
+            source.set_alpha_mod(((1.0 - p.ghost) * 255.0) as u8);
+            run(&mut fx.ghost, &mut |c| c.copy(source, None, None));
+            source.set_alpha_mod(255);
         }
-        // Glow source: the picture blurred by two linear downscales.
-        run(&mut fx.mid, &mut |c| c.copy(texture, None, None));
+        // Glow source: the picture at the source's resolution, blurred by two linear downscales.
+        source.set_blend_mode(BlendMode::None);
+        run(&mut fx.base, &mut |c| c.copy(source, None, None));
+        let base = &fx.base;
+        run(&mut fx.mid, &mut |c| c.copy(base, None, None));
         let mid = &fx.mid;
         run(&mut fx.small, &mut |c| c.copy(mid, None, None));
-        let src: &mut Texture = match prescaled {
-            _ if p.ghost > 0.0 => &mut fx.ghost,
-            Some((target, _)) if pre => target,
-            _ => texture,
-        };
+        let src: &mut Texture = if p.ghost > 0.0 { &mut fx.ghost } else { source };
         let (mask, small, glow) = (&fx.mask, &mut fx.small, fx.glow);
         run(&mut fx.scene, &mut |c| {
             let full = Rect::new(0, 0, dw, dh);
@@ -281,14 +524,13 @@ impl Video {
             c.copy(src, None, full)?;
             if p.bleed > 0.0 {
                 // Composite colour bleed: a copy ~0.6 source pixel to the right.
-                let shift = (dw as f32 / W as f32 * 0.6).round() as i32;
+                let shift = (dw as f32 / size.0 as f32 * 0.6).round() as i32;
                 src.set_blend_mode(BlendMode::Blend);
                 src.set_alpha_mod((p.bleed * 255.0) as u8);
                 c.copy(src, None, Rect::new(shift, 0, dw, dh))?;
                 src.set_alpha_mod(255);
             }
-            // Back to SDL's default for an alpha format, which the plain path relies on.
-            src.set_blend_mode(BlendMode::Blend);
+            src.set_blend_mode(BlendMode::None);
             c.copy(mask, None, full)?;
             let g = (glow * 255.0).round() as u8;
             small.set_blend_mode(BlendMode::Add);
@@ -299,34 +541,34 @@ impl Video {
         ok
     }
 
-    fn make_fx(&mut self, key: (Effect, Rect)) -> Result<Fx, String> {
-        let (effect, dest) = key;
+    /// Effect resources for (effect, destination rect, source size). The ghost starts as
+    /// the source picture just composed.
+    fn make_fx(&mut self, key: (Effect, Rect, (u32, u32))) -> Result<Fx, String> {
+        let (effect, dest, (sw, sh)) = key;
         let p = effect.params();
         let (dw, dh) = (dest.width(), dest.height());
-        let target = |w: u32, h: u32, linear: bool| {
-            sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", if linear { "1" } else { "0" });
-            let t = self._creator.create_texture_target(PixelFormatEnum::ABGR8888, w, h);
-            sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
-            t.map_err(|e| e.to_string())
-        };
-        let scene = target(dw, dh, true)?;
-        let mid = target(W / 2, H / 2, true)?;
+        let creator = &self._creator;
+        let scene = make_target(creator, dw, dh, true)?;
+        let base = make_target(creator, sw, sh, true)?;
+        let mid = make_target(creator, (sw / 2).max(1), (sh / 2).max(1), true)?;
         let blur = p.glow_blur.max(1);
-        let small = target(W / blur, H / blur, true)?;
-        let mut ghost = target(W, H, false)?;
-        let m = crt::mask(effect, dw, dh);
-        let mut mask = self
-            ._creator
+        let small = make_target(creator, (sw / blur).max(1), (sh / blur).max(1), true)?;
+        let mut ghost = make_target(creator, dw, dh, false)?;
+        let m = crt::mask(effect, dw, dh, sw, sh);
+        let mut mask = creator
             .create_texture_static(PixelFormatEnum::ABGR8888, dw, dh)
             .map_err(|e| e.to_string())?;
         mask.update(None, &m.rgba, (dw * 4) as usize).map_err(|e| e.to_string())?;
         mask.set_blend_mode(BlendMode::Mod);
-        let texture = &self.texture;
-        self.canvas
-            .with_texture_canvas(&mut ghost, |c| {
-                let _ = c.copy(texture, None, None);
-            })
-            .map_err(|e| e.to_string())?;
+        if let Some((source, ..)) = self.source.as_mut() {
+            source.set_blend_mode(BlendMode::None);
+            let source = &*source;
+            self.canvas
+                .with_texture_canvas(&mut ghost, |c| {
+                    let _ = c.copy(source, None, None);
+                })
+                .map_err(|e| e.to_string())?;
+        }
         let d = (dest.x() as f32, dest.y() as f32, dw as f32, dh as f32);
         let (verts, indices) = crt::mesh(d, p);
         let vertices = verts
@@ -340,45 +582,7 @@ impl Video {
                 }
             })
             .collect();
-        Ok(Fx { key, params: p, scene, mask, glow: m.glow, mid, small, ghost, vertices, indices })
-    }
-
-    /// Draws the picture into the `k`× target; false when render targets are unavailable.
-    fn draw_prescaled(&mut self, k: u32) -> bool {
-        if !self.targets {
-            return false;
-        }
-        if self.prescaled.as_ref().map(|(_, have)| *have) != Some(k) {
-            // The scale-quality hint is read when a texture is created: linear for the
-            // target, nearest (as set in `new`) for everything else.
-            sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "1");
-            let made = self._creator.create_texture_target(PixelFormatEnum::ABGR8888, W * k, H * k);
-            sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
-            match made {
-                Ok(target) => {
-                    if let Some((old, _)) = self.prescaled.replace((target, k)) {
-                        // SAFETY: the old target is not used again; the renderer is alive.
-                        unsafe { old.destroy() };
-                    }
-                }
-                Err(e) => {
-                    eprintln!("ebobo: no render target ({e}), using nearest scaling");
-                    self.targets = false;
-                    return false;
-                }
-            }
-        }
-        let (target, _) = self.prescaled.as_mut().expect("created above");
-        let texture = &self.texture;
-        let drawn = self.canvas.with_texture_canvas(target, |c| {
-            let _ = c.copy(texture, None, None);
-        });
-        if let Err(e) = drawn {
-            eprintln!("ebobo: render target failed ({e}), using nearest scaling");
-            self.targets = false;
-            return false;
-        }
-        true
+        Ok(Fx { key, params: p, scene, mask, glow: m.glow, base, mid, small, ghost, vertices, indices })
     }
 
     /// "Screen" setting; applies from the next frame.
@@ -428,17 +632,125 @@ impl Video {
         }
     }
 
-    /// Window position → 256x240 UI canvas pixel through the destination rect `present`
-    /// draws into; `None` in the letterbox bars or when the window size is unknown.
+    /// Window position → 256x240 UI canvas pixel through the picture rectangle of the last
+    /// presented frame; `None` in the letterbox bars or when the window size is unknown.
     pub fn to_canvas(&self, pos: WindowPos) -> Option<(i32, i32)> {
         let (ow, oh) = self.canvas.output_size().ok()?;
-        map_to_canvas(self.screen, self.effect.params().curve, self.canvas.window().size(), (ow, oh), pos)
+        map_to_canvas(self.screen, self.effect.params().curve, self.canvas.window().size(), (ow, oh), self.shown, pos)
     }
+}
+
+/// A render target; `linear` picks the filtering when it is drawn scaled.
+fn make_target(creator: &TextureCreator<WindowContext>, w: u32, h: u32, linear: bool) -> Result<Texture, String> {
+    // The scale-quality hint is read when a texture is created: nearest (as set in `new`)
+    // for everything that does not ask for linear.
+    sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", if linear { "1" } else { "0" });
+    let made = creator.create_texture_target(PixelFormatEnum::ABGR8888, w, h);
+    sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
+    made.map_err(|e| e.to_string())
+}
+
+/// Draws `texture` (`size`) with nearest-neighbour into the `k`× linear target kept in
+/// `slot` (made anew when the size or the factor changed), alpha included; returns the target.
+fn prescale_into<'a>(
+    canvas: &mut WindowCanvas,
+    creator: &TextureCreator<WindowContext>,
+    slot: &'a mut Option<(Texture, (u32, u32, u32))>,
+    texture: &mut Texture,
+    size: (u32, u32),
+    k: u32,
+) -> Result<&'a mut Texture, String> {
+    let key = (size.0, size.1, k);
+    if slot.as_ref().map(|(_, have)| *have) != Some(key) {
+        let made = make_target(creator, size.0 * k, size.1 * k, true)?;
+        if let Some((old, _)) = slot.replace((made, key)) {
+            // SAFETY: the old target is not used again; the renderer is alive.
+            unsafe { old.destroy() };
+        }
+    }
+    let (target, _) = slot.as_mut().expect("created above");
+    texture.set_blend_mode(BlendMode::None);
+    let texture = &*texture;
+    let mut drawn = Ok(());
+    canvas
+        .with_texture_canvas(target, |c| drawn = c.copy(texture, None, None))
+        .map_err(|e| e.to_string())?;
+    drawn?;
+    Ok(target)
+}
+
+/// Draws the layers over `at` (already cleared): the game filling it, each placed picture
+/// (its box filled with `back`, the picture fitted inside, both clipped to `clip`, faded by
+/// `alpha`), then the interface blended over all of it. Only pictures marked `tick` are drawn.
+fn draw_layers(
+    c: &mut WindowCanvas,
+    at: Rect,
+    game: Option<&mut Texture>,
+    ui: &mut Texture,
+    placed: &[Placed],
+    pics: &mut [Pic],
+    tick: u64,
+) -> Result<(), String> {
+    if let Some(game) = game {
+        game.set_blend_mode(BlendMode::None);
+        c.copy(game, None, at)?;
+    }
+    if !placed.is_empty() {
+        let drawn = draw_placed(c, at, placed, pics, tick);
+        c.set_clip_rect(None::<Rect>);
+        c.set_blend_mode(BlendMode::None);
+        drawn?;
+    }
+    ui.set_blend_mode(BlendMode::Blend);
+    c.copy(ui, None, at)
+}
+
+/// The pictures of `draw_layers`; leaves the clip rectangle set.
+fn draw_placed(c: &mut WindowCanvas, at: Rect, placed: &[Placed], pics: &mut [Pic], tick: u64) -> Result<(), String> {
+    for p in placed {
+        let (Some(clip), Some(boxed)) = (scaled(p.clip, at), scaled((p.x, p.y, p.w, p.h), at)) else { continue };
+        let Some(clip) = clip.intersection(at) else { continue };
+        c.set_clip_rect(Some(clip));
+        c.set_blend_mode(BlendMode::Blend);
+        c.set_draw_color(Color::RGBA(p.back[0], p.back[1], p.back[2], p.back[3]));
+        c.fill_rect(boxed)?;
+        if let Some(pic) = pics.iter_mut().find(|pic| pic.id == p.id && pic.used == tick) {
+            pic.tex.set_alpha_mod(p.alpha);
+            c.copy(&pic.tex, None, fitted(pic.w, pic.h, boxed))?;
+        }
+    }
+    Ok(())
+}
+
+/// Index of the least recently drawn picture given each one's `used`; `None` when every
+/// one was drawn in frame `tick` (nothing may be dropped).
+fn oldest(used: impl Iterator<Item = u64>, tick: u64) -> Option<usize> {
+    let (i, used) = used.enumerate().min_by_key(|&(_, used)| used)?;
+    (used != tick).then_some(i)
+}
+
+/// Canvas rectangle (x, y, w, h in 256x240 canvas pixels) → pixels of the picture rectangle
+/// `at`, edges rounded to the nearest pixel; `None` when it comes out empty.
+fn scaled(b: (i32, i32, i32, i32), at: Rect) -> Option<Rect> {
+    let (sx, sy) = (at.width() as f32 / W as f32, at.height() as f32 / H as f32);
+    let (left, top) = ((b.0 as f32 * sx).round() as i32, (b.1 as f32 * sy).round() as i32);
+    let (right, bottom) = (((b.0 + b.2) as f32 * sx).round() as i32, ((b.1 + b.3) as f32 * sy).round() as i32);
+    (right > left && bottom > top).then(|| Rect::new(at.x() + left, at.y() + top, (right - left) as u32, (bottom - top) as u32))
+}
+
+/// The largest rectangle with the proportions of a `pw`×`ph` picture inside `boxed`, centred.
+fn fitted(pw: u32, ph: u32, boxed: Rect) -> Rect {
+    let (pw, ph) = (pw.max(1) as u64, ph.max(1) as u64);
+    let (bw, bh) = (boxed.width() as u64, boxed.height() as u64);
+    // Narrower than the box → full height, else full width.
+    let (w, h) = if pw * bh <= ph * bw { ((pw * bh + ph / 2) / ph, bh) } else { (bw, (ph * bw + pw / 2) / pw) };
+    let (w, h) = (w.clamp(1, bw) as u32, h.clamp(1, bh) as u32);
+    Rect::new(boxed.x() + ((boxed.width() - w) / 2) as i32, boxed.y() + ((boxed.height() - h) / 2) as i32, w, h)
 }
 
 /// CRT turn-on over `dest`: only the centred `open` fraction of the height shows, with
 /// `flash` white added on top (a bright line that opens vertically, then settles).
-fn draw_power(c: &mut Canvas<Window>, dest: Rect, open: f32, flash: f32) -> Result<(), String> {
+fn draw_power(c: &mut WindowCanvas, dest: Rect, open: f32, flash: f32) -> Result<(), String> {
     let h = dest.height() as f32;
     let band = (h * open).round().max(1.0) as u32;
     let top = dest.y() + ((h as u32 - band.min(h as u32)) / 2) as i32;
@@ -461,40 +773,61 @@ fn draw_power(c: &mut Canvas<Window>, dest: Rect, open: f32, flash: f32) -> Resu
     Ok(())
 }
 
-/// Where the 256x240 picture goes in an `ow`×`oh` drawable.
-fn dest_rect(screen: ScreenMode, ow: u32, oh: u32) -> Rect {
+/// Where the picture of a `sw`×`sh` source goes in an `ow`×`oh` drawable.
+///
+/// - `Stretch`: the whole drawable.
+/// - `Fit`: the largest rectangle of the picture's shape: 256:240 for a 256x240 source (the
+///   interface and the NES, as before), 4:3 for every other size (the console's TV picture,
+///   whatever its pixel grid).
+/// - `Pixel`: the largest integer multiple of the source's own size. A frame taller than
+///   wide (interlaced double height, 320x448) doubles the horizontal factor, so its half-high
+///   lines stay whole pixels on a picture of the usual shape. A drawable smaller than one
+///   picture falls back to `Fit`.
+fn dest_rect(screen: ScreenMode, ow: u32, oh: u32, sw: u32, sh: u32) -> Rect {
     let (ow, oh) = (ow.max(1), oh.max(1));
+    let (sw, sh) = (sw.max(1), sh.max(1));
+    // Width of one source pixel in units of its height's factor.
+    let wide = if sh > sw { sw * 2 } else { sw };
     let (w, h) = match screen {
         ScreenMode::Stretch => (ow, oh),
-        ScreenMode::Pixel if ow >= W && oh >= H => {
-            let k = (ow / W).min(oh / H);
-            (W * k, H * k)
+        ScreenMode::Pixel if ow >= wide && oh >= sh => {
+            let k = (ow / wide).min(oh / sh);
+            (wide * k, sh * k)
         }
         // Fit, and Pixel in a drawable smaller than one picture.
         _ => {
-            // Wider than 256:240 → full height, else full width.
-            if ow as u64 * H as u64 > oh as u64 * W as u64 {
-                (((oh as u64 * W as u64 + H as u64 / 2) / H as u64) as u32, oh)
+            let (aw, ah) = if (sw, sh) == (W, H) { (W as u64, H as u64) } else { (4, 3) };
+            // Wider than the picture's shape → full height, else full width.
+            if ow as u64 * ah > oh as u64 * aw {
+                (((oh as u64 * aw + ah / 2) / ah) as u32, oh)
             } else {
-                (ow, ((ow as u64 * H as u64 + W as u64 / 2) / W as u64) as u32)
+                (ow, ((ow as u64 * ah + aw / 2) / aw) as u32)
             }
         }
     };
-    let (w, h) = (w.max(1), h.max(1));
+    let (w, h) = (w.clamp(1, ow), h.clamp(1, oh));
     Rect::new(((ow - w) / 2) as i32, ((oh - h) / 2) as i32, w, h)
 }
 
 /// `pos` in a window of `win` points whose drawable is `out` pixels (HiDPI: out = 2 × win on
-/// Retina) → canvas pixel of the picture drawn by `dest_rect`, through the inverse of the
-/// screen curvature `curve` (0 = flat; the glass corners outside the picture → `None`).
-fn map_to_canvas(screen: ScreenMode, curve: f32, win: (u32, u32), out: (u32, u32), pos: WindowPos) -> Option<(i32, i32)> {
+/// Retina) → canvas pixel of the picture `dest_rect` draws for a `src`-sized source, through
+/// the inverse of the screen curvature `curve` (0 = flat; the glass corners outside the
+/// picture → `None`).
+fn map_to_canvas(
+    screen: ScreenMode,
+    curve: f32,
+    win: (u32, u32),
+    out: (u32, u32),
+    src: (u32, u32),
+    pos: WindowPos,
+) -> Option<(i32, i32)> {
     let (ww, wh) = (win.0.max(1) as f32, win.1.max(1) as f32);
     let (ow, oh) = (out.0.max(1) as f32, out.1.max(1) as f32);
     let (px, py) = match pos {
         WindowPos::Point(x, y) => (x * ow / ww, y * oh / wh),
         WindowPos::Touch(x, y) => (x * ow, y * oh),
     };
-    let d = dest_rect(screen, out.0, out.1);
+    let d = dest_rect(screen, out.0, out.1, src.0, src.1);
     let fx = (px - d.x() as f32) / d.width() as f32;
     let fy = (py - d.y() as f32) / d.height() as f32;
     let (fx, fy) = crt::warp(fx, fy, curve);
@@ -504,17 +837,18 @@ fn map_to_canvas(screen: ScreenMode, curve: f32, win: (u32, u32), out: (u32, u32
     Some(((fx * W as f32) as i32, (fy * H as f32) as i32))
 }
 
-/// Integer prescale for a `w`×`h` destination: 1 (draw directly with nearest) when the
-/// destination is an exact integer multiple or not larger than the picture, else the
-/// smallest factor covering it (capped), which is then scaled down linearly.
-fn prescale(w: u32, h: u32) -> u32 {
-    if w <= W && h <= H {
+/// Integer prescale of a `sw`×`sh` layer for a `w`×`h` destination: 1 (draw directly with
+/// nearest) when the destination is an exact integer multiple or not larger than the layer,
+/// else the smallest factor covering it (capped), which is then scaled down linearly.
+fn prescale(w: u32, h: u32, sw: u32, sh: u32) -> u32 {
+    let (sw, sh) = (sw.max(1), sh.max(1));
+    if w <= sw && h <= sh {
         return 1;
     }
-    if w % W == 0 && h % H == 0 && w / W == h / H {
+    if w % sw == 0 && h % sh == 0 && w / sw == h / sh {
         return 1;
     }
-    w.div_ceil(W).max(h.div_ceil(H)).clamp(1, MAX_PRESCALE)
+    w.div_ceil(sw).max(h.div_ceil(sh)).clamp(1, MAX_PRESCALE)
 }
 
 #[cfg(test)]
@@ -523,21 +857,100 @@ mod tests {
 
     #[test]
     fn deck_screen_modes() {
-        assert_eq!(dest_rect(ScreenMode::Stretch, 1280, 800), Rect::new(0, 0, 1280, 800));
-        assert_eq!(dest_rect(ScreenMode::Fit, 1280, 800), Rect::new(213, 0, 853, 800));
-        assert_eq!(dest_rect(ScreenMode::Pixel, 1280, 800), Rect::new(256, 40, 768, 720));
-        assert_eq!(dest_rect(ScreenMode::Fit, 256, 400), Rect::new(0, 80, 256, 240));
-        assert_eq!(dest_rect(ScreenMode::Pixel, 200, 100).height(), 100);
-        assert_eq!(prescale(768, 720), 1);
-        assert_eq!(prescale(1280, 800), 5);
-        assert_eq!(prescale(853, 800), 4);
-        assert_eq!(prescale(200, 100), 1);
-        assert_eq!(prescale(7680, 4320), MAX_PRESCALE);
+        assert_eq!(dest_rect(ScreenMode::Stretch, 1280, 800, 256, 240), Rect::new(0, 0, 1280, 800));
+        assert_eq!(dest_rect(ScreenMode::Fit, 1280, 800, 256, 240), Rect::new(213, 0, 853, 800));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 1280, 800, 256, 240), Rect::new(256, 40, 768, 720));
+        assert_eq!(dest_rect(ScreenMode::Fit, 256, 400, 256, 240), Rect::new(0, 80, 256, 240));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 200, 100, 256, 240).height(), 100);
+        assert_eq!(prescale(768, 720, 256, 240), 1);
+        assert_eq!(prescale(1280, 800, 256, 240), 5);
+        assert_eq!(prescale(853, 800, 256, 240), 4);
+        assert_eq!(prescale(200, 100, 256, 240), 1);
+        assert_eq!(prescale(7680, 4320, 256, 240), MAX_PRESCALE);
+    }
+
+    #[test]
+    fn picture_rect_follows_the_game_size() {
+        // Stretch: the whole drawable whatever the source.
+        for (sw, sh) in [(256, 240), (320, 224), (320, 448)] {
+            for (ow, oh) in [(1280, 800), (640, 480), (600, 800), (1920, 1080)] {
+                assert_eq!(dest_rect(ScreenMode::Stretch, ow, oh, sw, sh), Rect::new(0, 0, ow, oh));
+            }
+        }
+        // Fit: 4:3 for the Mega Drive's sizes, 256:240 for a 256x240 source.
+        for (sw, sh) in [(320, 224), (320, 448)] {
+            assert_eq!(dest_rect(ScreenMode::Fit, 1280, 800, sw, sh), Rect::new(106, 0, 1067, 800));
+            assert_eq!(dest_rect(ScreenMode::Fit, 640, 480, sw, sh), Rect::new(0, 0, 640, 480));
+            assert_eq!(dest_rect(ScreenMode::Fit, 600, 800, sw, sh), Rect::new(0, 175, 600, 450));
+            assert_eq!(dest_rect(ScreenMode::Fit, 1920, 1080, sw, sh), Rect::new(240, 0, 1440, 1080));
+        }
+        assert_eq!(dest_rect(ScreenMode::Fit, 640, 480, 256, 240), Rect::new(64, 0, 512, 480));
+        assert_eq!(dest_rect(ScreenMode::Fit, 600, 800, 256, 240), Rect::new(0, 119, 600, 563));
+        assert_eq!(dest_rect(ScreenMode::Fit, 1920, 1080, 256, 240), Rect::new(384, 0, 1152, 1080));
+        // Pixel: integer multiples of the game's own size.
+        assert_eq!(dest_rect(ScreenMode::Pixel, 1280, 800, 320, 224), Rect::new(160, 64, 960, 672));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 1920, 1080, 320, 224), Rect::new(320, 92, 1280, 896));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 640, 480, 320, 224), Rect::new(0, 16, 640, 448));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 640, 480, 256, 240), Rect::new(64, 0, 512, 480));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 1920, 1080, 256, 240), Rect::new(448, 60, 1024, 960));
+        // Interlaced double height: half-high lines, the usual shape.
+        assert_eq!(dest_rect(ScreenMode::Pixel, 1280, 800, 320, 448), Rect::new(320, 176, 640, 448));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 1920, 1080, 320, 448), Rect::new(320, 92, 1280, 896));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 640, 480, 320, 448), Rect::new(0, 16, 640, 448));
+        // Smaller than one picture: as Fit.
+        assert_eq!(dest_rect(ScreenMode::Pixel, 300, 200, 320, 224), Rect::new(16, 0, 267, 200));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 400, 500, 320, 448), Rect::new(0, 100, 400, 300));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 300, 200, 320, 224), dest_rect(ScreenMode::Fit, 300, 200, 320, 224));
+    }
+
+    #[test]
+    fn prescale_uses_the_layer_size() {
+        // Exact integer multiples and smaller destinations are drawn directly.
+        assert_eq!(prescale(960, 672, 320, 224), 1);
+        assert_eq!(prescale(320, 224, 320, 224), 1);
+        assert_eq!(prescale(300, 200, 320, 224), 1);
+        // Else the smallest factor covering the rectangle.
+        assert_eq!(prescale(1067, 800, 320, 224), 4);
+        assert_eq!(prescale(1067, 800, 320, 448), 4);
+        assert_eq!(prescale(1440, 1080, 320, 224), 5);
+        assert_eq!(prescale(640, 448, 320, 448), 2);
+        assert_eq!(prescale(7680, 4320, 320, 224), MAX_PRESCALE);
+        // The interface over a game's rectangle.
+        assert_eq!(prescale(960, 672, 256, 240), 4);
+    }
+
+    #[test]
+    fn pictures_fit_their_boxes() {
+        // A 44x62 tile at canvas (10, 34), the canvas shown 4x.
+        let at = Rect::new(0, 0, 1024, 960);
+        let tile = scaled((10, 34, 44, 62), at).unwrap();
+        assert_eq!(tile, Rect::new(40, 136, 176, 248));
+        // Upright box art: full height, a pixel short of the width.
+        assert_eq!(fitted(512, 727, tile), Rect::new(40, 136, 175, 248));
+        // A 4:3 title screen sits in the middle.
+        assert_eq!(fitted(320, 240, tile), Rect::new(40, 194, 176, 132));
+        assert_eq!(fitted(176, 248, tile), tile);
+        assert_eq!(fitted(1, 1000, tile), Rect::new(127, 136, 1, 248));
+        // The rectangle's origin and a non-integer scale (853x800 at x 213).
+        let fit = Rect::new(213, 0, 853, 800);
+        assert_eq!(scaled((0, 0, 256, 240), fit), Some(fit));
+        assert_eq!(scaled((10, 34, 44, 62), fit), Some(Rect::new(246, 113, 147, 207)));
+        assert_eq!(scaled((10, 34, 0, 62), fit), None);
+        assert_eq!(scaled((10, 34, 44, -3), fit), None);
+    }
+
+    #[test]
+    fn least_recently_drawn_picture_goes() {
+        assert_eq!(oldest([5, 3, 9, 3].into_iter(), 9), Some(1));
+        assert_eq!(oldest([9, 9, 8].into_iter(), 9), Some(2));
+        // Everything was drawn this frame: nothing to drop.
+        assert_eq!(oldest([9, 9].into_iter(), 9), None);
+        assert_eq!(oldest(std::iter::empty(), 9), None);
     }
 
     #[test]
     fn window_to_canvas_all_modes() {
-        let deck = |mode, pos| map_to_canvas(mode, 0.0, (1280, 800), (1280, 800), pos);
+        let deck = |mode, pos| map_to_canvas(mode, 0.0, (1280, 800), (1280, 800), (256, 240), pos);
         // Stretch: whole window, no bars.
         assert_eq!(deck(ScreenMode::Stretch, WindowPos::Point(0.0, 0.0)), Some((0, 0)));
         assert_eq!(deck(ScreenMode::Stretch, WindowPos::Point(1279.0, 799.0)), Some((255, 239)));
@@ -555,15 +968,15 @@ mod tests {
         assert_eq!(deck(ScreenMode::Pixel, WindowPos::Point(259.0, 43.0)), Some((1, 1)));
         assert_eq!(deck(ScreenMode::Pixel, WindowPos::Point(1023.0, 759.0)), Some((255, 239)));
         // HiDPI: 640x400 points, 1280x800 pixels → the same picture as the Deck.
-        let retina = map_to_canvas(ScreenMode::Pixel, 0.0, (640, 400), (1280, 800), WindowPos::Point(129.5, 21.5));
+        let retina = map_to_canvas(ScreenMode::Pixel, 0.0, (640, 400), (1280, 800), (256, 240), WindowPos::Point(129.5, 21.5));
         assert_eq!(retina, Some((1, 1)));
-        assert_eq!(map_to_canvas(ScreenMode::Fit, 0.0, (640, 400), (1280, 800), WindowPos::Point(50.0, 200.0)), None);
+        assert_eq!(map_to_canvas(ScreenMode::Fit, 0.0, (640, 400), (1280, 800), (256, 240), WindowPos::Point(50.0, 200.0)), None);
         // Flat effects map exactly like Off.
         for effect in Effect::ALL {
             if effect.params().curve == 0.0 {
                 for pos in [WindowPos::Point(259.0, 43.0), WindowPos::Touch(0.31, 0.77)] {
                     assert_eq!(
-                        map_to_canvas(ScreenMode::Fit, effect.params().curve, (1280, 800), (1280, 800), pos),
+                        map_to_canvas(ScreenMode::Fit, effect.params().curve, (1280, 800), (1280, 800), (256, 240), pos),
                         deck(ScreenMode::Fit, pos)
                     );
                 }
@@ -572,17 +985,35 @@ mod tests {
     }
 
     #[test]
+    fn window_to_canvas_over_a_game() {
+        // A 320x224 game, Pixel: 3x at (160, 64), 960x672; the canvas is stretched over it.
+        let game = |mode, pos| map_to_canvas(mode, 0.0, (1280, 800), (1280, 800), (320, 224), pos);
+        assert_eq!(game(ScreenMode::Pixel, WindowPos::Point(160.0, 64.0)), Some((0, 0)));
+        assert_eq!(game(ScreenMode::Pixel, WindowPos::Point(1119.0, 735.0)), Some((255, 239)));
+        assert_eq!(game(ScreenMode::Pixel, WindowPos::Point(159.0, 400.0)), None);
+        assert_eq!(game(ScreenMode::Pixel, WindowPos::Point(640.0, 736.0)), None);
+        assert_eq!(game(ScreenMode::Pixel, WindowPos::Touch(0.5, 0.5)), Some((128, 120)));
+        // Fit: 4:3 at x 106..1173.
+        assert_eq!(game(ScreenMode::Fit, WindowPos::Point(105.0, 400.0)), None);
+        assert_eq!(game(ScreenMode::Fit, WindowPos::Point(106.0, 0.0)), Some((0, 0)));
+        assert_eq!(game(ScreenMode::Fit, WindowPos::Point(1172.0, 799.0)), Some((255, 239)));
+    }
+
+    #[test]
     fn curved_taps_land_on_drawn_pixel() {
         let k = Effect::CrtTv.params().curve;
-        let d = dest_rect(ScreenMode::Fit, 1280, 800);
+        let d = dest_rect(ScreenMode::Fit, 1280, 800, 256, 240);
         for (cx, cy) in [(128, 120), (10, 12), (240, 200), (5, 230), (128, 3)] {
             // Where the curved mesh draws the centre of canvas pixel (cx, cy).
             let (sx, sy) = crt::unwarp((cx as f32 + 0.5) / W as f32, (cy as f32 + 0.5) / H as f32, k);
             let pos = WindowPos::Point(d.x() as f32 + sx * d.width() as f32, d.y() as f32 + sy * d.height() as f32);
-            let (x, y) = map_to_canvas(ScreenMode::Fit, k, (1280, 800), (1280, 800), pos).expect("on the picture");
+            let (x, y) = map_to_canvas(ScreenMode::Fit, k, (1280, 800), (1280, 800), (256, 240), pos).expect("on the picture");
             assert!((x - cx).abs() <= 1 && (y - cy).abs() <= 1, "({cx},{cy}) → ({x},{y})");
         }
         // The black glass corner is not the picture.
-        assert_eq!(map_to_canvas(ScreenMode::Fit, k, (1280, 800), (1280, 800), WindowPos::Point(214.0, 1.0)), None);
+        assert_eq!(
+            map_to_canvas(ScreenMode::Fit, k, (1280, 800), (1280, 800), (256, 240), WindowPos::Point(214.0, 1.0)),
+            None
+        );
     }
 }
