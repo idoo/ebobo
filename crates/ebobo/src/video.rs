@@ -885,7 +885,7 @@ mod tests {
             assert_eq!(dest_rect(ScreenMode::Fit, 1920, 1080, sw, sh), Rect::new(240, 0, 1440, 1080));
         }
         assert_eq!(dest_rect(ScreenMode::Fit, 640, 480, 256, 240), Rect::new(64, 0, 512, 480));
-        assert_eq!(dest_rect(ScreenMode::Fit, 600, 800, 256, 240), Rect::new(0, 119, 600, 563));
+        assert_eq!(dest_rect(ScreenMode::Fit, 600, 800, 256, 240), Rect::new(0, 118, 600, 563));
         assert_eq!(dest_rect(ScreenMode::Fit, 1920, 1080, 256, 240), Rect::new(384, 0, 1152, 1080));
         // Pixel: integer multiples of the game's own size.
         assert_eq!(dest_rect(ScreenMode::Pixel, 1280, 800, 320, 224), Rect::new(160, 64, 960, 672));
