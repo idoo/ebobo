@@ -1,7 +1,11 @@
 //! Menus, lobby screen, pause menu, on-screen display and toasts, drawn on the 256x240 canvas.
 //! Gamepad-first (Steam Deck), keyboard works everywhere. Owner: ui slice (also owns i18n.rs).
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
+
+use ebobo_art::shelf::Shelf;
+use ebobo_art::Art;
 
 use ebobo_net::{
     normalize_code, LobbyStatus, NatKind, NetDiag, NetError, NetStats, ResumeInfo, ResumeKind, RomState, RouteKind, Stage,
@@ -432,10 +436,23 @@ pub struct Ui {
     /// (`None` = a new game). Empty for guests and when nothing was saved.
     resume_options: Vec<ResumeInfo>,
     resume_pick: Option<usize>,
+    /// Pictures and names of the library's cards.
+    art: Art,
+    /// Favourites and play history.
+    shelf: Shelf,
 }
 
 impl Ui {
+    /// An interface without the app around it (tests, tools): pictures come from an offline
+    /// `Art` over a fresh temporary folder, favourites and history stay in memory.
     pub fn new(lang: Lang) -> Ui {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!("ebobo-art-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        Ui::with_library(lang, Art::new(dir, false), Shelf::in_memory())
+    }
+
+    /// The interface with the app's library services.
+    pub fn with_library(lang: Lang, art: Art, shelf: Shelf) -> Ui {
         Ui {
             lang,
             stack: Vec::new(),
@@ -458,7 +475,21 @@ impl Ui {
             osk_wanted: false,
             resume_options: Vec::new(),
             resume_pick: None,
+            art,
+            shelf,
         }
+    }
+
+    pub fn art(&self) -> &Art {
+        &self.art
+    }
+
+    pub fn art_mut(&mut self) -> &mut Art {
+        &mut self.art
+    }
+
+    pub fn shelf_mut(&mut self) -> &mut Shelf {
+        &mut self.shelf
     }
 
     pub fn set_lang(&mut self, lang: Lang) {
