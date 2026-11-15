@@ -23,16 +23,25 @@ fn extend(cpu: &mut Cpu, src: u32, dst: u32, size: Size, sub: bool) -> u32 {
     res
 }
 
-/// The long at -(An) as ADDX.l and SUBX.l read it: An steps down a word at a time, low word read first, so an odd
-/// address faults at An - 2 with An already 2 lower.
+/// The long at -(An) as ADDX.l and SUBX.l read it: low word first, at An - 2, then the high word at An - 4. An odd
+/// address faults on the low word with An not stepped yet and the frame's PC 2 past `pc`.
 fn predec_long(cpu: &mut Cpu, bus: &mut impl Bus, n: u8) -> Res<u32> {
-    let lo_addr = cpu.a(n).wrapping_sub(2);
-    cpu.set_a(n, lo_addr);
-    let lo = cpu.read(bus, lo_addr, Size::Word)?;
-    let hi_addr = lo_addr.wrapping_sub(2);
-    cpu.set_a(n, hi_addr);
-    let hi = cpu.read(bus, hi_addr, Size::Word)?;
+    let addr = cpu.a(n).wrapping_sub(4);
+    cpu.ae_pc = 2;
+    let lo = cpu.read(bus, addr.wrapping_add(2), Size::Word)?;
+    let hi = cpu.read(bus, addr, Size::Word)?;
+    cpu.set_a(n, addr);
     Ok(hi << 16 | lo)
+}
+
+/// One operand of CMPM, (An)+. An odd address faults with the frame's PC 2 past `pc`; An is then a word further for
+/// the source (`first`, whatever the size: a long has stepped half its way) and not stepped for the destination.
+fn postinc(cpu: &mut Cpu, bus: &mut impl Bus, n: u8, size: Size, first: bool) -> Res<u32> {
+    let addr = cpu.a(n);
+    let ea = cpu.ea(bus, 3, n, size)?;
+    cpu.ae_pc = 2;
+    cpu.ae_restore = Some((n, if first { addr.wrapping_add(2) } else { addr }));
+    cpu.load(bus, ea, size)
 }
 
 /// What a long operation into a register idles: 2 cycles after a memory source (6 + ea in the manual), 4 after a
@@ -120,10 +129,8 @@ pub(crate) fn exec(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
                 }
                 // CMPM (Ay)+,(Ax)+: 12, long 20.
                 (1, true) => {
-                    let ea = cpu.ea(bus, 3, r, size)?;
-                    let src = cpu.load(bus, ea, size)?;
-                    let ea = cpu.ea(bus, 3, rn, size)?;
-                    let dst = cpu.load(bus, ea, size)?;
+                    let src = postinc(cpu, bus, r, size, true)?;
+                    let dst = postinc(cpu, bus, rn, size, false)?;
                     cpu.cmp_flags(src, dst, dst.wrapping_sub(src) & size.mask(), size);
                     Ok(())
                 }
