@@ -334,7 +334,8 @@ impl Console {
 
     /// Which layer each pixel of the last finished picture came from, one byte per pixel,
     /// row by row (`out` is resized to `width * height`), higher = nearer the viewer. NES:
-    /// 0 = background, 1 = sprite. Mega Drive: 0 = backdrop colour, 1 = plane B, 2 = plane A
+    /// 0 = backdrop colour, 1 = sprite behind the background, 2 = background, 3 = sprite in
+    /// front. Mega Drive: 0 = backdrop colour, 1 = plane B, 2 = plane A
     /// or the window, 3 = sprite. For display helpers (edge-aware scaling, shadows); not
     /// emulated state.
     pub fn frame_layers(&self, out: &mut Vec<u8>) -> (usize, usize) {

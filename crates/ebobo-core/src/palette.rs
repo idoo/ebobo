@@ -54,7 +54,7 @@ fn build(pal: bool) -> Box<[[u8; 4]; 512]> {
 }
 
 /// Converts PPU output (`index | emphasis << 6`) to RGBA8888. PAL swaps the red and green
-/// emphasis bits. Bits above 8 (the sprite marker, `ppu::FRAME_SPRITE`) do not affect the colour.
+/// emphasis bits. Bits above 8 (the layer, `ppu::FRAME_LAYER_SHIFT`) do not affect the colour.
 pub fn write_rgba(frame: &[u16], region: Region, out: &mut [u8]) {
     let t = table(region);
     for (px, o) in frame.iter().zip(out.chunks_exact_mut(4)) {
@@ -67,14 +67,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sprite_marker_does_not_change_colour() {
+    fn layer_markers_do_not_change_colour() {
         let words: Vec<u16> = (0..512).collect();
-        let marked: Vec<u16> = words.iter().map(|w| w | crate::ppu::FRAME_SPRITE).collect();
-        for region in [Region::Ntsc, Region::Pal] {
-            let (mut a, mut b) = (vec![0u8; 512 * 4], vec![0u8; 512 * 4]);
-            write_rgba(&words, region, &mut a);
-            write_rgba(&marked, region, &mut b);
-            assert_eq!(a, b);
+        for marker in [crate::ppu::FRAME_SPRITE_BEHIND, crate::ppu::FRAME_BG, crate::ppu::FRAME_SPRITE] {
+            let marked: Vec<u16> = words.iter().map(|w| w | marker).collect();
+            for region in [Region::Ntsc, Region::Pal] {
+                let (mut a, mut b) = (vec![0u8; 512 * 4], vec![0u8; 512 * 4]);
+                write_rgba(&words, region, &mut a);
+                write_rgba(&marked, region, &mut b);
+                assert_eq!(a, b);
+            }
         }
     }
 }

@@ -3,9 +3,19 @@
 use crate::cart::{Esx, Mirroring, Region};
 use crate::mapper::{Cartridge, Nt};
 
-/// Bit of a frame word set when the pixel shown is a sprite's (it won the priority mux and is
-/// not transparent). Display-only: the frame buffer is not emulated state.
-pub const FRAME_SPRITE: u16 = 0x8000;
+/// Bits 14-15 of a frame word: the layer the pixel shown belongs to, in the order the console
+/// stacks them, nearest the viewer last. Display-only: the frame buffer is not emulated state.
+///
+/// 0 (no bit): the backdrop colour: nothing is drawn there, rendering is off, or the
+/// background pixel has the backdrop's own colour (games fill sky with either; to the eye it
+/// is one surface).
+pub const FRAME_LAYER_SHIFT: u32 = 14;
+/// A sprite pixel with the "behind the background" priority, seen through the backdrop.
+pub const FRAME_SPRITE_BEHIND: u16 = 1 << FRAME_LAYER_SHIFT;
+/// An opaque background tile pixel.
+pub const FRAME_BG: u16 = 2 << FRAME_LAYER_SHIFT;
+/// A sprite pixel in front of the background (overlay and ESX sprites included).
+pub const FRAME_SPRITE: u16 = 3 << FRAME_LAYER_SHIFT;
 
 /// All PPU state: registers, 2 KiB CIRAM (4 KiB for four-screen), OAM, palette RAM, render
 /// pipeline. Part of the rollback snapshot, so `Clone + Hash`, and the frame buffer is NOT
@@ -823,12 +833,12 @@ impl Ppu {
         if skip && !self.rendering() {
             return;
         }
-        let (index, sprite) = if !self.rendering() {
+        let (index, layer) = if !self.rendering() {
             // Rendering off: the backdrop, or whatever palette entry `v` points at.
             if self.v & 0x3F00 == 0x3F00 {
-                (palette_index(self.v), false)
+                (palette_index(self.v), 0)
             } else {
-                (0, false)
+                (0, 0)
             }
         } else {
             let (mut bg_pixel, mut bg_pal) = (0u8, 0u8);
@@ -870,9 +880,10 @@ impl Ppu {
             }
 
             let sprite_wins = sp_pixel != 0 && (bg_pixel == 0 || sp_front);
+            let sprite_layer = if sp_front { FRAME_SPRITE } else { FRAME_SPRITE_BEHIND };
             if sprite_wins && sp_esx {
                 let color = self.esx_pal[((sp_pal << 2) | sp_pixel) as usize];
-                self.write_color(fb, y, x, color, true);
+                self.write_color(fb, y, x, color, sprite_layer);
                 return;
             }
             let (pal, pixel) = if bg_pixel == 0 {
@@ -884,25 +895,33 @@ impl Ppu {
             };
 
             if pixel == 0 {
-                (0, false)
+                (0, 0)
             } else {
-                (((pal << 2) | pixel) as usize & 0x1F, sprite_wins)
+                let index = ((pal << 2) | pixel) as usize & 0x1F;
+                let layer = if sprite_wins {
+                    sprite_layer
+                } else if self.palette[index] & 0x3F == self.palette[0] & 0x3F {
+                    0
+                } else {
+                    FRAME_BG
+                };
+                (index, layer)
             }
         };
 
         let color = self.palette[index];
-        self.write_color(fb, y, x, color, sprite);
+        self.write_color(fb, y, x, color, layer);
     }
 
-    /// Applies greyscale and emphasis to NES colour `color` and stores it; `sprite` (the pixel
-    /// shown is a sprite's, overlay and ESX sprites included) sets [`FRAME_SPRITE`].
+    /// Applies greyscale and emphasis to NES colour `color` and stores it with `layer`: 0 for
+    /// the backdrop, or [`FRAME_SPRITE_BEHIND`], [`FRAME_BG`], [`FRAME_SPRITE`].
     #[inline]
-    fn write_color(&self, fb: &mut [u16], y: usize, x: usize, color: u8, sprite: bool) {
+    fn write_color(&self, fb: &mut [u16], y: usize, x: usize, color: u8, layer: u16) {
         let mut color = color & 0x3F;
         if self.mask & 1 != 0 {
             color &= 0x30;
         }
-        fb[y * 256 + x] = color as u16 | ((self.mask as u16 & 0xE0) << 1) | if sprite { FRAME_SPRITE } else { 0 };
+        fb[y * 256 + x] = color as u16 | ((self.mask as u16 & 0xE0) << 1) | layer;
     }
 
     /// Rasterises the 8 sprite slots into `sp_buf`; lower slots win, as in hardware.
@@ -1296,10 +1315,57 @@ mod tests {
             }
         }
         assert_eq!(f[0] & 0x3F, 0x29, "backdrop colour");
-        assert_eq!((f[0] & !FRAME_SPRITE) >> 6, 0b111, "emphasis in bits 6-8");
+        assert_eq!(f[0] >> 6, 0b111, "emphasis in bits 6-8, no layer bit on the backdrop");
     }
 
-    /// `frame_layers` marks sprite pixels of a test ROM's picture and reading it changes nothing.
+    /// The layer of a pixel follows what the console stacks there: backdrop, a sprite behind
+    /// the background, background, a sprite in front; a background pixel of the backdrop's
+    /// own colour counts as backdrop.
+    #[test]
+    fn frame_layer_follows_the_priority_order() {
+        let mut chr = vec![0u8; 16];
+        chr[..8].fill(0xFF);
+        // `mask`: PPUMASK; `tile`: colour of the solid background tile's pixels.
+        let run = |mask: u8, tile: u8| {
+            let (mut p, mut c, mut f) = (Ppu::new(Region::Ntsc), cart_with_chr(&chr), fb());
+            for (addr, colour) in [(0x00, 0x21), (0x01, tile), (0x11, 0x16)] {
+                p.write_register(0x2006, 0x3F, &mut c);
+                p.write_register(0x2006, addr, &mut c);
+                p.write_register(0x2007, colour, &mut c);
+            }
+            p.write_register(0x2006, 0, &mut c);
+            p.write_register(0x2006, 0, &mut c);
+            p.write_register(0x2003, 0, &mut c);
+            for n in 0..64u8 {
+                // Sprite 0 in front at x 16, sprite 1 behind the background at x 48.
+                let s = match n {
+                    0 => [20, 0, 0x00, 16],
+                    1 => [20, 0, 0x20, 48],
+                    _ => [0xFF, 0, 0, 0],
+                };
+                for b in s {
+                    p.write_register(0x2004, b, &mut c);
+                }
+            }
+            p.write_register(0x2001, mask, &mut c);
+            for _ in 0..2 {
+                loop {
+                    p.tick(&mut c, &mut f);
+                    if p.take_frame_done() {
+                        break;
+                    }
+                }
+            }
+            // Front sprite, behind sprite, neither: (layer, colour).
+            [18, 50, 100].map(|x| (f[22 * WIDTH + x] >> FRAME_LAYER_SHIFT, f[22 * WIDTH + x] & 0x3F))
+        };
+        assert_eq!(run(0x14, 0x27), [(3, 0x16), (1, 0x16), (0, 0x21)], "sprites only");
+        assert_eq!(run(0x1E, 0x27), [(3, 0x16), (2, 0x27), (2, 0x27)], "the background hides the sprite behind it");
+        assert_eq!(run(0x1E, 0x21), [(3, 0x16), (0, 0x21), (0, 0x21)], "a background in the backdrop's colour is backdrop");
+    }
+
+    /// `frame_layers` hands out the layer bits of a test ROM's picture, and reading it changes
+    /// nothing.
     #[test]
     fn frame_layers_marks_sprites() {
         let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/roms"));
@@ -1311,12 +1377,13 @@ mod tests {
             b.run_frame([0; 4]);
             a.frame_layers(&mut layers);
         }
-        let ones = layers.iter().filter(|&&l| l == 1).count();
-        eprintln!("{LAYERS_ROM}: {ones} sprite pixels");
-        assert!(layers.iter().all(|&l| l <= 1));
-        assert!(ones > 0 && ones < layers.len() / 4, "{ones} sprite pixels");
+        let count = |layer: u8| layers.iter().filter(|&&l| l == layer).count();
+        let (tiles, sprites) = (count(2), count(1) + count(3));
+        eprintln!("{LAYERS_ROM}: {} backdrop, {tiles} background, {sprites} sprite pixels", count(0));
+        assert!(sprites > 0 && sprites < layers.len() / 4, "{sprites} sprite pixels");
+        assert!(tiles > 0, "{tiles} background pixels");
         for (l, w) in layers.iter().zip(a.frame()) {
-            assert_eq!(*l == 1, w & FRAME_SPRITE != 0);
+            assert_eq!(u16::from(*l), w >> FRAME_LAYER_SHIFT);
         }
         assert_eq!(a.state_hash(), b.state_hash());
         let (mut pa, mut pb) = (vec![0u8; layers.len() * 4], vec![0u8; layers.len() * 4]);

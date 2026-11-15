@@ -34,7 +34,7 @@ The library shows games as cards with their box art, which ebobo looks up by the
 
 On the Steam Deck everything works by touch, and text fields bring up ebobo's own keyboard (Steam's keyboard can't type into it in Game Mode). Your Steam name is the default nickname. In Desktop Mode Steam makes the Deck's buttons type keys; ebobo switches them to a gamepad while its window is in front and back when you leave.
 
-Settings > Enhance redraws the pixels in HD: smooth outlines instead of squares, with sprites kept apart from the background, and optionally soft shadows under characters and between the background layers. Settings > Effect turns the picture into an old CRT TV (curved glass, scanlines, glow), a flat studio monitor, or a handheld LCD. The two combine. When the picture leaves bars at the sides, they glow in its colours.
+Settings > Enhance redraws the pixels of NES and Mega Drive games in HD: smooth outlines instead of squares, with sprites kept apart from the background, and optionally soft shadows that characters, platforms and scenery cast on what is behind them. Settings > Effect turns the picture into an old CRT TV (curved glass, scanlines, glow), a flat studio monitor, or a handheld LCD. The two combine. When the picture leaves bars at the sides, they glow in its colours.
 
 ## Keys
 

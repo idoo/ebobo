@@ -919,8 +919,40 @@ mod tests {
         best.1
     }
 
+    /// The game named by `EBOBO_ENHANCE_ROM` (NES or Mega Drive) after `EBOBO_ENHANCE_FRAMES`
+    /// frames, with the pads of `EBOBO_ENHANCE_INPUT`: lines `<frame> <p1 hex> [p2 p3 p4]` in
+    /// the console's pad bits, each held until the next line (the headless runners' format).
+    fn env_shot() -> Option<Shot> {
+        let rom = std::fs::read(std::env::var("EBOBO_ENHANCE_ROM").ok()?).ok()?;
+        let frames: usize = std::env::var("EBOBO_ENHANCE_FRAMES").ok()?.parse().ok()?;
+        let script = std::env::var("EBOBO_ENHANCE_INPUT").ok().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let mut holds: Vec<(usize, [u16; 4])> = Vec::new();
+        for line in script.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            let mut words = line.split_whitespace();
+            let Some(Ok(frame)) = words.next().map(str::parse) else { continue };
+            let mut pads = [0u16; 4];
+            for (pad, word) in pads.iter_mut().zip(words) {
+                *pad = u16::from_str_radix(word, 16).unwrap_or(0);
+            }
+            holds.push((frame, pads));
+        }
+        let mut console = ebobo_console::Console::new(&rom, None).ok()?;
+        let mut pads = [0u16; 4];
+        for frame in 0..frames {
+            if let Some((_, p)) = holds.iter().find(|(f, _)| *f == frame) {
+                pads = *p;
+            }
+            console.run_frame(pads);
+        }
+        let (mut rgba, mut layers) = (Vec::new(), Vec::new());
+        let (w, h) = console.frame_rgba(&mut rgba);
+        console.frame_layers(&mut layers);
+        Some((rgba, layers, w, h))
+    }
+
     /// `cargo test --release -p ebobo enhance_snapshots -- --ignored --nocapture`: writes
-    /// `/tmp/ebobo-enhance-<name>-{raw,hd,depth,crop}.png` for the games that are on this disk.
+    /// `/tmp/ebobo-enhance-<name>-{raw,hd,depth,crop}.png` for the games that are on this disk,
+    /// and as `env` for the game `env_shot` names.
     #[test]
     #[ignore]
     fn enhance_snapshots() {
@@ -930,6 +962,7 @@ mod tests {
             ("nes-play", nes_shot(2700, &[])),
             ("md-platformer", md_shot("sgdk-platformer.bin", 300)),
             ("md-cave", md_shot("cave-story-md.gen", 600)),
+            ("env", env_shot()),
         ];
         let mut e = Enhancer::new();
         for (name, shot) in shots {

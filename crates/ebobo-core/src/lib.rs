@@ -131,8 +131,8 @@ impl Nes {
     }
 
     /// Last completed picture: `WIDTH * HEIGHT` entries, bits 0-5 palette index,
-    /// bits 6-8 PPUMASK colour emphasis, bit 15 set when the pixel shown is a sprite's
-    /// (see [`Nes::frame_layers`]; mask it off before using the word as a colour). Bits 9-14
+    /// bits 6-8 PPUMASK colour emphasis, bits 14-15 the layer the pixel belongs to (see
+    /// [`Nes::frame_layers`]; mask them off before using the word as a colour). Bits 9-13
     /// are 0.
     pub fn frame(&self) -> &[u16] {
         self.bus.frame()
@@ -144,11 +144,12 @@ impl Nes {
     }
 
     /// Which layer each pixel of the last completed picture came from, one byte per pixel
-    /// (`WIDTH * HEIGHT`): 0 = background, 1 = sprite. For display helpers; not emulated
-    /// state.
+    /// (`WIDTH * HEIGHT`), nearest the viewer last: 0 = the backdrop colour, 1 = a sprite
+    /// behind the background, 2 = background, 3 = a sprite in front. For display helpers;
+    /// not emulated state.
     pub fn frame_layers(&self, out: &mut [u8]) {
         for (o, px) in out.iter_mut().zip(self.bus.frame()) {
-            *o = (px >> 15) as u8;
+            *o = (px >> ppu::FRAME_LAYER_SHIFT) as u8;
         }
     }
 
