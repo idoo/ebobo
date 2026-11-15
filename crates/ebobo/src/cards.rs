@@ -125,7 +125,7 @@ const NAME_STEP_MS: u128 = 200;
 const NAME_REST: usize = 5;
 
 /// 7x7 star, bit 6 = leftmost pixel.
-const STAR: [u16; 7] = [0b0001000, 0b0001000, 0b1111111, 0b0111110, 0b0011100, 0b0110110, 0b0100010];
+pub(crate) const STAR: [u16; 7] = [0b0001000, 0b0001000, 0b1111111, 0b0111110, 0b0011100, 0b0110110, 0b0100010];
 /// 11x11 refresh arrow, bit 10 = leftmost pixel.
 const REFRESH: [u16; 11] = [
     0b00001111000,
@@ -749,7 +749,7 @@ impl Cards {
                     }
                 }
                 // Two builds of one game: the file's date tells them apart.
-                if games.iter().enumerate().any(|(j, other)| j != i && other.name == game.name) {
+                if games.iter().enumerate().any(|(j, other)| j != i && same_name(other.name, game.name)) {
                     let (year, month, day) = date(game.mtime);
                     let _ = write!(line, "  {day:02}.{month:02}.{year}");
                 }
@@ -806,8 +806,13 @@ fn fill(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, span: (i32, i32), color:
     }
 }
 
+/// Whether two game names are the same whatever their letter case (no allocation).
+fn same_name(a: &str, b: &str) -> bool {
+    a.chars().flat_map(char::to_lowercase).eq(b.chars().flat_map(char::to_lowercase))
+}
+
 /// A one-colour bitmap, `w` pixels wide (bit `w - 1` = leftmost), cut to the rows `span.0..span.1`.
-fn icon(c: &mut Canvas, x: i32, y: i32, rows: &[u16], w: i32, span: (i32, i32), color: Color) {
+pub(crate) fn icon(c: &mut Canvas, x: i32, y: i32, rows: &[u16], w: i32, span: (i32, i32), color: Color) {
     for (row, &bits) in rows.iter().enumerate() {
         let py = y + row as i32;
         if py < span.0 || py >= span.1 {
@@ -1487,5 +1492,12 @@ mod tests {
             }
         });
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_name_ignores_letter_case() {
+        assert!(same_name("Sonic the Hedgehog", "SONIC THE HEDGEHOG"));
+        assert!(same_name("Чип и Дейл", "ЧИП И ДЕЙЛ"));
+        assert!(!same_name("Sonic", "Sonic 2"));
     }
 }

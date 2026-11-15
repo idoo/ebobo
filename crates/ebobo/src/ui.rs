@@ -17,6 +17,7 @@ use crate::canvas::{Canvas, Color, Font};
 use crate::cards::{self, Cards};
 use crate::config::{is_steam_deck, Config, ScreenMode, SpriteLimit};
 use crate::crt::Effect;
+use crate::enhance::Mode;
 use crate::i18n::{Lang, S};
 use crate::input::{InputFrame, Nav, PadEvent, PadInfo, PadKind, PointerEvent};
 use crate::osk::{self, Charset, Osk, OskNav, OskOutput};
@@ -492,6 +493,12 @@ impl Ui {
     /// Main menu (no game running).
     pub fn show_main(&mut self) {
         self.stack = vec![Screen::Main];
+        self.press = None;
+    }
+
+    /// The solo library of cards over the main menu (`--library`).
+    pub fn show_library(&mut self) {
+        self.stack = vec![Screen::Main, Screen::Picker(Purpose::Solo)];
         self.press = None;
     }
 
@@ -1251,6 +1258,17 @@ impl Ui {
                 .to_string(),
                 true,
             ),
+            Item::value(
+                self.t(S::Enhance),
+                self.t(match cfg.enhance {
+                    Mode::Off => S::EnhanceOff,
+                    Mode::Hd => S::EnhanceHd,
+                    Mode::Depth => S::EnhanceDepth,
+                })
+                .to_string(),
+                true,
+            ),
+            Item::value(self.t(S::Ambient), onoff(cfg.ambient), true),
             Item::value(self.t(S::Volume), format!("{}%", (cfg.volume * 100.0).round() as u32), true),
             Item::value(self.t(S::Language), if self.lang == Lang::Ru { "Русский" } else { "English" }.to_string(), true),
             Item::new(self.t(S::Advanced)),
@@ -1299,7 +1317,7 @@ impl Ui {
             self.pop();
             return None;
         }
-        let confirm = self.menu_step(Screen::Settings, 8, nav);
+        let confirm = self.menu_step(Screen::Settings, 10, nav);
         let row = self.sel[Screen::Settings.slot()];
         let delta: i32 = if nav.right || confirm.is_some() { 1 } else if nav.left { -1 } else { 0 };
         let cfg = &mut *ctx.config;
@@ -1309,12 +1327,12 @@ impl Ui {
                 self.open_field(Field::Nick, nick);
                 None
             }
-            7 if confirm.is_some() => {
+            9 if confirm.is_some() => {
                 self.sel[Screen::Advanced.slot()] = 0;
                 self.push(Screen::Advanced);
                 None
             }
-            0 | 7 => None,
+            0 | 9 => None,
             _ if delta == 0 => None,
             1 => {
                 cfg.fullscreen = !cfg.fullscreen;
@@ -1337,6 +1355,14 @@ impl Ui {
                 Some(UiAction::ConfigChanged)
             }
             5 => {
+                cfg.enhance = if delta > 0 { cfg.enhance.next() } else { cfg.enhance.prev() };
+                Some(UiAction::ConfigChanged)
+            }
+            6 => {
+                cfg.ambient = !cfg.ambient;
+                Some(UiAction::ConfigChanged)
+            }
+            7 => {
                 let steps = ((cfg.volume * 10.0).round() as i32 + delta).clamp(0, 10);
                 let volume = steps as f32 / 10.0;
                 let changed = volume != cfg.volume;
@@ -1505,8 +1531,10 @@ impl Ui {
                 let base = self.t(S::Scanning);
                 f.draw(c, 64, 60, &format!("{base}{}", self.ticker()), WARN, 1);
             }
-            for (i, s) in [S::PutRomsIn, S::RomsHome, S::RomsDeck, S::RomsDownloads].into_iter().enumerate() {
-                f.draw(c, 16, 140 + i as i32 * 12, self.t(s), SEC, 1);
+            let lines = [S::PutRomsIn, S::PutRomsKinds, S::RomsHome, S::RomsDeck, S::RomsDeckMd, S::RomsDownloads];
+            // Six lines 10 px apart between "No games found" (y 124) and the detail line (y 196).
+            for (i, s) in lines.into_iter().enumerate() {
+                f.draw(c, 16, 136 + i as i32 * 10, self.t(s), SEC, 1);
             }
         }
     }
@@ -1581,7 +1609,8 @@ impl Ui {
     fn draw_settings(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 8, self.t(S::Settings), WHITE, 1);
         let items = self.settings_items(ctx.config);
-        Self::draw_rows(c, f, &items, self.sel[Screen::Settings.slot()], 28, 14, h);
+        // Ten rows 12 px apart end at y 140, above the gamepads list (taps stay MIN_TAP tall).
+        Self::draw_rows(c, f, &items, self.sel[Screen::Settings.slot()], 24, 12, h);
         f.draw(c, 16, 146, self.t(S::Gamepads), SEC, 1);
         if ctx.pads.is_empty() {
             f.draw(c, 24, 157, self.t(S::NoPads), DIS, 1);
@@ -1912,62 +1941,70 @@ impl Ui {
         }
     }
 
+    /// The library's hints: confirm (play, or host for the two hosting pickers), North with
+    /// a star (favourite), West search, the shoulders filter. No Back: it fits every pad.
+    fn library_hints(purpose: Purpose) -> [(Glyph, Option<S>); 4] {
+        let confirm = if matches!(purpose, Purpose::Solo) { S::HintPlay } else { S::HintHost };
+        [(Glyph::Confirm, Some(confirm)), (Glyph::North, None), (Glyph::West, Some(S::HintFind)), (Glyph::Shoulders, Some(S::Filter))]
+    }
+
     fn draw_hints(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, top: Option<Screen>, h: &mut Vec<(Area, Hit)>) {
-        let entries: Vec<(Glyph, S)> = if self.modal.is_some() {
-            vec![(Glyph::Confirm, S::Ok)]
+        let library = self.modal.is_none() && matches!(top, Some(Screen::Picker(_)));
+        let entries: Vec<(Glyph, Option<S>)> = if let Some(Screen::Picker(purpose)) = top.filter(|_| library) {
+            Self::library_hints(purpose).to_vec()
         } else {
-            match top {
-                None => return,
-                Some(Screen::Main) => vec![(Glyph::Confirm, S::Select)],
-                Some(Screen::Picker(_)) => vec![
-                    (Glyph::Confirm, S::Select),
-                    (Glyph::Back, S::Back),
-                    // By priority: what does not fit in 256 px is dropped from the end.
-                    (Glyph::North, S::Favourite),
-                    (Glyph::West, S::Search),
-                    (Glyph::Shoulders, S::Filter),
-                ],
-                Some(Screen::Code) => vec![(Glyph::Confirm, S::Join), (Glyph::Back, S::Back)],
-                Some(Screen::Field(_)) => vec![(Glyph::Confirm, S::Ok), (Glyph::Back, S::Back)],
-                Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 7 => {
-                    vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)]
-                }
-                Some(Screen::Advanced) if self.sel[Screen::Advanced.slot()] == 2 => {
-                    vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)]
-                }
-                Some(screen @ (Screen::Settings | Screen::Advanced)) if self.on_text_row(screen) => {
-                    vec![(Glyph::Confirm, S::Edit), (Glyph::Back, S::Back)]
-                }
-                Some(Screen::Settings | Screen::Advanced) => vec![(Glyph::LeftRight, S::Change), (Glyph::Back, S::Back)],
-                Some(Screen::NetCheck) if self.diag_running => vec![(Glyph::Back, S::Back)],
-                Some(Screen::NetCheck) => vec![(Glyph::Confirm, S::Recheck), (Glyph::Back, S::Back)],
-                Some(Screen::Lobby) => {
-                    let host = ctx.lobby.is_some_and(|l| l.is_host && l.stage == Stage::Lobby);
-                    let mut v = vec![(Glyph::Back, S::Leave)];
-                    if host && !self.resume_options.is_empty() && self.sel[Screen::Lobby.slot()] == 0 {
-                        v.insert(0, (Glyph::LeftRight, S::Change));
-                    } else if host {
-                        v.insert(0, (Glyph::Confirm, S::Start));
+            let plain: Vec<(Glyph, S)> = if self.modal.is_some() {
+                vec![(Glyph::Confirm, S::Ok)]
+            } else {
+                match top {
+                    None => return,
+                    Some(Screen::Main) => vec![(Glyph::Confirm, S::Select)],
+                    Some(Screen::Picker(_)) => unreachable!("the library's hints are chosen above"),
+                    Some(Screen::Code) => vec![(Glyph::Confirm, S::Join), (Glyph::Back, S::Back)],
+                    Some(Screen::Field(_)) => vec![(Glyph::Confirm, S::Ok), (Glyph::Back, S::Back)],
+                    Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 9 => {
+                        vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)]
                     }
-                    v
+                    Some(Screen::Advanced) if self.sel[Screen::Advanced.slot()] == 2 => {
+                        vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)]
+                    }
+                    Some(screen @ (Screen::Settings | Screen::Advanced)) if self.on_text_row(screen) => {
+                        vec![(Glyph::Confirm, S::Edit), (Glyph::Back, S::Back)]
+                    }
+                    Some(Screen::Settings | Screen::Advanced) => vec![(Glyph::LeftRight, S::Change), (Glyph::Back, S::Back)],
+                    Some(Screen::NetCheck) if self.diag_running => vec![(Glyph::Back, S::Back)],
+                    Some(Screen::NetCheck) => vec![(Glyph::Confirm, S::Recheck), (Glyph::Back, S::Back)],
+                    Some(Screen::Lobby) => {
+                        let host = ctx.lobby.is_some_and(|l| l.is_host && l.stage == Stage::Lobby);
+                        let mut v = vec![(Glyph::Back, S::Leave)];
+                        if host && !self.resume_options.is_empty() && self.sel[Screen::Lobby.slot()] == 0 {
+                            v.insert(0, (Glyph::LeftRight, S::Change));
+                        } else if host {
+                            v.insert(0, (Glyph::Confirm, S::Start));
+                        }
+                        v
+                    }
+                    Some(Screen::Pause) => vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Resume)],
+                    Some(Screen::ByIp) => vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)],
                 }
-                Some(Screen::Pause) => vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Resume)],
-                Some(Screen::ByIp) => vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)],
-            }
+            };
+            plain.into_iter().map(|(g, s)| (g, Some(s))).collect()
         };
         let y = 231;
-        // The library's five entries sit closer and may run to the edge of the canvas.
-        let (gap, right) = if self.modal.is_none() && matches!(top, Some(Screen::Picker(_))) { (8, 254) } else { (12, 250) };
+        // The library's entries sit closer, and keyboard keys show as pictograms there, so all
+        // four fit with every pad and the keyboard.
+        let (gap, space, right) = if library { (4, 2, 252) } else { (12, 4, 250) };
         let mut x = 8;
         for (glyph, s) in entries {
-            let label = self.t(s);
-            let gw = glyph_width(f, kind, glyph);
-            if x + gw + 4 + f.width(label, 1) > right {
+            let label = s.map(|s| self.t(s));
+            let lw = label.map_or(7, |l| f.width(l, 1));
+            let gw = glyph_width(f, kind, glyph, library);
+            if x + gw + space + lw > right {
                 break;
             }
             // The whole entry (glyph + label, padded into the gaps, down to the bottom edge)
             // is a button; LeftRight splits into a left and a right half.
-            let w = gw + 4 + f.width(label, 1) + gap;
+            let w = gw + space + lw + gap;
             let area = Area { x: x - gap / 2, y: 224, w, h: 16 };
             let keys: &[Key] = match glyph {
                 Glyph::Confirm => &[Key::Confirm],
@@ -1985,10 +2022,13 @@ impl Ui {
                 }
                 h.push((a, Hit::Key(*key)));
             }
-            draw_glyph(c, f, x, y, kind, glyph);
-            x += gw + 4;
-            f.draw(c, x, y, label, SEC, 1);
-            x += f.width(label, 1) + gap;
+            draw_glyph(c, f, x, y, kind, glyph, library);
+            x += gw + space;
+            match label {
+                Some(l) => f.draw(c, x, y, l, SEC, 1),
+                None => crate::cards::icon(c, x, y, &crate::cards::STAR, 7, (0, 240), WARN),
+            }
+            x += lw + gap;
         }
     }
 
@@ -2110,7 +2150,25 @@ fn glyph_label(kind: Option<PadKind>, glyph: Glyph) -> Option<&'static str> {
     })
 }
 
-fn glyph_width(f: &Font, kind: Option<PadKind>, glyph: Glyph) -> i32 {
+/// Return arrow, space bar and tab arrow, 7x7, bit 6 = leftmost pixel.
+const KEY_ENTER: [u8; 7] = [0b0000001, 0b0000001, 0b0010001, 0b0110001, 0b1111111, 0b0110000, 0b0010000];
+const KEY_SPACE: [u8; 7] = [0, 0, 0, 0b1000001, 0b1000001, 0b1111111, 0];
+const KEY_TAB: [u8; 7] = [0b0000001, 0b0001001, 0b0001101, 0b1111111, 0b0001101, 0b0001001, 0b0000001];
+
+/// A keyboard key drawn as a pictogram in the library's tight hint bar: Enter, Space, Tab.
+fn key_icon(kind: Option<PadKind>, glyph: Glyph, compact: bool) -> Option<&'static [u8; 7]> {
+    match (compact, kind, glyph) {
+        (true, None, Glyph::Confirm) => Some(&KEY_ENTER),
+        (true, None, Glyph::North) => Some(&KEY_SPACE),
+        (true, None, Glyph::Shoulders) => Some(&KEY_TAB),
+        _ => None,
+    }
+}
+
+fn glyph_width(f: &Font, kind: Option<PadKind>, glyph: Glyph, compact: bool) -> i32 {
+    if key_icon(kind, glyph, compact).is_some() {
+        return 11;
+    }
     match (glyph_label(kind, glyph), kind, glyph) {
         (_, _, Glyph::LeftRight) => 12,
         (Some(label), _, _) => f.width(label, 1) + 4,
@@ -2119,7 +2177,12 @@ fn glyph_width(f: &Font, kind: Option<PadKind>, glyph: Glyph) -> i32 {
     }
 }
 
-fn draw_glyph(c: &mut Canvas, f: &mut Font, x: i32, y: i32, kind: Option<PadKind>, glyph: Glyph) {
+fn draw_glyph(c: &mut Canvas, f: &mut Font, x: i32, y: i32, kind: Option<PadKind>, glyph: Glyph, compact: bool) {
+    if let Some(rows) = key_icon(kind, glyph, compact) {
+        c.fill_rect(x, y - 1, 11, 10, DIS_BAR);
+        bitmap(c, x + 2, y, rows, 7, WHITE);
+        return;
+    }
     if let Some(label) = glyph_label(kind, glyph) {
         c.fill_rect(x, y - 1, f.width(label, 1) + 4, 10, DIS_BAR);
         f.draw(c, x + 2, y, label, WHITE, 1);
@@ -2397,12 +2460,12 @@ mod tests {
         cfg.volume = 0.5;
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Main, Screen::Settings];
-        let volume_y = 28 + 5 * 14;
+        let volume_y = 24 + 7 * 12;
         let back = |ui: &Ui| {
             ui.regions
                 .iter()
                 .find_map(|(_, hit)| match hit {
-                    Hit::Row { i: 5, back, .. } => *back,
+                    Hit::Row { i: 7, back, .. } => *back,
                     _ => None,
                 })
                 .expect("volume row cycles")
@@ -2412,7 +2475,7 @@ mod tests {
         let (from, to) = back(&ui);
         assert_eq!(ui.update(&tap(from, volume_y), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(c.config.volume, 0.4);
-        assert_eq!(ui.sel[Screen::Settings.slot()], 5);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 7);
         redraw(&mut ui, &c);
         let (_, to2) = back(&ui);
         assert_eq!(ui.update(&tap(to2, volume_y), &mut c, DT), Some(UiAction::ConfigChanged));
@@ -2492,7 +2555,7 @@ mod tests {
                 ui.update(&nav(|n| n.down = true), &mut c, DT);
             }
             ui.update(&nav(|n| n.confirm = true), &mut c, DT);
-            for _ in 0..5 {
+            for _ in 0..7 {
                 ui.update(&nav(|n| n.down = true), &mut c, DT);
             }
             assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
@@ -2505,7 +2568,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 6;
+        ui.sel[Screen::Settings.slot()] = 8;
         let mut c = ctx(&mut cfg, &[], None);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(ui.lang, Lang::En);
@@ -2736,11 +2799,11 @@ mod tests {
     fn ui_settings_top_level_fits() {
         let cfg = Config::default();
         let ui = Ui::new(Lang::Ru);
-        assert_eq!(ui.settings_items(&cfg).len(), 8);
+        assert_eq!(ui.settings_items(&cfg).len(), 10);
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 7;
+        ui.sel[Screen::Settings.slot()] = 9;
         let mut c = ctx(&mut cfg, &[], None);
         ui.update(&nav(|n| n.confirm = true), &mut c, DT);
         assert_eq!(ui.stack.last(), Some(&Screen::Advanced));
@@ -2758,19 +2821,19 @@ mod tests {
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
         let mut c = ctx(&mut cfg, &[], None);
-        for _ in 0..6 {
+        for _ in 0..8 {
             assert_eq!(ui.update(&nav(|n| n.down = true), &mut c, DT), None);
         }
-        assert_eq!(ui.sel[Screen::Settings.slot()], 6);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 8);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
-        assert_eq!(ui.lang, Lang::En, "row 6 is Language");
+        assert_eq!(ui.lang, Lang::En, "row 8 is Language");
         ui.update(&nav(|n| n.down = true), &mut c, DT);
-        assert_eq!(ui.sel[Screen::Settings.slot()], 7);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 9);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
         assert_eq!(ui.stack.last(), Some(&Screen::Advanced));
         ui.pop();
         ui.update(&nav(|n| n.down = true), &mut c, DT);
-        assert_eq!(ui.sel[Screen::Settings.slot()], 0, "8 rows wrap");
+        assert_eq!(ui.sel[Screen::Settings.slot()], 0, "10 rows wrap");
     }
 
     #[test]
@@ -2851,7 +2914,7 @@ mod tests {
         }
         // Taps: the left part of the value steps back, the label area forward.
         redraw(&mut ui, &c);
-        let y = 28 + 4 * 14;
+        let y = 24 + 4 * 12;
         let (from, _) = ui
             .regions
             .iter()
@@ -2865,6 +2928,124 @@ mod tests {
         redraw(&mut ui, &c);
         assert_eq!(ui.update(&tap(30, y), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(c.config.effect, Effect::Off);
+    }
+
+    /// The rows after Effect: Enhance cycles both ways, by confirm and by taps; Ambient
+    /// toggles by button and tap; the rows below (Volume, Language) still do their job by tap.
+    #[test]
+    fn ui_enhance_and_ambient_rows() {
+        let mut cfg = Config::default();
+        cfg.volume = 0.5;
+        let mut ui = Ui::new(Lang::En);
+        ui.stack = vec![Screen::Main, Screen::Settings];
+        let mut c = ctx(&mut cfg, &[], None);
+        let items = ui.settings_items(c.config);
+        for (row, s) in [(4, S::Effect), (5, S::Enhance), (6, S::Ambient), (7, S::Volume), (8, S::Language), (9, S::Advanced)] {
+            assert_eq!(items[row].label, Lang::En.tr(s), "row {row}");
+        }
+        ui.sel[Screen::Settings.slot()] = 5;
+        assert_eq!(c.config.enhance, Mode::Off);
+        for want in [Mode::Hd, Mode::Depth, Mode::Off] {
+            assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
+            assert_eq!(c.config.enhance, want);
+        }
+        for want in [Mode::Depth, Mode::Hd, Mode::Off] {
+            assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::ConfigChanged));
+            assert_eq!(c.config.enhance, want);
+        }
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.enhance, Mode::Hd);
+        // Taps: the left part of the value steps back, the label area forward.
+        let y = |row: i32| 24 + row * 12;
+        redraw(&mut ui, &c);
+        let (from, _) = ui
+            .regions
+            .iter()
+            .find_map(|(_, hit)| match hit {
+                Hit::Row { i: 5, back, .. } => *back,
+                _ => None,
+            })
+            .expect("enhance row cycles");
+        assert_eq!(ui.update(&tap(from, y(5)), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.enhance, Mode::Off);
+        redraw(&mut ui, &c);
+        assert_eq!(ui.update(&tap(30, y(5)), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.enhance, Mode::Hd);
+        // Ambient light: on by default, buttons and a tap toggle it.
+        assert!(c.config.ambient);
+        ui.sel[Screen::Settings.slot()] = 6;
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert!(!c.config.ambient);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert!(c.config.ambient);
+        redraw(&mut ui, &c);
+        assert_eq!(ui.update(&tap(30, y(6)), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert!(!c.config.ambient);
+        // The rows below follow: Volume steps up, Language switches.
+        redraw(&mut ui, &c);
+        assert_eq!(ui.update(&tap(30, y(7)), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(c.config.volume, 0.6);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 7);
+        redraw(&mut ui, &c);
+        assert_eq!(ui.update(&tap(30, y(8)), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(ui.lang, Lang::Ru);
+        assert_eq!((c.config.enhance, c.config.ambient), (Mode::Hd, false), "untouched by the rows below");
+    }
+
+    #[test]
+    fn ui_show_library_opens_solo_library() {
+        let mut ui = Ui::new(Lang::En);
+        ui.show_pause();
+        ui.show_library();
+        assert_eq!(ui.stack, vec![Screen::Main, Screen::Picker(Purpose::Solo)]);
+        let mut cfg = Config::default();
+        let lib = library_with_builds();
+        let c = ctx(&mut cfg, &lib, None);
+        redraw(&mut ui, &c);
+        assert!(ui.regions.iter().any(|(_, hit)| *hit == Hit::Key(Key::Fav)), "the library's hints");
+    }
+
+    /// The library's hint bar keeps all four entries (no Back) and ends at x ≤ 252 with every
+    /// pad kind and the keyboard, in both languages and for every purpose.
+    #[test]
+    fn ui_library_hints_fit_every_pad() {
+        let mut font = Font::new();
+        let mut cfg = Config::default();
+        let lib = library_with_builds();
+        let kinds = [
+            Some(PadKind::PlayStation),
+            Some(PadKind::Xbox),
+            Some(PadKind::Nintendo),
+            Some(PadKind::SteamDeck),
+            Some(PadKind::Generic),
+            None,
+        ];
+        for lang in [Lang::Ru, Lang::En] {
+            for purpose in [Purpose::Solo, Purpose::Host, Purpose::Direct] {
+                for kind in kinds {
+                    let mut ui = Ui::new(lang);
+                    ui.stack = vec![Screen::Main, Screen::Picker(purpose)];
+                    let c = ctx(&mut cfg, &lib, None);
+                    let mut canvas = Canvas::new();
+                    ui.draw(&mut canvas, &mut font, &c, &InputFrame { hint_kind: kind, ..InputFrame::default() });
+                    let keys: Vec<(Area, Key)> = ui
+                        .regions
+                        .iter()
+                        .filter_map(|(a, hit)| match hit {
+                            Hit::Key(k) if a.y == 224 => Some((*a, *k)),
+                            _ => None,
+                        })
+                        .collect();
+                    for want in [Key::Confirm, Key::Fav, Key::Search, Key::PrevTab, Key::NextTab] {
+                        assert!(keys.iter().any(|(_, k)| *k == want), "{lang:?} {kind:?}: an entry dropped");
+                    }
+                    assert!(!keys.iter().any(|(_, k)| *k == Key::Back), "no Back hint in the library");
+                    // Each area reaches half the 4 px gap past its text.
+                    let end = keys.iter().map(|(a, _)| a.x + a.w - 2).max().unwrap_or(0);
+                    assert!(end <= 252, "{lang:?} {kind:?}: the last hint ends at {end}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2972,8 +3153,11 @@ mod tests {
             ("en", Lang::En, Some(PadKind::PlayStation), Purpose::Solo, false, ""),
             ("xbox-en", Lang::En, Some(PadKind::Xbox), Purpose::Solo, false, ""),
             ("keys-en", Lang::En, None, Purpose::Direct, false, ""),
+            ("keys-ru", Lang::Ru, None, Purpose::Host, false, ""),
+            ("nintendo-ru", Lang::Ru, Some(PadKind::Nintendo), Purpose::Host, false, ""),
             ("search-ru", Lang::Ru, Some(PadKind::SteamDeck), Purpose::Solo, false, "con"),
             ("empty-ru", Lang::Ru, Some(PadKind::PlayStation), Purpose::Solo, true, ""),
+            ("empty-en", Lang::En, None, Purpose::Solo, true, ""),
         ];
         for (name, lang, kind, purpose, empty, search) in cases {
             let mut ui = Ui::new(lang);
