@@ -141,6 +141,14 @@ impl Nes {
         palette::write_rgba(self.bus.frame(), self.info.region, out);
     }
 
+    /// Which layer each pixel of the last completed picture came from, one byte per pixel
+    /// (`WIDTH * HEIGHT`): 0 = background, 1 = sprite. For display helpers; not emulated
+    /// state.
+    pub fn frame_layers(&self, out: &mut [u8]) {
+        // Owner: layers slice (the PPU does not record it yet).
+        out.fill(0);
+    }
+
     /// Output sample rate of [`Nes::drain_audio`]. Fractional so the frontend can nudge it
     /// to keep the audio queue level.
     pub fn set_sample_rate(&mut self, hz: f64) {

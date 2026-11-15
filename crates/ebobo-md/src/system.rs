@@ -251,6 +251,23 @@ impl Md {
         (w, h)
     }
 
+    /// Which layer each pixel of the last finished picture came from, one byte per pixel,
+    /// row by row (`out` is resized to `width * height`): 0 = backdrop colour, 1 = plane B,
+    /// 2 = plane A or the window, 3 = sprite. For display helpers; not emulated state.
+    pub fn frame_layers(&self, out: &mut Vec<u8>) -> (usize, usize) {
+        let (w, h) = self.frame_size();
+        out.resize(w * h, 0);
+        if w == 0 {
+            return (w, h);
+        }
+        for (row, line) in out.chunks_exact_mut(w).zip(self.m.screen.px.chunks(MAX_W)) {
+            for (layer, &px) in row.iter_mut().zip(line) {
+                *layer = (px >> 24) as u8;
+            }
+        }
+        (w, h)
+    }
+
     /// Output sample rate in Hz. May be nudged every frame to keep the audio queue level.
     pub fn set_sample_rate(&mut self, hz: f64) {
         self.m.audio.set_sample_rate(hz);

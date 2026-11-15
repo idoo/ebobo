@@ -332,6 +332,22 @@ impl Console {
         }
     }
 
+    /// Which layer each pixel of the last finished picture came from, one byte per pixel,
+    /// row by row (`out` is resized to `width * height`), higher = nearer the viewer. NES:
+    /// 0 = background, 1 = sprite. Mega Drive: 0 = backdrop colour, 1 = plane B, 2 = plane A
+    /// or the window, 3 = sprite. For display helpers (edge-aware scaling, shadows); not
+    /// emulated state.
+    pub fn frame_layers(&self, out: &mut Vec<u8>) -> (usize, usize) {
+        match self {
+            Console::Nes(nes) => {
+                out.resize(nes::WIDTH * nes::HEIGHT, 0);
+                nes.frame_layers(out);
+                (nes::WIDTH, nes::HEIGHT)
+            }
+            Console::Md(md) => md.frame_layers(out),
+        }
+    }
+
     /// Output sample rate in Hz. May be nudged every frame to keep the audio queue level.
     pub fn set_sample_rate(&mut self, hz: f64) {
         match self {
