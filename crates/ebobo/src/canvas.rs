@@ -8,34 +8,99 @@ pub const H: usize = 240;
 /// RGBA8888.
 pub type Color = [u8; 4];
 
-/// The frame the window shows: game picture first, UI drawn on top.
+/// A picture the interface placed this frame (box art on a card); `Video` draws it under the canvas.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placed {
+    /// `(system as u64) << 32 | crc32`.
+    pub id: u64,
+    /// Its box in canvas pixels (may be partly outside the clip).
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// x, y, w, h actually visible, canvas pixels.
+    pub clip: (i32, i32, i32, i32),
+    /// Fills the box behind the picture (it is fitted inside, centred, proportions kept).
+    pub back: Color,
+    /// 255 = opaque (fade-in).
+    pub alpha: u8,
+}
+
+/// The interface layer: straight (non-premultiplied) RGBA, stretched over the picture rectangle.
+/// Transparent pixels show the layers below: the placed pictures, then the game.
 pub struct Canvas {
     /// `W * H * 4` bytes.
     pub px: Vec<u8>,
+    /// Pictures placed since the last `clear` / `clear_transparent`, in drawing order.
+    pub placed: Vec<Placed>,
 }
 
 impl Canvas {
+    /// Opaque black, nothing placed.
     pub fn new() -> Canvas {
-        Canvas { px: vec![0; W * H * 4] }
+        let mut c = Canvas { px: vec![0; W * H * 4], placed: Vec::new() };
+        c.clear([0, 0, 0, 255]);
+        c
     }
 
+    /// Fills every pixel with `color` and forgets the placed pictures.
     pub fn clear(&mut self, color: Color) {
         for p in self.px.chunks_exact_mut(4) {
             p.copy_from_slice(&color);
         }
+        self.placed.clear();
     }
 
-    /// Darkens everything by `amount` (0.0-1.0), for menus over the game.
+    /// Makes every pixel transparent black (the game shows through) and forgets the placed pictures.
+    pub fn clear_transparent(&mut self) {
+        self.px.fill(0);
+        self.placed.clear();
+    }
+
+    /// Records a picture and makes its `clip` rectangle (clipped to the canvas) transparent black: a hole
+    /// the picture shows through. What is drawn afterwards lands above the picture.
+    pub fn picture(&mut self, p: Placed) {
+        let (cx, cy, cw, ch) = p.clip;
+        let x0 = cx.max(0);
+        let y0 = cy.max(0);
+        let x1 = cx.saturating_add(cw).min(W as i32);
+        let y1 = cy.saturating_add(ch).min(H as i32);
+        if x0 < x1 && y0 < y1 {
+            let (x0, x1) = (x0 as usize, x1 as usize);
+            for row in y0 as usize..y1 as usize {
+                self.px[(row * W + x0) * 4..(row * W + x1) * 4].fill(0);
+            }
+        }
+        self.placed.push(p);
+    }
+
+    /// A black veil of alpha `amount` (0.0-1.0) over everything, for menus over the game: opaque pixels
+    /// darken, transparent ones become black with alpha `amount` (so the layers below darken as well).
     pub fn dim(&mut self, amount: f32) {
         let keep = ((1.0 - amount.clamp(0.0, 1.0)) * 256.0).round() as u32;
+        let veil = 256 - keep;
         for p in self.px.chunks_exact_mut(4) {
-            for c in &mut p[..3] {
-                *c = ((*c as u32 * keep + 128) >> 8) as u8;
+            let da = p[3] as u32;
+            if da == 255 {
+                for c in &mut p[..3] {
+                    *c = ((*c as u32 * keep + 128) >> 8) as u8;
+                }
+                continue;
             }
+            // Alpha of the result in 1/(255 * 256) units.
+            let den = veil * 255 + da * keep;
+            if den == 0 {
+                p.fill(0);
+                continue;
+            }
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * da * keep + den / 2) / den) as u8;
+            }
+            p[3] = ((den + 128) >> 8) as u8;
         }
     }
 
-    /// Alpha-blended filled rectangle, clipped to the canvas.
+    /// Filled rectangle composed "over" in straight alpha, clipped to the canvas.
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
         let x0 = x.max(0);
         let y0 = y.max(0);
@@ -55,10 +120,19 @@ impl Canvas {
             } else {
                 let inv = 255 - a;
                 for p in line.chunks_exact_mut(4) {
-                    for i in 0..3 {
-                        p[i] = ((color[i] as u32 * a + p[i] as u32 * inv + 127) / 255) as u8;
+                    let da = p[3] as u32;
+                    if da == 255 {
+                        for i in 0..3 {
+                            p[i] = ((color[i] as u32 * a + p[i] as u32 * inv + 127) / 255) as u8;
+                        }
+                        continue;
                     }
-                    p[3] = (a + (p[3] as u32 * inv + 127) / 255) as u8;
+                    // Alpha of the result in 1/(255 * 255) units; never 0 here (`a` > 0).
+                    let den = a * 255 + da * inv;
+                    for i in 0..3 {
+                        p[i] = ((color[i] as u32 * a * 255 + p[i] as u32 * da * inv + den / 2) / den) as u8;
+                    }
+                    p[3] = ((den + 127) / 255) as u8;
                 }
             }
         }
@@ -194,7 +268,7 @@ mod tests {
         out.extend_from_slice(&(data.len() as u32).to_be_bytes());
         out.extend_from_slice(kind);
         out.extend_from_slice(data);
-        out.extend_from_slice(&ebobo_core::cart::crc32(&[kind, data]).to_be_bytes());
+        out.extend_from_slice(&ebobo_console::nes::cart::crc32(&[kind, data]).to_be_bytes());
     }
 
     /// Minimal RGBA PNG: zlib with stored (uncompressed) deflate blocks.
@@ -289,5 +363,111 @@ mod tests {
         assert_eq!((at(20, 20), at(23, 22), at(21, 21), at(22, 21)), (9, 9, 0, 0));
         c.dim(0.5);
         assert_eq!(c.px[0], 128);
+    }
+
+    fn px(c: &Canvas, x: usize, y: usize) -> [u8; 4] {
+        let i = (y * W + x) * 4;
+        [c.px[i], c.px[i + 1], c.px[i + 2], c.px[i + 3]]
+    }
+
+    fn placed(clip: (i32, i32, i32, i32)) -> Placed {
+        Placed { id: (1 << 32) | 0xDEAD_BEEF, x: -10, y: -10, w: 44, h: 62, clip, back: [1, 2, 3, 255], alpha: 255 }
+    }
+
+    /// Values computed by the formulas the canvas had before it learned about transparency.
+    #[test]
+    fn canvas_blending_on_opaque_pixels_is_unchanged() {
+        let mut c = Canvas::new();
+        assert_eq!(px(&c, 0, 0), [0, 0, 0, 255]);
+        assert!(c.placed.is_empty());
+        c.clear([10, 20, 30, 255]);
+        c.fill_rect(0, 0, 1, 1, [200, 100, 50, 77]);
+        assert_eq!(px(&c, 0, 0), [67, 44, 36, 255]);
+        c.fill_rect(1, 0, 1, 1, [200, 100, 50, 255]);
+        assert_eq!(px(&c, 1, 0), [200, 100, 50, 255]);
+        c.clear([0, 0, 0, 255]);
+        c.fill_rect(0, 0, 1, 1, [255, 255, 255, 1]);
+        c.fill_rect(1, 0, 1, 1, [255, 255, 255, 254]);
+        c.fill_rect(2, 0, 1, 1, [255, 255, 255, 0]);
+        assert_eq!((px(&c, 0, 0), px(&c, 1, 0), px(&c, 2, 0)), ([1, 1, 1, 255], [254, 254, 254, 255], [0, 0, 0, 255]));
+
+        c.clear([255, 101, 7, 255]);
+        c.dim(0.5);
+        assert_eq!(px(&c, 3, 3), [128, 51, 4, 255]);
+        c.clear([200, 33, 0, 255]);
+        c.dim(0.25);
+        assert_eq!(px(&c, 3, 3), [150, 25, 0, 255]);
+        c.dim(0.0);
+        assert_eq!(px(&c, 3, 3), [150, 25, 0, 255]);
+        c.dim(1.0);
+        assert_eq!(px(&c, 3, 3), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn canvas_blending_on_transparent_pixels() {
+        let mut c = Canvas::new();
+        c.clear_transparent();
+        assert!(c.px.iter().all(|&b| b == 0));
+        // Translucent over nothing: the source colour with the source alpha.
+        c.fill_rect(0, 0, 2, 2, [200, 100, 50, 77]);
+        assert_eq!(px(&c, 1, 1), [200, 100, 50, 77]);
+        c.fill_rect(4, 0, 1, 1, [9, 8, 7, 255]);
+        assert_eq!(px(&c, 4, 0), [9, 8, 7, 255]);
+        // Half over half: alpha 3/4, the upper colour weighs twice the lower.
+        c.fill_rect(8, 0, 1, 1, [0, 0, 255, 128]);
+        c.fill_rect(8, 0, 1, 1, [255, 0, 0, 128]);
+        assert_eq!(px(&c, 8, 0), [170, 0, 85, 192]);
+
+        c.dim(0.5);
+        let hole = px(&c, 100, 100);
+        assert_eq!(&hole[..3], &[0, 0, 0]);
+        assert!((127..=129).contains(&hole[3]), "veil alpha {}", hole[3]);
+        assert_eq!(px(&c, 4, 0), [5, 4, 4, 255]);
+        c.clear_transparent();
+        c.dim(0.0);
+        assert_eq!(px(&c, 100, 100), [0, 0, 0, 0]);
+        c.dim(1.0);
+        assert_eq!(px(&c, 100, 100), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn canvas_picture_punches_its_clip_and_is_recorded() {
+        let bg = [0x14, 0x13, 0x1A, 255];
+        let mut c = Canvas::new();
+        c.clear(bg);
+        let p = placed((-4, -4, 10, 8));
+        c.picture(p);
+        assert_eq!(c.placed, vec![p]);
+        // The hole is the clip cut to the canvas: x 0..6, y 0..4.
+        assert_eq!(c.px.chunks_exact(4).filter(|q| q[3] == 0).count(), 24);
+        assert_eq!((px(&c, 0, 0), px(&c, 5, 3)), ([0, 0, 0, 0], [0, 0, 0, 0]));
+        assert_eq!((px(&c, 6, 3), px(&c, 5, 4)), (bg, bg));
+        // Nothing visible: recorded all the same, no pixel touched.
+        c.picture(placed((300, 10, 5, 5)));
+        c.picture(placed((10, 10, 0, -3)));
+        assert_eq!(c.placed.len(), 3);
+        assert_eq!(c.px.chunks_exact(4).filter(|q| q[3] == 0).count(), 24);
+
+        c.clear(bg);
+        assert!(c.placed.is_empty());
+        assert_eq!(px(&c, 0, 0), bg);
+        c.picture(p);
+        c.clear_transparent();
+        assert!(c.placed.is_empty());
+    }
+
+    #[test]
+    fn canvas_text_after_picture_lands_over_the_hole() {
+        let mut c = Canvas::new();
+        c.clear([0x14, 0x13, 0x1A, 255]);
+        c.picture(placed((16, 16, 44, 62)));
+        let mut font = Font::new();
+        font.draw(&mut c, 16, 16, "A", [255, 255, 255, 255], 1);
+        let cell: Vec<[u8; 4]> = (0..64).map(|i| px(&c, 16 + i % 8, 16 + i / 8)).collect();
+        let ink = cell.iter().filter(|q| **q == [255, 255, 255, 255]).count();
+        assert!(ink >= 5, "glyph has {ink} pixels");
+        assert_eq!(cell.iter().filter(|q| **q == [0, 0, 0, 0]).count(), 64 - ink);
+        c.rect(16, 16, 44, 62, [0xE4, 0x3B, 0x2C, 128]);
+        assert_eq!(px(&c, 59, 77), [0xE4, 0x3B, 0x2C, 128]);
     }
 }
