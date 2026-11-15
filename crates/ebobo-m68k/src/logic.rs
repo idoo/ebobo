@@ -46,9 +46,9 @@ fn divide_by_zero(cpu: &mut Cpu, bus: &mut impl Bus) -> Res<()> {
 }
 
 /// DIVU <ea>,Dn: Dn (32 bits) / source (16 bits), remainder in the high word, quotient in the low word. A quotient
-/// that does not fit leaves Dn, sets V (N and Z kept) and takes 10 cycles. Otherwise the time is that of the chip's
-/// restoring division: 76 cycles, plus 4 for every quotient bit of the first 15 that is 0, or 2 when it is 1 and
-/// no bit was shifted out of the dividend.
+/// that does not fit leaves Dn, sets N and V, clears Z and C and takes 10 cycles. Otherwise the time is that of the
+/// chip's restoring division: 76 cycles, plus 4 for every quotient bit of the first 15 that is 0, or 2 when it is 1
+/// and no bit was shifted out of the dividend.
 fn divu(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let divisor = word_source(cpu, bus, op)?;
     let n = reg9(op);
@@ -56,12 +56,13 @@ fn divu(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     if divisor == 0 {
         return divide_by_zero(cpu, bus);
     }
-    cpu.set_flag(sr::C, false);
     if dividend >> 16 >= divisor {
-        cpu.set_flag(sr::V, true);
+        cpu.set_flag(sr::Z | sr::C, false);
+        cpu.set_flag(sr::N | sr::V, true);
         cpu.idle(10 - 4);
         return Ok(());
     }
+    cpu.set_flag(sr::C, false);
     let hdivisor = divisor << 16;
     let mut work = dividend;
     let mut units = 38u32;
@@ -87,9 +88,11 @@ fn divu(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
 }
 
 /// DIVS <ea>,Dn: signed, the remainder has the sign of the dividend. A quotient that does not fit a signed word leaves
-/// Dn, sets V (N and Z kept) and takes 16 cycles, 18 for a negative dividend. The time of a whole division:
-/// 122 cycles, 2 more for a negative dividend, 2 less for a positive divisor with a positive dividend, 2 more for a
-/// positive divisor with a negative dividend, and 2 for every zero in the top 15 bits of the absolute quotient.
+/// Dn, sets N and V and clears Z and C. The chip sees that early only when the high word of the absolute dividend is
+/// not below the absolute divisor: 16 cycles, 18 for a negative dividend. Any other overflow is found after the whole
+/// division and costs what a division costs: 122 cycles, 2 more for a negative dividend, 2 less for a positive
+/// divisor with a positive dividend, 2 more for a positive divisor with a negative dividend, and 2 for every zero in
+/// the top 15 bits of the absolute quotient's low word.
 fn divs(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let divisor = word_source(cpu, bus, op)? as i16 as i32;
     let n = reg9(op);
@@ -97,24 +100,30 @@ fn divs(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     if divisor == 0 {
         return divide_by_zero(cpu, bus);
     }
-    cpu.set_flag(sr::C, false);
     let mut units = 6u32;
     if dividend < 0 {
         units += 1;
     }
-    let aquot = dividend.unsigned_abs() / divisor.unsigned_abs();
-    let negative = (dividend < 0) != (divisor < 0);
-    if aquot > 0x7FFF && !(negative && aquot == 0x8000) {
-        cpu.set_flag(sr::V, true);
+    let (adividend, adivisor) = (dividend.unsigned_abs(), divisor.unsigned_abs());
+    if adividend >> 16 >= adivisor {
+        cpu.set_flag(sr::Z | sr::C, false);
+        cpu.set_flag(sr::N | sr::V, true);
         cpu.idle((units + 2) * 2 - 4);
         return Ok(());
     }
+    let aquot = adividend / adivisor;
     units += 55;
     if divisor >= 0 {
         if dividend >= 0 { units -= 1 } else { units += 1 }
     }
     units += (!aquot & 0xFFFE).count_ones();
     cpu.idle(units * 2 - 4);
+    let negative = (dividend < 0) != (divisor < 0);
+    if aquot > 0x7FFF && !(negative && aquot == 0x8000) {
+        cpu.set_flag(sr::Z | sr::C, false);
+        cpu.set_flag(sr::N | sr::V, true);
+        return Ok(());
+    }
     let quot = dividend / divisor;
     let rem = dividend % divisor;
     cpu.set_d(n, Size::Long, (rem as u32 & 0xFFFF) << 16 | (quot as u32 & 0xFFFF));

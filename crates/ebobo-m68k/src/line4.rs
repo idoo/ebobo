@@ -205,9 +205,11 @@ fn nbcd(cpu: &mut Cpu, bus: &mut impl Bus, m: u8, r: u8) -> Res<()> {
     cpu.store(bus, ea, Size::Byte, rr & 0xFF)
 }
 
-/// CHK <ea>,Dn: the low word of Dn against 0 and the word operand; outside, exception 6. 10 + ea when inside, 38 + ea
-/// above the bound (checked first), 40 + ea below 0. After the read (an address error leaves the flags alone) Z is set
-/// from Dn = 0, V and C cleared; N is kept inside and is the sign of Dn on a trap.
+/// CHK <ea>,Dn: the low word of Dn against 0 and the word operand; outside, exception 6. The chip subtracts the
+/// operand from Dn first, then looks at Dn's sign. 10 + ea when inside. 38 + ea when Dn is above the bound, and also
+/// when Dn is negative and that subtraction overflowed (a positive bound far enough above); 40 + ea for the rest of
+/// the negative Dn. After the read (an address error leaves the flags alone) Z is set from Dn = 0, V and C cleared;
+/// N is the sign of Dn: clear inside and above the bound, set below 0.
 fn chk(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let (m, r) = (mode(op), reg(op));
     if !data(m, r) {
@@ -218,13 +220,12 @@ fn chk(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let bound = cpu.load(bus, ea, Size::Word)? as u16 as i16;
     cpu.set_flag(sr::Z, v == 0);
     cpu.set_flag(sr::V | sr::C, false);
-    if v > bound {
+    cpu.set_flag(sr::N, v < 0);
+    if v > bound || (v < 0 && v.checked_sub(bound).is_none()) {
         cpu.idle(14);
-        cpu.set_flag(sr::N, v < 0);
         cpu.exception(bus, 6)
     } else if v < 0 {
         cpu.idle(16);
-        cpu.set_flag(sr::N, true);
         cpu.exception(bus, 6)
     } else {
         cpu.idle(6);
