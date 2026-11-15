@@ -1,6 +1,7 @@
 //! Menus, lobby screen, pause menu, on-screen display and toasts, drawn on the 256x240 canvas.
 //! Gamepad-first (Steam Deck), keyboard works everywhere. Owner: ui slice (also owns i18n.rs).
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -13,6 +14,7 @@ use ebobo_net::{
 };
 
 use crate::canvas::{Canvas, Color, Font};
+use crate::cards::{self, Cards};
 use crate::config::{is_steam_deck, Config, ScreenMode, SpriteLimit};
 use crate::crt::Effect;
 use crate::i18n::{Lang, S};
@@ -140,13 +142,8 @@ const ERR: Color = rgb(0xE4, 0x50, 0x50);
 const SHADE: Color = [0, 0, 0, 170];
 const SLOT: [Color; 4] = [rgb(0x3B, 0x7B, 0xE4), rgb(0xE4, 0x3B, 0x2C), rgb(0x4C, 0xC6, 0x6A), rgb(0xE4, 0x6A, 0xB4)];
 
-const PICKER_ROWS: usize = 13;
-/// ROM picker row pitch: 14 canvas px ≈ 44 pt on the Deck's 1280x800 screen.
-const PICKER_STEP: i32 = 14;
 /// Smallest tap target height, canvas px (≈ 44 pt on the Deck).
 const MIN_TAP: i32 = 14;
-/// A press that moves this far (canvas px) on a list becomes a scroll drag, not a tap.
-const DRAG_START: i32 = 6;
 const TOAST_SECS: f32 = 2.5;
 const NICK_MAX: usize = 16;
 
@@ -177,37 +174,6 @@ fn trunc(s: &str, cols: usize) -> String {
         out.push_str("..");
         out
     }
-}
-
-/// `DD.MM` of a Unix time in the local time zone.
-#[cfg(unix)]
-fn day_month(unix_secs: u64) -> Option<String> {
-    use sdl2::libc;
-    let t = libc::time_t::try_from(unix_secs).ok()?;
-    // SAFETY: `tm` is plain integers (and a nullable pointer), so all-zero is a valid value;
-    // `localtime_r` only reads `t` and writes `tm`, both live for the call.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
-        return None;
-    }
-    Some(format!("{:02}.{:02}", tm.tm_mday, tm.tm_mon + 1))
-}
-
-/// No `localtime_r` outside Unix: no date is shown.
-#[cfg(not(unix))]
-fn day_month(_unix_secs: u64) -> Option<String> {
-    None
-}
-
-/// Date tag of picker row `i`: when the file arrived, only for a name another row shares
-/// (two builds of one game, e.g. an older copy and a newer one received from a host), so the
-/// player can tell them apart. The library is sorted by lower-cased name, so rows sharing a
-/// name are neighbours.
-fn build_date_tag(lib: &[RomEntry], i: usize) -> Option<String> {
-    let key = lib[i].name.to_lowercase();
-    let same = |j: usize| lib.get(j).is_some_and(|e| e.name.to_lowercase() == key);
-    let shared = i.checked_sub(1).is_some_and(same) || same(i + 1);
-    if shared { day_month(lib[i].mtime) } else { None }
 }
 
 /// Word wrap to `cols` characters per line.
@@ -252,6 +218,8 @@ enum Field {
     Addr,
     Nick,
     Server,
+    /// The library's search text.
+    Search,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +301,12 @@ enum Glyph {
     Confirm,
     Back,
     LeftRight,
+    /// North face button: favourite.
+    North,
+    /// West face button: search.
+    West,
+    /// The shoulder pair: previous / next filter.
+    Shoulders,
 }
 
 /// A rectangle on the canvas that takes taps and clicks.
@@ -359,6 +333,10 @@ enum Key {
     Right,
     Up,
     Down,
+    Fav,
+    Search,
+    PrevTab,
+    NextTab,
 }
 
 impl Key {
@@ -371,6 +349,10 @@ impl Key {
             Key::Right => n.right = true,
             Key::Up => n.up = true,
             Key::Down => n.down = true,
+            Key::Fav => n.fav = true,
+            Key::Search => n.search = true,
+            Key::PrevTab => n.prev_tab = true,
+            Key::NextTab => n.next_tab = true,
         }
         n
     }
@@ -379,7 +361,7 @@ impl Key {
 /// What a hit region does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hit {
-    /// Row `i` of the top screen's list (picker: library index). Press selects it, release
+    /// Row `i` of the top screen's list. Press selects it, release
     /// confirms; on a row that cycles a value, a release in `back` (x from..to, the left third of
     /// the value area) goes left, anywhere else right.
     Row { i: usize, back: Option<(i32, i32)>, enabled: bool },
@@ -397,18 +379,23 @@ enum Hit {
 #[derive(Clone, Copy, Debug)]
 struct Press {
     hit: Hit,
-    y0: i32,
-    /// Moved far enough on the ROM list to scroll it; the release then does not activate.
-    dragging: bool,
-    /// Rows already scrolled by this drag.
-    scrolled: i32,
 }
 
 pub struct Ui {
     lang: Lang,
     stack: Vec<Screen>,
     sel: [usize; 10],
-    picker_top: usize,
+    /// The library screen (one state for the three purposes).
+    cards: Cards,
+    /// The games list handed to `cards`, kept empty between frames for its allocation.
+    games: Vec<cards::Game<'static>>,
+    /// "Cannot run" texts of the library's unsupported NES games: (library index, mapper, text).
+    notes: Vec<(usize, u16, String)>,
+    /// Unix seconds, read from the system clock at every `update`.
+    now: u64,
+    /// Snapshot tests fix `now`.
+    #[cfg(test)]
+    now_pinned: bool,
     code: [Option<u8>; CODE_LEN],
     code_cur: usize,
     field: String,
@@ -457,7 +444,12 @@ impl Ui {
             lang,
             stack: Vec::new(),
             sel: [0; 10],
-            picker_top: 0,
+            cards: Cards::new(),
+            games: Vec::new(),
+            notes: Vec::new(),
+            now: unix_now(),
+            #[cfg(test)]
+            now_pinned: false,
             code: [None; CODE_LEN],
             code_cur: 0,
             field: String::new(),
@@ -494,6 +486,7 @@ impl Ui {
 
     pub fn set_lang(&mut self, lang: Lang) {
         self.lang = lang;
+        self.notes.clear();
     }
 
     /// Main menu (no game running).
@@ -544,8 +537,14 @@ impl Ui {
         !self.stack.is_empty() || self.modal.is_some()
     }
 
-    /// A text field (room code, IP, nickname, server) has focus.
+    /// The keyboard types into the interface: a text field (room code, IP, nickname, server,
+    /// search) has focus, or the library is on top (typing searches).
     pub fn wants_text_input(&self) -> bool {
+        self.field_focused() || (self.modal.is_none() && matches!(self.stack.last(), Some(Screen::Picker(_))))
+    }
+
+    /// A text field screen is on top.
+    fn field_focused(&self) -> bool {
         self.modal.is_none() && matches!(self.stack.last(), Some(Screen::Code | Screen::Field(_)))
     }
 
@@ -615,6 +614,7 @@ impl Ui {
 
     pub fn update(&mut self, input: &InputFrame, ctx: &mut UiCtx, dt: Duration) -> Option<UiAction> {
         self.clock += dt.as_secs_f32();
+        self.read_clock();
         // A gamepad press or a tap opens the next text field with the built-in keyboard,
         // Enter on a physical keyboard without it.
         if input.pad.used || input.pointer.iter().any(|e| matches!(e, PointerEvent::Up(_))) {
@@ -624,7 +624,7 @@ impl Ui {
         }
         // Taps and clicks become the button they stand for, so every screen handles them
         // exactly like the keyboard/gamepad.
-        let tapped = self.pointer(input, ctx);
+        let tapped = self.pointer(input);
         let synth;
         let input = if tapped == Nav::default() {
             input
@@ -637,8 +637,10 @@ impl Ui {
                 right: n.right || tapped.right,
                 confirm: n.confirm || tapped.confirm,
                 back: n.back || tapped.back,
-                // Taps only stand for the six keys above.
-                ..n
+                fav: n.fav || tapped.fav,
+                search: n.search || tapped.search,
+                prev_tab: n.prev_tab || tapped.prev_tab,
+                next_tab: n.next_tab || tapped.next_tab,
             };
             synth = InputFrame { nav, ..input.clone() };
             &synth
@@ -685,7 +687,7 @@ impl Ui {
                 }
                 None
             }
-            Screen::Picker(purpose) => self.update_picker(purpose, input, ctx),
+            Screen::Picker(purpose) => self.update_picker(purpose, input, ctx, dt),
             Screen::Code => self.update_code(input),
             Screen::ByIp => {
                 if nav.back {
@@ -782,7 +784,7 @@ impl Ui {
         h.clear();
         match top {
             Some(Screen::Main) => self.draw_main(canvas, font, ctx, &mut h),
-            Some(Screen::Picker(p)) => self.draw_picker(canvas, font, ctx, p, &mut h),
+            Some(Screen::Picker(p)) => self.draw_picker(canvas, font, ctx, p),
             Some(Screen::Code) => self.draw_code(canvas, font, &mut h),
             Some(Screen::ByIp) => self.draw_by_ip(canvas, font, ctx, &mut h),
             Some(Screen::Field(f)) => self.draw_field(canvas, font, f),
@@ -870,18 +872,13 @@ impl Ui {
 
     /// Mouse/touch on the regions of the last drawn frame: a press selects what it lands on,
     /// a release on the same region returns the button it stands for, a release elsewhere
-    /// cancels. On the ROM list a drag or the wheel scrolls.
-    fn pointer(&mut self, input: &InputFrame, ctx: &UiCtx) -> Nav {
-        let picker = match self.stack.last() {
-            Some(&Screen::Picker(p)) if self.modal.is_none() => Some(p),
-            _ => None,
-        };
-        let mut scroll = 0;
+    /// cancels. The library has no regions but its hint bar: it reads the pointer itself.
+    fn pointer(&mut self, input: &InputFrame) -> Nav {
         let mut out = Nav::default();
         for ev in &input.pointer {
             match *ev {
                 PointerEvent::Down(Some((x, y))) => {
-                    self.press = self.hit_at(x, y).map(|hit| Press { hit, y0: y, dragging: false, scrolled: 0 });
+                    self.press = self.hit_at(x, y).map(|hit| Press { hit });
                     if let Some(p) = self.press {
                         self.select(p.hit);
                     }
@@ -890,23 +887,11 @@ impl Ui {
                     self.press = None;
                     self.release_osk();
                 }
-                PointerEvent::Move(Some((_, y))) => {
-                    let Some(p) = self.press.as_mut().filter(|_| picker.is_some()) else { continue };
-                    if !p.dragging && (y - p.y0).abs() >= DRAG_START {
-                        p.dragging = true;
-                    }
-                    if p.dragging {
-                        // Content follows the finger: dragging up shows later rows.
-                        let rows = (p.y0 - y) / PICKER_STEP;
-                        scroll += rows - p.scrolled;
-                        p.scrolled = rows;
-                    }
-                }
-                PointerEvent::Move(None) => {}
+                PointerEvent::Move(_) | PointerEvent::Wheel(_) => {}
                 PointerEvent::Up(pos) => {
                     self.release_osk();
                     let Some(p) = self.press.take() else { continue };
-                    let Some((x, y)) = pos.filter(|_| !p.dragging) else { continue };
+                    let Some((x, y)) = pos else { continue };
                     if self.hit_at(x, y) == Some(p.hit) {
                         if let Hit::Osk(i) = p.hit {
                             self.osk_tap = Some(i);
@@ -916,11 +901,7 @@ impl Ui {
                         break;
                     }
                 }
-                PointerEvent::Wheel(dy) => scroll -= dy,
             }
-        }
-        if let (Some(purpose), true) = (picker, scroll != 0) {
-            self.scroll_picker(purpose, scroll, ctx.library.len());
         }
         out
     }
@@ -956,14 +937,6 @@ impl Ui {
             Hit::Row { .. } | Hit::Modal(_) => Key::Confirm.nav(),
             Hit::Key(k) => k.nav(),
         }
-    }
-
-    /// Scrolls the ROM list by `rows` (positive = later rows), keeping the selection on screen.
-    fn scroll_picker(&mut self, purpose: Purpose, rows: i32, n: usize) {
-        let max_top = (n + 1).saturating_sub(PICKER_ROWS) as i32;
-        self.picker_top = (self.picker_top as i32 + rows).clamp(0, max_top) as usize;
-        let sel = &mut self.sel[Screen::Picker(purpose).slot()];
-        *sel = (*sel).clamp(self.picker_top, self.picker_top + PICKER_ROWS - 1).min(n);
     }
 
     /// Up/down with wrap on the remembered selection; `Some(index)` on confirm.
@@ -1016,7 +989,7 @@ impl Ui {
         self.push(Screen::Field(field));
         self.open_osk(match field {
             Field::Addr => Charset::Address,
-            Field::Nick => Charset::Nickname,
+            Field::Nick | Field::Search => Charset::Nickname,
             Field::Server => Charset::Url,
         });
     }
@@ -1029,7 +1002,7 @@ impl Ui {
     }
 
     fn osk_shown(&self) -> bool {
-        self.osk.is_some() && self.wants_text_input()
+        self.osk.is_some() && self.field_focused()
     }
 
     fn release_osk(&mut self) {
@@ -1091,60 +1064,55 @@ impl Ui {
         Some(f)
     }
 
-    fn update_picker(&mut self, purpose: Purpose, input: &InputFrame, ctx: &UiCtx) -> Option<UiAction> {
-        let nav = input.nav;
-        if nav.back {
-            self.pop();
-            return None;
+    /// Reads the system clock into `now` (tests may have pinned it).
+    fn read_clock(&mut self) {
+        #[cfg(test)]
+        if self.now_pinned {
+            return;
         }
+        self.now = unix_now();
+    }
+
+    /// Brings `notes` in line with the library: nothing is allocated while it has not changed.
+    fn sync_notes(&mut self, lib: &[RomEntry]) {
+        let noted = |e: &RomEntry| !e.supported && matches!(e.system, ebobo_art::System::Nes);
+        let mut cached = self.notes.iter();
+        let same = lib.iter().enumerate().filter(|(_, e)| noted(e)).all(|(i, e)| cached.next().is_some_and(|n| n.0 == i && n.1 == e.mapper))
+            && cached.next().is_none();
+        if !same {
+            let word = self.lang.tr(S::Unsupported);
+            self.notes.clear();
+            self.notes.extend(lib.iter().enumerate().filter(|(_, e)| noted(e)).map(|(i, e)| (i, e.mapper, format!("{word} {}", e.mapper))));
+        }
+    }
+
+    fn update_picker(&mut self, purpose: Purpose, input: &InputFrame, ctx: &UiCtx, dt: Duration) -> Option<UiAction> {
         let lib = ctx.library;
-        let n = lib.len();
-        let total = n + 1; // last row: Rescan
-        let selectable = |i: usize| i == n || lib[i].supported;
-        let slot = Screen::Picker(purpose).slot();
-        let mut sel = self.sel[slot].min(n);
-        let step = |from: usize, fwd: bool| -> usize {
-            let mut i = from;
-            for _ in 0..total {
-                i = if fwd { (i + 1) % total } else { (i + total - 1) % total };
-                if selectable(i) {
-                    return i;
-                }
+        self.sync_notes(lib);
+        let mut games = recycle(std::mem::take(&mut self.games));
+        fill_games(&mut games, lib, &self.notes);
+        let action = self.cards.update(input, &games, &mut self.shelf, self.now, dt);
+        self.games = recycle(games);
+        match action? {
+            cards::Action::Start(i) => {
+                let entry = lib[i].clone();
+                Some(match purpose {
+                    Purpose::Solo => UiAction::PlaySolo(entry),
+                    Purpose::Host => UiAction::HostRoom(entry),
+                    Purpose::Direct => UiAction::HostDirect(entry),
+                })
             }
-            from
-        };
-        if !selectable(sel) {
-            sel = step(sel, true);
+            cards::Action::Rescan => Some(UiAction::Rescan),
+            cards::Action::Back => {
+                self.pop();
+                None
+            }
+            cards::Action::EditSearch => {
+                let text = self.cards.search().to_string();
+                self.open_field(Field::Search, text);
+                None
+            }
         }
-        if nav.up {
-            sel = step(sel, false);
-        }
-        if nav.down {
-            sel = step(sel, true);
-        }
-        if nav.left || nav.right {
-            let target = if nav.left { sel.saturating_sub(PICKER_ROWS) } else { (sel + PICKER_ROWS).min(n) };
-            sel = if selectable(target) { target } else { step(target, nav.right) };
-        }
-        self.sel[slot] = sel;
-        if sel < self.picker_top {
-            self.picker_top = sel;
-        } else if sel >= self.picker_top + PICKER_ROWS {
-            self.picker_top = sel + 1 - PICKER_ROWS;
-        }
-        self.picker_top = self.picker_top.min(total.saturating_sub(PICKER_ROWS));
-        if !nav.confirm {
-            return None;
-        }
-        if sel == n {
-            return Some(UiAction::Rescan);
-        }
-        let entry = lib[sel].clone();
-        Some(match purpose {
-            Purpose::Solo => UiAction::PlaySolo(entry),
-            Purpose::Host => UiAction::HostRoom(entry),
-            Purpose::Direct => UiAction::HostDirect(entry),
-        })
     }
 
     fn put_code_char(&mut self, c: char) {
@@ -1214,7 +1182,11 @@ impl Ui {
             self.pop();
             return None;
         }
-        let max = if field == Field::Nick { NICK_MAX } else { 200 };
+        let max = match field {
+            Field::Nick => NICK_MAX,
+            Field::Search => 24,
+            Field::Addr | Field::Server => 200,
+        };
         for c in input.paste.iter().flat_map(|p| p.chars()).chain(input.text.chars()) {
             if !c.is_control() && self.field.chars().count() < max {
                 self.field.push(c);
@@ -1242,6 +1214,12 @@ impl Ui {
                 }
                 self.pop();
                 Some(UiAction::ConfigChanged)
+            }
+            // Back leaves the search as it was; an empty text clears it.
+            Field::Search => {
+                self.cards.set_search(&value);
+                self.pop();
+                None
             }
         }
     }
@@ -1301,6 +1279,7 @@ impl Ui {
                 true,
             ),
             Item::value(self.t(S::AutoUpdate), self.t(if cfg.auto_update { S::On } else { S::Off }).to_string(), true),
+            Item::value(self.t(S::OnlineArt), self.t(if cfg.online_art { S::On } else { S::Off }).to_string(), true),
             Item::value(self.t(S::InputDelay), delay, true),
         ]
     }
@@ -1377,7 +1356,7 @@ impl Ui {
             self.pop();
             return None;
         }
-        let confirm = self.menu_step(Screen::Advanced, 7, nav);
+        let confirm = self.menu_step(Screen::Advanced, 8, nav);
         let cfg = &mut *ctx.config;
         match self.sel[Screen::Advanced.slot()] {
             0 => {
@@ -1411,6 +1390,10 @@ impl Ui {
                 Some(UiAction::ConfigChanged)
             }
             6 if confirm.is_some() || nav.left || nav.right => {
+                cfg.online_art = !cfg.online_art;
+                Some(UiAction::ConfigChanged)
+            }
+            7 if confirm.is_some() || nav.left || nav.right => {
                 let i = DELAYS.iter().position(|d| *d == cfg.input_delay).unwrap_or(0) as i32;
                 let delta = if nav.left { -1 } else { 1 };
                 cfg.input_delay = DELAYS[(i + delta).rem_euclid(DELAYS.len() as i32) as usize];
@@ -1504,86 +1487,27 @@ impl Ui {
         Self::draw_rows(c, f, &items, self.sel[Screen::Main.slot()], 88, 16, h);
     }
 
-    fn draw_picker(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, purpose: Purpose, h: &mut Vec<(Area, Hit)>) {
+    /// The library of cards; with no games at all also where to put them.
+    fn draw_picker(&mut self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, purpose: Purpose) {
         let title = self.t(match purpose {
             Purpose::Solo => S::PickRomSolo,
             Purpose::Host => S::PickRomHost,
             Purpose::Direct => S::PickRomDirect,
         });
-        f.draw(c, 8, 8, title, WHITE, 1);
         let lib = ctx.library;
-        let n = lib.len();
-        let count = format!("{}: {}", self.t(S::Found), n);
-        f.draw(c, 248 - f.width(&count, 1), 8, &count, if ctx.scanning { WARN } else { SEC }, 1);
-        c.fill_rect(8, 18, 240, 1, DIS_BAR);
-        let sel = self.sel[Screen::Picker(purpose).slot()].min(n);
-        if n == 0 {
-            let lines = [
-                (S::NoRoms, WHITE),
-                (S::PutRomsIn, SEC),
-                (S::RomsHome, SEC),
-                (S::RomsDeck, SEC),
-                (S::RomsDownloads, SEC),
-            ];
-            for (i, (s, col)) in lines.iter().enumerate() {
-                f.draw(c, 16, 32 + i as i32 * 14 + if i > 1 { 4 } else { 0 }, self.t(*s), *col, 1);
-            }
+        self.sync_notes(lib);
+        let mut games = recycle(std::mem::take(&mut self.games));
+        fill_games(&mut games, lib, &self.notes);
+        self.cards.draw(c, f, &games, &self.shelf, &mut self.art, self.lang, title, ctx.scanning, self.now);
+        self.games = recycle(games);
+        if lib.is_empty() {
             if ctx.scanning {
                 let base = self.t(S::Scanning);
-                f.draw(c, 16, 112, &format!("{base}{}", self.ticker()), WARN, 1);
+                f.draw(c, 64, 60, &format!("{base}{}", self.ticker()), WARN, 1);
             }
-            Self::draw_rows(c, f, &[Item::new(self.t(S::Rescan))], 0, 136, 16, h);
-            return;
-        }
-        let top = self.picker_top.min(n);
-        for row in 0..PICKER_ROWS {
-            let i = top + row;
-            if i > n {
-                break;
+            for (i, s) in [S::PutRomsIn, S::RomsHome, S::RomsDeck, S::RomsDownloads].into_iter().enumerate() {
+                f.draw(c, 16, 140 + i as i32 * 12, self.t(s), SEC, 1);
             }
-            let y = 26 + row as i32 * PICKER_STEP;
-            let selected = i == sel;
-            if selected {
-                c.fill_rect(8, y - 3, 240, PICKER_STEP, ACCENT);
-                f.draw(c, 10, y, ">", WHITE, 1);
-            }
-            let enabled = i == n || lib[i].supported;
-            h.push((row_area(y, PICKER_STEP), Hit::Row { i, back: None, enabled }));
-            if i == n {
-                f.draw(c, 20, y, self.t(S::Rescan), if selected { WHITE } else { SEC }, 1);
-                continue;
-            }
-            let e = &lib[i];
-            let (tag, tag_col) = if !e.supported {
-                (format!("{} {}", self.t(S::Unsupported), e.mapper), DIS)
-            } else if e.region.is_pal() {
-                ("PAL".to_string(), if selected { WHITE } else { WARN })
-            } else {
-                (String::new(), SEC)
-            };
-            // Right-aligned tags: the build date (only for names that repeat), then PAL or
-            // the unsupported mapper; the name gets whatever is left.
-            let date = build_date_tag(lib, i);
-            let date_w = date.as_deref().map_or(0, |d| f.width(d, 1));
-            let tag_w = f.width(&tag, 1);
-            let tags_w = tag_w + date_w + if tag_w > 0 && date_w > 0 { 8 } else { 0 };
-            let cols = ((244 - tags_w - 20 - if tags_w > 0 { 8 } else { 0 }) / 8) as usize;
-            let col = if !e.supported { DIS } else { WHITE };
-            f.draw(c, 20, y, &trunc(&e.name, cols), col, 1);
-            if let Some(date) = &date {
-                f.draw(c, 244 - tags_w, y, date, if selected { WHITE } else { SEC }, 1);
-            }
-            if tag_w > 0 {
-                f.draw(c, 244 - tag_w, y, &tag, tag_col, 1);
-            }
-        }
-        if n + 1 > PICKER_ROWS {
-            // Scroll position, 1 px track on the right edge.
-            let track = PICKER_ROWS as i32 * PICKER_STEP;
-            let thumb = (track * PICKER_ROWS as i32 / (n as i32 + 1)).max(4);
-            let y = 24 + (track - thumb) * top as i32 / (n + 1 - PICKER_ROWS) as i32;
-            c.fill_rect(250, 23, 1, track, DIS_BAR);
-            c.fill_rect(250, y - 1, 1, thumb, SEC);
         }
     }
 
@@ -1642,6 +1566,7 @@ impl Ui {
             Field::Addr => S::AddrTitle,
             Field::Nick => S::NickTitle,
             Field::Server => S::ServerTitle,
+            Field::Search => S::Search,
         });
         f.draw_centered(c, 48, title, WHITE, 1);
         c.fill_rect(8, 70, 240, 20, PANEL);
@@ -1994,7 +1919,14 @@ impl Ui {
             match top {
                 None => return,
                 Some(Screen::Main) => vec![(Glyph::Confirm, S::Select)],
-                Some(Screen::Picker(_)) => vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back), (Glyph::LeftRight, S::Page)],
+                Some(Screen::Picker(_)) => vec![
+                    (Glyph::Confirm, S::Select),
+                    (Glyph::Back, S::Back),
+                    // By priority: what does not fit in 256 px is dropped from the end.
+                    (Glyph::North, S::Favourite),
+                    (Glyph::West, S::Search),
+                    (Glyph::Shoulders, S::Filter),
+                ],
                 Some(Screen::Code) => vec![(Glyph::Confirm, S::Join), (Glyph::Back, S::Back)],
                 Some(Screen::Field(_)) => vec![(Glyph::Confirm, S::Ok), (Glyph::Back, S::Back)],
                 Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 7 => {
@@ -2024,21 +1956,26 @@ impl Ui {
             }
         };
         let y = 231;
+        // The library's five entries sit closer and may run to the edge of the canvas.
+        let (gap, right) = if self.modal.is_none() && matches!(top, Some(Screen::Picker(_))) { (8, 254) } else { (12, 250) };
         let mut x = 8;
         for (glyph, s) in entries {
             let label = self.t(s);
             let gw = glyph_width(f, kind, glyph);
-            if x + gw + 4 + f.width(label, 1) > 250 {
+            if x + gw + 4 + f.width(label, 1) > right {
                 break;
             }
             // The whole entry (glyph + label, padded into the gaps, down to the bottom edge)
             // is a button; LeftRight splits into a left and a right half.
-            let w = gw + 4 + f.width(label, 1) + 12;
-            let area = Area { x: x - 6, y: 224, w, h: 16 };
+            let w = gw + 4 + f.width(label, 1) + gap;
+            let area = Area { x: x - gap / 2, y: 224, w, h: 16 };
             let keys: &[Key] = match glyph {
                 Glyph::Confirm => &[Key::Confirm],
                 Glyph::Back => &[Key::Back],
                 Glyph::LeftRight => &[Key::Left, Key::Right],
+                Glyph::North => &[Key::Fav],
+                Glyph::West => &[Key::Search],
+                Glyph::Shoulders => &[Key::PrevTab, Key::NextTab],
             };
             let part = area.w / keys.len() as i32;
             for (k, key) in keys.iter().enumerate() {
@@ -2051,7 +1988,7 @@ impl Ui {
             draw_glyph(c, f, x, y, kind, glyph);
             x += gw + 4;
             f.draw(c, x, y, label, SEC, 1);
-            x += f.width(label, 1) + 12;
+            x += f.width(label, 1) + gap;
         }
     }
 
@@ -2154,40 +2091,64 @@ const PS_GREEN: Color = rgb(0x4C, 0xC6, 0x9A);
 const PS_PINK: Color = rgb(0xE8, 0x8C, 0xC8);
 const LETTER_A: [u8; 5] = [0b010, 0b101, 0b111, 0b101, 0b101];
 const LETTER_B: [u8; 5] = [0b110, 0b101, 0b110, 0b101, 0b110];
+const LETTER_X: [u8; 5] = [0b101, 0b101, 0b010, 0b101, 0b101];
+const LETTER_Y: [u8; 5] = [0b101, 0b101, 0b010, 0b010, 0b010];
+
+/// The text of a glyph drawn as a boxed label: keyboard keys, and the shoulder pair of a pad.
+fn glyph_label(kind: Option<PadKind>, glyph: Glyph) -> Option<&'static str> {
+    Some(match (kind, glyph) {
+        (_, Glyph::LeftRight) => return None,
+        (None, Glyph::Confirm) => "Enter",
+        (None, Glyph::Back) => "Esc",
+        (None, Glyph::North) => "Space",
+        (None, Glyph::West) => "A-Z",
+        (None, Glyph::Shoulders) => "Tab",
+        (Some(PadKind::PlayStation | PadKind::SteamDeck), Glyph::Shoulders) => "L1 R1",
+        (Some(PadKind::Nintendo), Glyph::Shoulders) => "L R",
+        (Some(PadKind::Xbox | PadKind::Generic), Glyph::Shoulders) => "LB RB",
+        (Some(_), _) => return None,
+    })
+}
 
 fn glyph_width(f: &Font, kind: Option<PadKind>, glyph: Glyph) -> i32 {
-    match (kind, glyph) {
-        (_, Glyph::LeftRight) => 12,
-        (None, Glyph::Confirm) => f.width("Enter", 1) + 4,
-        (None, Glyph::Back) => f.width("Esc", 1) + 4,
-        (Some(PadKind::PlayStation), _) => 8,
-        (Some(_), _) => 9,
+    match (glyph_label(kind, glyph), kind, glyph) {
+        (_, _, Glyph::LeftRight) => 12,
+        (Some(label), _, _) => f.width(label, 1) + 4,
+        (None, Some(PadKind::PlayStation), _) => 8,
+        (None, _, _) => 9,
     }
 }
 
 fn draw_glyph(c: &mut Canvas, f: &mut Font, x: i32, y: i32, kind: Option<PadKind>, glyph: Glyph) {
-    let confirm = matches!(glyph, Glyph::Confirm);
+    if let Some(label) = glyph_label(kind, glyph) {
+        c.fill_rect(x, y - 1, f.width(label, 1) + 4, 10, DIS_BAR);
+        f.draw(c, x + 2, y, label, WHITE, 1);
+        return;
+    }
     match (kind, glyph) {
         (_, Glyph::LeftRight) => {
             tri(c, x, y, SEC, false);
             tri(c, x + 7, y, SEC, true);
         }
-        (None, _) => {
-            let label = if confirm { "Enter" } else { "Esc" };
-            c.fill_rect(x, y - 1, f.width(label, 1) + 4, 10, DIS_BAR);
-            f.draw(c, x + 2, y, label, WHITE, 1);
-        }
         (Some(PadKind::PlayStation), _) => {
-            if confirm {
-                bitmap(c, x, y, &PS_CROSS, 8, PS_BLUE);
-            } else {
-                bitmap(c, x, y, &PS_CIRCLE, 8, PS_RED);
-            }
+            let (shape, col) = match glyph {
+                Glyph::Confirm => (&PS_CROSS, PS_BLUE),
+                Glyph::Back => (&PS_CIRCLE, PS_RED),
+                Glyph::North => (&PS_TRIANGLE, PS_GREEN),
+                _ => (&PS_SQUARE, PS_PINK),
+            };
+            bitmap(c, x, y, shape, 8, col);
         }
-        (Some(kind), _) => {
-            // South confirms; Nintendo prints B there, everyone else A.
-            let a = confirm != (kind == PadKind::Nintendo);
-            let col = if a { OK } else { ERR };
+        (kind, _) => {
+            // By position: south confirms, east goes back, north is the favourite, west the
+            // search. Nintendo prints B A X Y there, everyone else A B Y X.
+            let nintendo = kind == Some(PadKind::Nintendo);
+            let (letter, col) = match (glyph, nintendo) {
+                (Glyph::Confirm, false) | (Glyph::Back, true) => (&LETTER_A, OK),
+                (Glyph::Confirm, true) | (Glyph::Back, false) => (&LETTER_B, ERR),
+                (Glyph::North, false) | (Glyph::West, true) => (&LETTER_Y, WARN),
+                _ => (&LETTER_X, PS_BLUE),
+            };
             for dy in 0..9 {
                 for dx in 0..9 {
                     let (px, py) = (dx * 2 - 8, dy * 2 - 8);
@@ -2196,9 +2157,35 @@ fn draw_glyph(c: &mut Canvas, f: &mut Font, x: i32, y: i32, kind: Option<PadKind
                     }
                 }
             }
-            bitmap(c, x + 3, y + 1, if a { &LETTER_A } else { &LETTER_B }, 3, BG);
+            bitmap(c, x + 3, y + 1, letter, 3, BG);
         }
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The emptied list under another lifetime, keeping its allocation (the closure never runs:
+/// an in-place collect of nothing).
+fn recycle<'a, 'b>(mut games: Vec<cards::Game<'a>>) -> Vec<cards::Game<'b>> {
+    games.clear();
+    games.into_iter().map(|g| cards::Game { name: "", file: "", path: Path::new(""), note: None, key: g.key, pal: g.pal, runnable: g.runnable, mtime: g.mtime }).collect()
+}
+
+/// One card per library entry, in library order; `notes` as `Ui::sync_notes` leaves them.
+fn fill_games<'a>(out: &mut Vec<cards::Game<'a>>, lib: &'a [RomEntry], notes: &'a [(usize, u16, String)]) {
+    let mut notes = notes.iter().peekable();
+    out.extend(lib.iter().enumerate().map(|(i, e)| cards::Game {
+        key: ebobo_art::Key { system: e.system, crc32: e.crc32 },
+        name: &e.name,
+        file: e.path.file_stem().and_then(|s| s.to_str()).unwrap_or(&e.name),
+        path: &e.path,
+        pal: e.region.is_pal(),
+        runnable: e.supported,
+        note: notes.next_if(|n| n.0 == i).map(|n| n.2.as_str()),
+        mtime: e.mtime,
+    }));
 }
 
 #[cfg(test)]
@@ -2219,50 +2206,103 @@ mod tests {
         RomEntry { path: PathBuf::from(format!("/r/{crc32:08x}/{name}.nes")), crc32, mtime: unix_secs, ..entry(name, true, region) }
     }
 
-    /// Two builds of the Chip 'n Dale hack (newest first, as the library sorts them), one of
-    /// Contra and an unsupported game between unique names.
+    /// Two builds of the Chip 'n Dale hack and of Contra, and an unsupported game between
+    /// unique names.
     fn library_with_builds() -> Vec<RomEntry> {
         // 2026-11-14 12:00 and 2026-11-09 12:00 UTC: midday keeps the day in any zone ±11 h.
         let (new, old) = (1_794_657_600, 1_794_225_600);
         vec![
-            entry("Battletoads (USA)", true, Region::Ntsc),
+            build("Battletoads (USA)", 0x0101_0101, old, Region::Ntsc),
             build("Chip 'n Dale - Rescue Rangers 4P (Europe)", 0x1111_1111, new, Region::Pal),
             build("Chip 'n Dale - Rescue Rangers 4P (Europe)", 0x2222_2222, old, Region::Pal),
             build("Contra (USA)", 0x3333_3333, new, Region::Ntsc),
             build("contra (usa)", 0x4444_4444, old, Region::Ntsc),
-            entry("Kirby's Adventure (USA)", false, Region::Ntsc),
-            entry("Super Mario Bros. (World)", true, Region::Ntsc),
+            RomEntry { crc32: 0x5555_5555, ..entry("Kirby's Adventure (USA)", false, Region::Ntsc) },
+            build("Super Mario Bros. (World)", 0x6666_6666, old, Region::Ntsc),
         ]
     }
 
-    #[test]
-    fn ui_picker_dates_only_repeated_names() {
-        let lib = library_with_builds();
-        let tags: Vec<Option<String>> = (0..lib.len()).map(|i| build_date_tag(&lib, i)).collect();
-        let dated = |s: &str| Some(s.to_string());
-        assert_eq!(tags, [None, dated("14.11"), dated("09.11"), dated("14.11"), dated("09.11"), None, None]);
-        assert_eq!(build_date_tag(&lib[..1], 0), None, "a one-game library has no neighbours");
+    /// `n` runnable games "Game 00", "Game 01", ... with their own checksums.
+    fn games(n: u32) -> Vec<RomEntry> {
+        (0..n).map(|i| build(&format!("Game {i:02}"), i + 1, 0, Region::Ntsc)).collect()
+    }
+
+    fn library(purpose: Purpose) -> Ui {
+        let mut ui = Ui::new(Lang::En);
+        ui.stack = vec![Screen::Main, Screen::Picker(purpose)];
+        ui
     }
 
     #[test]
-    fn ui_picker_rows_with_builds() {
+    fn ui_library_starts_the_first_game_for_each_purpose() {
         let mut cfg = Config::default();
-        let lib = library_with_builds();
-        let mut ui = Ui::new(Lang::En);
-        ui.stack = vec![Screen::Main, Screen::Picker(Purpose::Host)];
+        let lib = games(3);
+        let confirm = nav(|n| n.confirm = true);
         let mut c = ctx(&mut cfg, &lib, None);
+        assert_eq!(library(Purpose::Solo).update(&confirm, &mut c, DT), Some(UiAction::PlaySolo(lib[0].clone())));
+        assert_eq!(library(Purpose::Host).update(&confirm, &mut c, DT), Some(UiAction::HostRoom(lib[0].clone())));
+        assert_eq!(library(Purpose::Direct).update(&confirm, &mut c, DT), Some(UiAction::HostDirect(lib[0].clone())));
+    }
+
+    #[test]
+    fn ui_library_rescan_tile_and_back() {
+        let mut cfg = Config::default();
+        let lib = games(1);
+        let mut ui = library(Purpose::Solo);
+        let mut c = ctx(&mut cfg, &lib, None);
+        // The tile after the only game is Rescan.
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), None);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::Rescan));
+        assert_eq!(ui.update(&nav(|n| n.back = true), &mut c, DT), None);
+        assert_eq!(ui.stack, vec![Screen::Main]);
+        // An empty library has the Rescan tile alone.
+        let mut ui = library(Purpose::Host);
+        let mut c = ctx(&mut cfg, &[], None);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::Rescan));
+    }
+
+    #[test]
+    fn ui_library_search_goes_through_the_text_field() {
+        let mut cfg = Config::default();
+        let lib = [build("Alpha", 1, 0, Region::Ntsc), build("Beta", 2, 0, Region::Ntsc)];
+        let mut ui = library(Purpose::Solo);
+        let mut c = ctx(&mut cfg, &lib, None);
+        assert!(ui.wants_text_input(), "a keyboard types into the library's search");
+        assert_eq!(ui.update(&nav(|n| n.search = true), &mut c, DT), None);
+        assert_eq!(ui.stack.last(), Some(&Screen::Field(Field::Search)));
+        // Typing (a space too) stays in the field; confirm hands the text to the library.
+        ui.update(&InputFrame { text: "be".into(), ..nav(|n| n.fav = true) }, &mut c, DT);
+        assert_eq!(ui.cards.search(), "");
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
+        assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
+        assert_eq!(ui.cards.search(), "be");
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::PlaySolo(lib[1].clone())), "only Beta is left");
+        // Leaving the field with Back keeps the search.
+        ui.update(&nav(|n| n.search = true), &mut c, DT);
+        ui.update(&InputFrame { text: "zzz".into(), ..InputFrame::default() }, &mut c, DT);
+        ui.update(&nav(|n| n.back = true), &mut c, DT);
+        assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
+        assert_eq!(ui.cards.search(), "be");
+    }
+
+    #[test]
+    fn ui_online_art_row_toggles() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::En);
+        ui.stack = vec![Screen::Settings, Screen::Advanced];
+        ui.sel[Screen::Advanced.slot()] = 6;
+        assert_eq!(ui.advanced_items(&cfg)[6].label, Lang::En.tr(S::OnlineArt));
+        let mut c = ctx(&mut cfg, &[], None);
+        assert!(c.config.online_art, "on by default");
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert!(!c.config.online_art);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert!(c.config.online_art);
+        // A tap on the row's value toggles it too.
         redraw(&mut ui, &c);
-        // One row per entry in library order, then Rescan.
-        let rows: Vec<usize> = ui.regions.iter().filter_map(|(_, hit)| match hit { Hit::Row { i, .. } => Some(*i), _ => None }).collect();
-        assert_eq!(rows, (0..=lib.len()).collect::<Vec<_>>());
-        // Down twice reaches the older Chip 'n Dale build; confirming hosts that file.
-        let down = nav(|n| n.down = true);
-        ui.update(&down, &mut c, DT);
-        ui.update(&down, &mut c, DT);
-        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::HostRoom(lib[2].clone())));
-        // A tap on the newer build's row hosts the newer one.
-        redraw(&mut ui, &c);
-        assert_eq!(ui.update(&tap(128, 26 + PICKER_STEP), &mut c, DT), Some(UiAction::HostRoom(lib[1].clone())));
+        let row = ui.regions.iter().find(|(_, hit)| matches!(hit, Hit::Row { i: 6, .. })).map(|(a, _)| *a).expect("row");
+        assert_eq!(ui.update(&tap(row.x + row.w - 4, row.y + 2), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert!(!c.config.online_art);
     }
 
     fn nav(f: impl FnOnce(&mut Nav)) -> InputFrame {
@@ -2388,33 +2428,23 @@ mod tests {
     }
 
     #[test]
-    fn ui_picker_scrolls_by_drag_and_wheel() {
+    fn ui_library_tap_starts_and_wheel_scrolls() {
         let mut cfg = Config::default();
-        let lib: Vec<RomEntry> = (0..40).map(|i| entry(&format!("Game {i}"), true, Region::Ntsc)).collect();
-        let mut ui = Ui::new(Lang::Ru);
-        ui.stack = vec![Screen::Main, Screen::Picker(Purpose::Solo)];
+        let lib = games(40);
+        let mut ui = library(Purpose::Solo);
         let mut c = ctx(&mut cfg, &lib, None);
         redraw(&mut ui, &c);
-        // Drag up by 5 rows: later games come into view, and the release starts nothing.
-        let y = 26 + 8 * PICKER_STEP;
-        let drag = [
-            PointerEvent::Down(Some((128, y))),
-            PointerEvent::Move(Some((128, y - 2 * PICKER_STEP))),
-            PointerEvent::Move(Some((128, y - 5 * PICKER_STEP))),
-            PointerEvent::Up(Some((128, y - 5 * PICKER_STEP))),
-        ];
-        assert_eq!(ui.update(&pointer(&drag), &mut c, DT), None);
-        assert_eq!(ui.picker_top, 5);
-        assert!(ui.sel[Screen::Picker(Purpose::Solo).slot()] >= 5);
-        // Wheel towards the user scrolls further down; past the end it stops.
-        ui.update(&pointer(&[PointerEvent::Wheel(-3)]), &mut c, DT);
-        assert_eq!(ui.picker_top, 8);
-        ui.update(&pointer(&[PointerEvent::Wheel(-100)]), &mut c, DT);
-        assert_eq!(ui.picker_top, 41 - PICKER_ROWS);
-        // A tap on the first visible row plays the game shown there.
+        // Press and release over the second tile of the first row.
+        assert_eq!(ui.update(&tap(80, 65), &mut c, DT), Some(UiAction::PlaySolo(lib[1].clone())));
+        // The wheel towards the user shows later rows and starts nothing.
+        assert_eq!(ui.update(&pointer(&[PointerEvent::Wheel(-3)]), &mut c, DT), None);
+        for _ in 0..20 {
+            assert_eq!(ui.update(&InputFrame::default(), &mut c, DT), None);
+        }
+        assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
         redraw(&mut ui, &c);
-        let first = ui.picker_top;
-        assert_eq!(ui.update(&tap(128, 26), &mut c, DT), Some(UiAction::PlaySolo(lib[first].clone())));
+        let Some(UiAction::PlaySolo(e)) = ui.update(&tap(32, 65), &mut c, DT) else { panic!("a tile under the tap") };
+        assert!(e.crc32 > 5, "the first row scrolled away: {}", e.name);
     }
 
     #[test]
@@ -2434,18 +2464,20 @@ mod tests {
     }
 
     #[test]
-    fn ui_picker_skips_unsupported() {
+    fn ui_library_cannot_start_unsupported() {
         let mut cfg = Config::default();
-        let lib = [entry("Bad", false, Region::Ntsc), entry("Good", true, Region::Ntsc)];
-        let mut ui = Ui::new(Lang::Ru);
-        ui.show_main();
+        let lib = [RomEntry { crc32: 9, ..entry("Bad", false, Region::Ntsc) }, build("Good", 2, 0, Region::Ntsc)];
+        let mut ui = library(Purpose::Solo);
         let mut c = ctx(&mut cfg, &lib, None);
-        ui.update(&nav(|n| n.down = true), &mut c, DT);
-        ui.update(&nav(|n| n.down = true), &mut c, DT);
-        ui.update(&nav(|n| n.confirm = true), &mut c, DT);
-        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::PlaySolo(lib[1].clone())));
-        // Moving up from Good wraps past Bad to Rescan.
-        assert_eq!(ui.update(&nav(|n| { n.up = true; n.confirm = true }), &mut c, DT), Some(UiAction::Rescan));
+        redraw(&mut ui, &c);
+        assert_eq!(ui.notes, [(0, 90, "mapper 90".to_string())]);
+        // Neither confirm on it nor a tap starts it.
+        if ui.cards.selected() == Some(0) {
+            assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
+        }
+        assert_eq!(ui.update(&tap(32, 65), &mut c, DT), None);
+        assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
+        assert_eq!(ui.update(&tap(80, 65), &mut c, DT), Some(UiAction::PlaySolo(lib[1].clone())));
     }
 
     #[test]
@@ -2778,7 +2810,7 @@ mod tests {
         ui.stack = vec![Screen::Settings, Screen::Advanced];
         ui.sel[Screen::Advanced.slot()] = 4;
         let items = ui.advanced_items(&cfg);
-        assert_eq!(items.len(), 7);
+        assert_eq!(items.len(), 8);
         let mut c = ctx(&mut cfg, &[], None);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(c.config.sprite_limit, SpriteLimit::Hardware);
@@ -2793,7 +2825,7 @@ mod tests {
         ui.sel[Screen::Advanced.slot()] = 4;
         ui.update(&nav(|n| n.left = true), &mut c, DT);
         assert_eq!(c.config.sprite_limit, SpriteLimit::Off);
-        ui.sel[Screen::Advanced.slot()] = 6;
+        ui.sel[Screen::Advanced.slot()] = 7;
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(c.config.input_delay, Some(1), "input delay moved to Advanced");
         ui.update(&nav(|n| n.left = true), &mut c, DT);
@@ -2925,23 +2957,40 @@ mod tests {
         std::fs::write(path, out).unwrap();
     }
 
-    /// The ROM picker with two builds of the same games, Russian and English
-    /// (`/tmp/ebobo-picker-dups-<lang>.png`): the older Chip 'n Dale build selected, dates
-    /// beside PAL, unique names untagged.
+    /// The library of cards (`/tmp/ebobo-library-<case>.png`, the interface layer alone:
+    /// pictures are holes): two builds of the same games with the older Chip 'n Dale build
+    /// selected (its date on the detail line), Russian and English with PlayStation hints,
+    /// English with Xbox and keyboard hints, a search, and the empty library while scanning.
     #[test]
     #[ignore]
-    fn ui_render_picker_dups_snapshots() {
+    fn ui_render_library_snapshots() {
         let mut font = Font::new();
         let mut cfg = Config::default();
         let lib = library_with_builds();
-        for (lang, code) in [(Lang::Ru, "ru"), (Lang::En, "en")] {
+        let cases = [
+            ("ru", Lang::Ru, Some(PadKind::PlayStation), Purpose::Host, false, ""),
+            ("en", Lang::En, Some(PadKind::PlayStation), Purpose::Solo, false, ""),
+            ("xbox-en", Lang::En, Some(PadKind::Xbox), Purpose::Solo, false, ""),
+            ("keys-en", Lang::En, None, Purpose::Direct, false, ""),
+            ("search-ru", Lang::Ru, Some(PadKind::SteamDeck), Purpose::Solo, false, "con"),
+            ("empty-ru", Lang::Ru, Some(PadKind::PlayStation), Purpose::Solo, true, ""),
+        ];
+        for (name, lang, kind, purpose, empty, search) in cases {
             let mut ui = Ui::new(lang);
-            ui.stack = vec![Screen::Main, Screen::Picker(Purpose::Host)];
-            ui.sel[Screen::Picker(Purpose::Host).slot()] = 2;
-            let c = ctx(&mut cfg, &lib, None);
+            ui.now_pinned = true;
+            ui.now = 1_794_657_600 + 2 * 86_400;
+            ui.stack = vec![Screen::Main, Screen::Picker(purpose)];
+            let mut c = ctx(&mut cfg, if empty { &[] } else { &lib }, None);
+            c.scanning = empty;
+            ui.cards.set_search(search);
+            if !empty && search.is_empty() {
+                ui.update(&nav(|n| n.right = true), &mut c, DT);
+                ui.update(&nav(|n| n.right = true), &mut c, DT);
+            }
             let mut canvas = Canvas::new();
-            ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
-            write_png(&format!("/tmp/ebobo-picker-dups-{code}.png"), &canvas.px, 256, 240);
+            canvas.clear(BG);
+            ui.draw(&mut canvas, &mut font, &c, &InputFrame { hint_kind: kind, ..InputFrame::default() });
+            write_png(&format!("/tmp/ebobo-library-{name}.png"), &canvas.px, 256, 240);
         }
     }
 
