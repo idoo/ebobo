@@ -205,17 +205,19 @@ fn nbcd(cpu: &mut Cpu, bus: &mut impl Bus, m: u8, r: u8) -> Res<()> {
     cpu.store(bus, ea, Size::Byte, rr & 0xFF)
 }
 
-/// CHK <ea>,Dn: the low word of Dn against 0 and the word operand; outside, exception 6. 10 + ea when inside. V and C
-/// cleared, Z kept, N set when it is below 0 (and, above the bound, from its sign).
+/// CHK <ea>,Dn: the low word of Dn against 0 and the word operand; outside, exception 6. 10 + ea when inside, 38 + ea
+/// above the bound (checked first), 40 + ea below 0. After the read (an address error leaves the flags alone) Z is set
+/// from Dn = 0, V and C cleared; N is kept inside and is the sign of Dn on a trap.
 fn chk(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let (m, r) = (mode(op), reg(op));
     if !data(m, r) {
         return Err(Fault::Illegal);
     }
+    let v = cpu.d(reg9(op), Size::Word) as u16 as i16;
     let ea = cpu.ea(bus, m, r, Size::Word)?;
     let bound = cpu.load(bus, ea, Size::Word)? as u16 as i16;
-    let v = cpu.d(reg9(op), Size::Word) as u16 as i16;
-    cpu.set_flag(sr::N | sr::V | sr::C, false);
+    cpu.set_flag(sr::Z, v == 0);
+    cpu.set_flag(sr::V | sr::C, false);
     if v > bound {
         cpu.idle(14);
         cpu.set_flag(sr::N, v < 0);
@@ -272,8 +274,9 @@ fn movem_to_mem(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
 }
 
 /// MOVEM memory to registers: D0 first, addresses going up, words sign-extended into the whole register, then one more
-/// word read past the last one. (An)+ leaves An past the last one. 12 + 4 (word) or 8 (long) for each register, plus
-/// the extension.
+/// word read past the last one. (An)+ leaves An past the last one; at an odd address the first read is an address
+/// error and An is left 2 past it, as the chip has stepped it. 12 + 4 (word) or 8 (long) for each register, plus the
+/// extension.
 fn movem_to_reg(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let (m, r) = (mode(op), reg(op));
     let size = if op & 0x0040 != 0 { Size::Long } else { Size::Word };
@@ -282,6 +285,9 @@ fn movem_to_reg(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     }
     let list = cpu.fetch16(bus)?;
     let mut addr = if m == 3 { cpu.a(r) } else { cpu.ea_addr(bus, m, r)? };
+    if m == 3 && addr & 1 != 0 {
+        cpu.set_a(r, addr.wrapping_add(2));
+    }
     for n in 0..16u8 {
         if list & (1 << n) == 0 {
             continue;
