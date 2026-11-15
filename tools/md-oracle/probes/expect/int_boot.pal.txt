@@ -1,0 +1,8 @@
+# reference emulator Genesis Plus GX v1.7.4 b9c2316, pal, 8 frames
+3A09
+0000
+0000
+0000
+0000
+0000
+0000

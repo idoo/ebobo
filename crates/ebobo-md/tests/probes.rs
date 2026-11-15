@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 const KNOWN_DIFF: &[(&str, &str)] = &[
     ("frame_cycles", "access timing inside an instruction (2 passes in 4202)"),
     ("vcounter", "H counter spacing: access timing inside an instruction"),
+    ("int_boot", "status word 0x3A08 vs 0x3608 at power-on; with the H interrupt off in the VDP from power-on and register 10 never \
+                  written the reference has no request waiting at line 16 (stage 2), ours one (V 0x10); the same after \
+                  register 10 = 0xFF is written in blanking (stage 3), so the request ours keeps comes from picture lines with \
+                  the interrupt off (open)"),
     ("blank_edges", "H-blank flag edges (both widths) agree on average within 0.5 H count over 12 lines each; single words differ by \
                     about 2 H counts, or by one poll-loop period (6-8) where the poll's phase lands on the other side of the edge: \
                     HV sample spacing, access timing inside an instruction"),

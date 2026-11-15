@@ -1,0 +1,7 @@
+# reference emulator Genesis Plus GX v1.7.4 b9c2316, ntsc-u, 12 frames
+0001
+0064
+0000
+0000
+0001
+0066
