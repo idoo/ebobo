@@ -8,7 +8,8 @@
 /// Master clocks per line.
 pub const LINE_CLOCKS: u32 = crate::MCLK_PER_LINE as u32;
 
-/// The point of a line whose state its row is drawn from: the left edge of the picture.
+/// The point of a line whose state its row is drawn from: the left edge of the picture. The vertical
+/// scroll is the exception: it is taken at the previous line's [`hint_point`] (`row_point` probe).
 pub const ROW_DRAW_POINT: u32 = 0;
 
 /// Lines per frame.

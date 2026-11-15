@@ -69,6 +69,9 @@ pub struct Vdp {
     cram: Vec<u16>,
     /// 40 entries, 11 bits each.
     vsram: Vec<u16>,
+    /// The vertical scroll the next row is drawn with: `vsram` as it stood at the previous line's
+    /// `hint_point` (the reference takes it there, not at the row's own start; `row_point` probe).
+    row_vsram: Vec<u16>,
     /// The first word of a two-word command was written.
     pending: bool,
     /// Command code CD5-CD0.
@@ -116,6 +119,7 @@ impl Vdp {
             vram: vec![0; 0x10000],
             cram: vec![0; 64],
             vsram: vec![0; 40],
+            row_vsram: vec![0; 40],
             pending: false,
             code: 0,
             addr: 0,
@@ -221,6 +225,7 @@ impl Vdp {
         }
         if self.fired & FIRED_HINT == 0 && self.mclk >= hint {
             self.fired |= FIRED_HINT;
+            self.row_vsram.copy_from_slice(&self.vsram);
             // The V counter steps here; the counter counts on the lines it then shows as
             // 0 to `active` (the step into line 0 counts already) and reloads on the others.
             if (self.line + 1) % self.lines() <= active {
@@ -249,7 +254,7 @@ impl Vdp {
                 regs: &self.regs,
                 vram: &self.vram,
                 cram: self.cram.as_slice().try_into().expect("64 colours"),
-                vsram: self.vsram.as_slice().try_into().expect("40 scroll words"),
+                vsram: self.row_vsram.as_slice().try_into().expect("40 scroll words"),
             };
             let mut screen = screen;
             for &r in rows {

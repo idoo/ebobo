@@ -19,6 +19,9 @@ const KNOWN_DIFF: &[(&str, &str)] = &[
     ("hint_pend", "counts and V bytes match; only H counter bytes differ: access timing inside an instruction"),
     ("fifo_rate", "one write slot off at the start: FIFO slot timing"),
     ("fifo_status", "FIFO empty flag one write early: FIFO slot timing"),
+    ("row_point", "HV words read after each write differ by a few H counts (poll phase: access timing inside an instruction); \
+                   the rows each write changes match, see tools/md-oracle/row_point.py"),
+    ("row_point_c", "as row_point"),
 ];
 
 /// Word 0 of the result block when the probe's `main` returned.
