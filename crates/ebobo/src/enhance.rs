@@ -74,9 +74,12 @@ const SHADOW_OFFSET_HALVES: usize = 3;
 const SHADOW_DARK: u32 = 102;
 /// Highest layer value the cores report.
 const TOP_LAYER: u8 = 3;
+/// Row bands a pass is split into: the calling thread takes the last, scoped threads the rest.
+/// The bands only change who computes a row, never its bytes.
+const BANDS: usize = 4;
 
-/// The enhancer and its buffers, which are reused from frame to frame: nothing is allocated
-/// once a picture of the same size has been through.
+/// The enhancer and its buffers, which are reused from frame to frame: no picture buffer is
+/// allocated once a picture of the same size has been through.
 #[derive(Default)]
 pub struct Enhancer {
     /// The source picture as `layer << 24 | 0x00RRGGBB` words.
@@ -84,17 +87,19 @@ pub struct Enhancer {
     /// After one MMPX pass, and after two.
     x2: Vec<u32>,
     x4: Vec<u32>,
-    /// One flag per source pixel of the row in work: its neighbourhood is not flat.
-    busy: Vec<u8>,
+    /// Per band: in MMPX one flag per source pixel of the row in work (its neighbourhood is
+    /// not flat), in the shadow one row of strengths.
+    scratch: [Vec<u8>; BANDS],
     /// The result, RGBA bytes.
     out: Vec<u8>,
     /// Shadow scratch: one row of occluder flags with zero margins, the last rows of their
-    /// horizontal sums, the running column sums, the blurred plane, one row of strengths.
+    /// horizontal sums, the running column sums, the blurred plane.
     pad: Vec<u32>,
     ring: Vec<u32>,
     col: Vec<u32>,
     soft: Vec<u32>,
-    strength: Vec<u8>,
+    /// Bands to use, 1..=`BANDS`; 0 means `BANDS`.
+    bands: usize,
 }
 
 impl Enhancer {
@@ -124,13 +129,18 @@ impl Enhancer {
             }
         }
 
+        let bands = if self.bands == 0 { BANDS } else { self.bands.min(BANDS) };
         self.x2.resize(n * 4, 0);
-        mmpx_2x(&self.src, w, h, &mut self.x2, &mut self.busy);
+        let src = &self.src;
+        banded(&mut self.x2, 4 * w, h, bands, &mut self.scratch, |y0, part, busy| mmpx_band(src, w, h, y0, part, busy));
         let (big, scale) = if h > MAX_ROWS_4X {
             (&self.x2, 2)
         } else {
             self.x4.resize(n * 16, 0);
-            mmpx_2x(&self.x2, w * 2, h * 2, &mut self.x4, &mut self.busy);
+            let x2 = &self.x2;
+            banded(&mut self.x4, 8 * w, 2 * h, bands, &mut self.scratch, |y0, part, busy| {
+                mmpx_band(x2, 2 * w, 2 * h, y0, part, busy)
+            });
             (&self.x4, 4)
         };
         let (bw, bh) = (w * scale, h * scale);
@@ -138,22 +148,55 @@ impl Enhancer {
 
         if mode == Mode::Depth && top > 0 {
             soften(big, bw, bh, scale, &mut self.pad, &mut self.ring, &mut self.col, &mut self.soft);
-            self.strength.resize(bw, 0);
+            let soft = &self.soft;
             let area = ((2 * scale + 1) * (2 * scale + 1)) as u32;
-            for y in 0..bh {
-                let row = &big[y * bw..][..bw];
-                let out = &mut self.out[y * bw * 4..][..bw * 4];
-                if shadow_row(&self.soft, row, y, bw, scale, top, &mut self.strength) {
-                    darken_row(row, &self.strength, area, out);
-                } else {
-                    unpack_row(row, out);
+            banded(&mut self.out, bw * 4, bh, bands, &mut self.scratch, |y0, part, strength| {
+                strength.resize(bw, 0);
+                for (i, out) in part.chunks_exact_mut(bw * 4).enumerate() {
+                    let y = y0 + i;
+                    let row = &big[y * bw..][..bw];
+                    if shadow_row(soft, row, y, bw, scale, top, strength) {
+                        darken_row(row, strength, area, out);
+                    } else {
+                        unpack_row(row, out);
+                    }
                 }
-            }
+            });
         } else {
-            unpack_row(big, &mut self.out);
+            banded(&mut self.out, bw * 4, bh, bands, &mut self.scratch, |y0, part, _| unpack_row(&big[y0 * bw..], part));
         }
         Enhanced { rgba: &self.out, w: bw, h: bh, scale: scale as u32 }
     }
+}
+
+/// Splits the first `rows` rows of `dst` (`row_len` items each) into up to `bands` runs of
+/// whole rows and calls `f(first_row, run, scratch)` for each: all runs but the last on scoped
+/// threads, the last on the calling thread. One band runs without any thread.
+fn banded<T: Send>(
+    dst: &mut [T],
+    row_len: usize,
+    rows: usize,
+    bands: usize,
+    scratch: &mut [Vec<u8>; BANDS],
+    f: impl Fn(usize, &mut [T], &mut Vec<u8>) + Sync,
+) {
+    let per = rows.div_ceil(bands.max(1)).max(1);
+    let dst = &mut dst[..rows * row_len];
+    if per >= rows {
+        f(0, dst, &mut scratch[0]);
+        return;
+    }
+    std::thread::scope(|s| {
+        let mut parts = dst.chunks_mut(per * row_len).zip(scratch.iter_mut()).enumerate();
+        let last = parts.next_back();
+        for (i, (part, sc)) in parts {
+            let f = &f;
+            s.spawn(move || f(i * per, part, sc));
+        }
+        if let Some((i, (part, sc))) = last {
+            f(i * per, part, sc);
+        }
+    });
 }
 
 /// Packed words to RGBA bytes (the layer is dropped, alpha is 255).
@@ -247,15 +290,22 @@ fn shadow_row(soft: &[u32], row: &[u32], y: usize, w: usize, scale: usize, top: 
 
 /// One MMPX pass: `src` (`w`×`h` words) magnified 2 times into `dst` (`2w`×`2h`). Outside the
 /// picture the nearest edge pixel repeats. `busy` is scratch (one byte per source column).
+#[cfg(test)]
 fn mmpx_2x(src: &[u32], w: usize, h: usize, dst: &mut [u32], busy: &mut Vec<u8>) {
+    mmpx_band(src, w, h, 0, &mut dst[..w * h * 4], busy);
+}
+
+/// Source rows `y0..` of one MMPX pass, as many as `dst` holds (4·`w` words per source row):
+/// the same words `mmpx_2x` writes there, whatever the band.
+fn mmpx_band(src: &[u32], w: usize, h: usize, y0: usize, dst: &mut [u32], busy: &mut Vec<u8>) {
     busy.clear();
     busy.resize(w, 0);
     let row = |y: isize| &src[y.clamp(0, h as isize - 1) as usize * w..][..w];
-    for y in 0..h {
-        let yi = y as isize;
+    for (band_y, out) in dst.chunks_exact_mut(4 * w).enumerate() {
+        let yi = (y0 + band_y) as isize;
         let rows = [row(yi - 3), row(yi - 2), row(yi - 1), row(yi), row(yi + 1), row(yi + 2), row(yi + 3)];
         let (up, mid, down) = (rows[2], rows[3], rows[4]);
-        let (out0, out1) = dst[y * 4 * w..][..4 * w].split_at_mut(2 * w);
+        let (out0, out1) = out.split_at_mut(2 * w);
 
         // The common case first, for the whole row: a pixel whose 3×3 neighbourhood is one
         // colour becomes four of itself. Both loops are branch-free so they vectorise.
@@ -619,6 +669,75 @@ mod tests {
         assert!(edge[0] > 60 && edge[0] < 100, "{edge:?}");
     }
 
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xCBF2_9CE4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01B3))
+    }
+
+    /// Four colours and four layers from a fixed generator, in 1- to 4-pixel runs: every rule gets its chance.
+    fn noise_shot(w: usize, h: usize) -> Shot {
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 20
+        };
+        let palette = [[0, 0, 0, 255], [255, 255, 255, 255], [200, 40, 40, 255], [40, 60, 220, 255]];
+        let (mut rgba, mut layers) = (Vec::new(), Vec::new());
+        let (mut colour, mut layer, mut run) = (0, 0, 0);
+        for _ in 0..w * h {
+            if run == 0 {
+                let n = next();
+                (colour, layer, run) = (n as usize & 3, (n >> 2 & 3) as u8, n >> 4 & 3);
+            } else {
+                run -= 1;
+            }
+            rgba.extend_from_slice(&palette[colour]);
+            layers.push(layer);
+        }
+        (rgba, layers, w, h)
+    }
+
+    /// The pictures whose output is pinned: both console sizes, noise, and a tall one (magnified 2 times).
+    fn pin_shots() -> [Shot; 4] {
+        [drawn_shot(256, 240), drawn_shot(320, 224), noise_shot(64, 48), noise_shot(48, 250)]
+    }
+
+    fn pins(mode: Mode) -> Vec<u64> {
+        let mut e = Enhancer::new();
+        pin_shots().iter().map(|(rgba, layers, w, h)| fnv(e.apply(mode, rgba, layers, *w, *h).rgba)).collect()
+    }
+
+    /// The Hd picture, byte for byte, as it was before the work was split into bands.
+    #[test]
+    fn enhance_hd_output_is_pinned() {
+        let sums = pins(Mode::Hd);
+        assert_eq!(sums, [0x484D_FC96_9008_311D, 0x8726_578A_88B0_4A4D, 0x2402_5786_5CFB_9655, 0xC577_9599_62E6_81BC], "{sums:#X?}");
+    }
+
+    /// The Depth picture is the same bytes on every machine.
+    #[test]
+    fn enhance_depth_output_is_pinned() {
+        let sums = pins(Mode::Depth);
+        assert_eq!(sums, [0x4A89_B8FA_E917_CAAD, 0xF4BF_D971_B077_8309, 0xF193_56AB_ADC8_F44C, 0xB0AC_8123_2E58_417C], "{sums:#X?}");
+    }
+
+    /// 1, 2, 3 and 4 bands give the same bytes, on a game picture when one is on this disk.
+    #[test]
+    fn enhance_bands_give_equal_output() {
+        let mut shots = pin_shots().to_vec();
+        shots.extend(md_shot("cave-story-md.gen", 600));
+        for (rgba, layers, w, h) in &shots {
+            for mode in [Mode::Hd, Mode::Depth] {
+                let mut e = Enhancer::new();
+                e.bands = 1;
+                let one = owned(e.apply(mode, rgba, layers, *w, *h));
+                for bands in 2..=BANDS {
+                    e.bands = bands;
+                    assert!(one == owned(e.apply(mode, rgba, layers, *w, *h)), "{mode:?} {w}x{h} in {bands} bands");
+                }
+            }
+        }
+    }
+
     #[test]
     fn enhance_is_deterministic() {
         let (w, h) = (40, 30);
@@ -695,25 +814,30 @@ mod tests {
     fn enhance_speed() {
         let shots = [
             ("NES 256x240", nes_shot(420, &[]).map(|s| (s, "game")).unwrap_or((drawn_shot(256, 240), "drawn"))),
-            ("NES 256x240 play", nes_shot(900, &[200, 400]).map(|s| (s, "game")).unwrap_or((drawn_shot(256, 240), "drawn"))),
+            ("NES 256x240 play", nes_shot(2700, &[]).map(|s| (s, "game")).unwrap_or((drawn_shot(256, 240), "drawn"))),
             ("MD 320x224", md_shot("sgdk-platformer.bin", 300).map(|s| (s, "game")).unwrap_or((drawn_shot(320, 224), "drawn"))),
             ("MD 320x224 cave", md_shot("cave-story-md.gen", 600).map(|s| (s, "game")).unwrap_or((drawn_shot(320, 224), "drawn"))),
         ];
         let mut e = Enhancer::new();
         for (name, ((rgba, layers, w, h), kind)) in &shots {
-            for mode in [Mode::Hd, Mode::Depth] {
+            for (mode, bands) in [(Mode::Hd, 1), (Mode::Hd, BANDS), (Mode::Depth, 1), (Mode::Depth, BANDS)] {
+                e.bands = bands;
                 let mut sum = 0u64;
                 e.apply(mode, rgba, layers, *w, *h);
-                let mut best = f64::MAX;
-                let started = Instant::now();
+                let mut times = Vec::new();
                 for _ in 0..200 {
                     let t = Instant::now();
                     let out = e.apply(mode, rgba, layers, *w, *h);
                     sum += u64::from(out.rgba[out.rgba.len() / 2]);
-                    best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+                    times.push(t.elapsed().as_secs_f64() * 1000.0);
                 }
-                let ms = started.elapsed().as_secs_f64() * 1000.0 / 200.0;
-                println!("{name} ({w}x{h}, {kind} picture) {:5}: {ms:.2} ms per frame, best {best:.2} ms [{sum}]", mode.name());
+                times.sort_by(f64::total_cmp);
+                println!(
+                    "{name} ({w}x{h}, {kind} picture) {:5} {bands} band(s): fastest {:.2} ms, median {:.2} ms [{sum}]",
+                    mode.name(),
+                    times[0],
+                    times[100]
+                );
             }
         }
     }
@@ -755,7 +879,8 @@ mod tests {
     fn enhance_snapshots() {
         let shots = [
             ("nes-title", nes_shot(420, &[])),
-            ("nes-play", nes_shot(900, &[200, 400])),
+            // The attract demo: real play, no input.
+            ("nes-play", nes_shot(2700, &[])),
             ("md-platformer", md_shot("sgdk-platformer.bin", 300)),
             ("md-cave", md_shot("cave-story-md.gen", 600)),
         ];
