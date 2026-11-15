@@ -68,8 +68,8 @@ pub enum Region {
 pub const MAX_W: usize = 320;
 pub const MAX_H: usize = 480;
 
-/// The library lists Mega Drive games only when this is true: set once games boot and play.
-pub const PLAYABLE: bool = false;
+/// The library lists Mega Drive games when this is true.
+pub const PLAYABLE: bool = true;
 
 /// Master clock in Hz.
 pub const MCLK_NTSC: u32 = 53_693_175;

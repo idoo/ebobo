@@ -755,15 +755,15 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Mega Drive images are picked up by extension, read and, while the Mega Drive core is
-    /// not playable (`ebobo_md::PLAYABLE` is false, so `identify` does not name them), skipped
-    /// without an error; the NES game next to them is listed.
+    /// Mega Drive images are picked up by any of their extensions and from a zip; copies of
+    /// one game make one entry; a `.bin` that is something else is skipped without an error.
     #[test]
-    fn library_mega_drive_image_is_skipped_for_now() {
+    fn library_lists_mega_drive_images() {
         let root = temp_dir("md");
         let mut image = vec![0u8; 0x400];
         image[0x100..0x110].copy_from_slice(b"SEGA MEGA DRIVE ");
-        assert_eq!(ebobo_console::identify(&image), None);
+        let id = ebobo_console::identify(&image).expect("a Mega Drive image");
+        assert_eq!(id.system, System::MegaDrive);
         for name in ["Sonic.md", "Sonic.gen", "Sonic.SMD", "Sonic.bin"] {
             fs::write(root.join(name), &image).unwrap();
         }
@@ -774,15 +774,18 @@ mod tests {
 
         let lib = Library::with_cache(vec![root.clone()], root.join("cache/library-cache.tsv"));
         wait(&lib);
-        let names: Vec<String> = lib.entries().into_iter().map(|e| e.name).collect();
-        assert_eq!(names, ["Mario"]);
-        assert_eq!(lib.entries()[0].system, System::Nes);
+        let entries = lib.entries();
+        let systems: Vec<System> = entries.iter().map(|e| e.system).collect();
+        assert_eq!(systems, [System::Nes, System::MegaDrive], "{entries:?}");
+        assert!(entries[1].name.starts_with("Sonic"));
+        assert!(entries[1].supported);
+        assert_eq!(entries[1].crc32, id.crc32);
         assert_eq!(lib.shared.reads.load(Ordering::Relaxed), 7, "every file with a ROM extension is read once");
         // The answer "not a ROM" is cached like any other.
         lib.rescan();
         wait(&lib);
         assert_eq!(lib.shared.reads.load(Ordering::Relaxed), 7);
-        assert!(lib.add_file(&root.join("Sonic.md")).is_err());
+        assert!(lib.add_file(&root.join("firmware.bin")).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 
