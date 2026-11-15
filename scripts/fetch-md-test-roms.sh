@@ -113,6 +113,37 @@ titan-overdrive.bin	https://files.scene.org/get/parties/2013/evoke13/wild/titan-
 titan-overdrive2.bin	https://files.scene.org/get/parties/2017/revision17/oldskool_demo/titan-overdrive2.zip	f722fc342bbd7008a743b9970e9ccaa7f2891c4b841126cb98d5dad93da45611	titan-overdrive2.bin
 # 240p Test Suite 1.21: video and audio hardware tests by Artemio Urbina; GPL; test patterns, scroll and sprite tests, 240p/480i switch, sound test; https://sourceforge.net/projects/testsuite240p/files/OldFiles/Sega_Genesis-MegaDrive-SegaCD_MegaCD/
 240p-suite.bin	https://downloads.sourceforge.net/project/testsuite240p/OldFiles/Sega_Genesis-MegaDrive-SegaCD_MegaCD/240pSuite-GenesisMD-1.21.zip	1776009ab324c18e4f046b4781fed11b897281f407ec04f2ac43649bcebae28f	240pSuite-1.21.bin
+# Demoscene productions by groups other than the two Titan demos above: free scene releases, each uploaded by its group to scene.org, untergrund.net or the group's own site (the pouet page links there). Hosts without tags: the SHA-256 is the pin.
+# The Spiral, 50 Hz version (2019): demo by Resistance, Evoke 2019; region E only, PAL frame timing; https://www.pouet.net/prod.php?which=82607
+rse-the-spiral-50hz.bin	https://resistance.no/releases/segamegadrive/The_Spiral_by_Resistance_2019_final.zip	2214da2f5d955821bcd8c51c3e8f45c47330316160ee0ed82683f9a1dc3a1332	The_Spiral_by_Resistance_2019_final_50Hz.bin
+# The Kessler Incident (2023): demo by Resistance, Xenium 2023; 6 MB image (above the 4 MB cartridge space); https://www.pouet.net/prod.php?which=94957
+rse-kessler-incident.bin	http://resistance.no/releases/segamegadrive/The_Kessler_Incident_by_Resistance_2023.zip	7bdf848ffd87c8a602513c81451dc832b2118fc62cc8eb900da55b8d5a04b868	The_Kessler_Incident_by_Resistance_2023.bin
+# Malabars Bumper (2016): demo by Resistance, Solskogen 2016; raster and scroll effects; https://www.pouet.net/prod.php?which=67778
+rse-malabars-bumper.bin	http://resistance.no/releases/segamegadrive/RSE-Malabars-Bumper.zip	5d91f0632d225cb3c8c6df49cd1447cc4f81a87ab3185f484c5a6e28528aecbf	RSE-Malabars-Bumper/RSE_Malabars-Bumper.bin
+# Zsenilia (2015): intro by Resistance, Under Construction 2015; https://www.pouet.net/prod.php?which=66742
+rse-zsenilia.bin	http://www.resistance.no/releases/segamegadrive/ZSENILIA-BY-RSE-2015.zip	5c4fa4d3b16fe94c9feb707e3cbb3ff6de04380c277dfa6155419228f887c988	ZSENILIA-BY-RSE-2015/ZSENILIA-BY-RSE-2015.bin
+# Convolved (2025): 32 KB intro by Resistance, 68k Inside 2025; https://www.pouet.net/prod.php?which=104189
+rse-convolved.bin	http://resistance.no/releases/segamegadrive/Convolved_intro_by_Resistance_2025.zip	20313914514a161e9f65b25a4f75888e9d3134962ac4be4ffe1b66419069109c	Convolved_intro_by_Resistance_2025.bin
+# Fullscreen NICCC 2000 for MegaDrive (2019): demo by Resistance (GliGli); polygon stream drawn over the whole frame; https://www.pouet.net/prod.php?which=81136
+rse-fullscreen-niccc.bin	http://sfx.gligli.free.fr/mddev/fullscreen_niccc2000_for_megadrive_by_RSE.zip	0e68aff4eff755d4f483d5954feb5f5f9b3e934a88d3496ea8f7928451d576d5	fullscreen_niccc2000_for_megadrive_fixed.bin
+# MD-NICCC (2019): demo by Titan, Revision 2019; region E only, software polygons uploaded by DMA; https://www.pouet.net/prod.php?which=81027
+titan-md-niccc.bin	https://ftp.untergrund.net/users/irokos/titan/titan-mdniccc.zip	6e0ad4b0e17a520d80a5d7aecc4861d29a146aa0c5213f00056288523d9a959d	titan-md-niccc.bin
+# MDMOD Player (2022): music disk by Titan, Nordlicht 2022; 4-channel sample playback through the DAC; https://www.pouet.net/prod.php?which=92359
+titan-mdmod-player.bin	https://ftp.untergrund.net/users/irokos/titan/titan-mdmodplayer.zip	ee4a03659938a735443f917ed9609d75d8a42d4329723f35007e10917fe08451	titan-mdmodplayer.bin
+# Stuck Somewhere in Time 1.3 (2014): demo by Up Rough, Insane and Titan, Compusphere 2014, uploaded by its coder Kabuto; region E only; https://www.pouet.net/prod.php?which=64438
+stuck-somewhere-in-time.bin	https://ftp.untergrund.net/users/kabuto/parties/2014/compusphere/stuck-somewhere-in-time_smd_v1.3.bin	5c2f5378a1c28b5b195c4cbd1104fb682304345eae8ef953fc1ff6ce11bb6366
+# Red Eyes (2019): music demo by Remute; region E only, sampled sound; https://www.pouet.net/prod.php?which=80580
+remute-red-eyes.bin	https://files.scene.org/get/demos/artists/remute/remute_redeyes.zip	ec4c069623d94e0ca219770ca70cbc6674d5f9a1bafb5388863922cc7ef39dfc	remute-redeyes.bin
+# Bad Apple!! part 1 (2012): full-motion video demo by FLM (Stephane Dallongeville), released with its source; tile streaming every frame, PCM through the DAC by a Z80 driver; https://www.pouet.net/prod.php?which=60780
+flm-bad-apple-p1.bin	https://files.scene.org/get/demos/groups/flm/flm-badapple-megadrive-bin-src.zip	f42ad29ccce340e4994b94ffdebfa2c79d734aec46b57582f21116774d64a802	BadApple_p1.bin
+# smell those douglas firs (2014): demo by Limp Ninja, Outline 2014; region E only; https://www.pouet.net/prod.php?which=63531
+limpninja-douglas-firs.bin	https://files.scene.org/get/parties/2014/outline14/wild/limpninja_-_smell_those_douglas_firs.zip	74fe4a2767c66894716d56b8db96b1bd3b349da85cb8a56c1c67a8924ed79ceb	wild_demo/limpninja_gigercounter.bin
+# Datastorm 2014 Invitation (2013): intro by Genesis Project; https://www.pouet.net/prod.php?which=61978
+datastorm-2014-invitation.bin	http://ag1976.com/files/datastorm_2014_invitation.zip	ffa22698a4aaf018790f256cd2d49efa27629b6df72965a8b6e164ad4369e528	datastorm_2014_invitation.bin
+# Work Without Rules (2017): music demo by Battle of the Bits; region EUR only; https://www.pouet.net/prod.php?which=72210
+botb-work-without-rules.bin	https://files.scene.org/get/demos/groups/battle_of_the_bits/workwithoutrules.bin	eaa44bbaabfb2a6057f7057f8dbcca30619453f7fecd3c2476868bf29e6e64e6
+# Silly Venture 2019 Invitation: intro by Mystic Bytes and Agenda, Deadline 2019; https://www.pouet.net/prod.php?which=83233
+sv2019-invitation.bin	https://files.scene.org/get/parties/2019/deadline19/oldschool_demo/sv2019inv.zip	e19463d90998835c827f626841faa7c7b903cf4ba5e68a9ea34801075e4d45fa	sv2019inv.bin
 EOF
 
 echo
