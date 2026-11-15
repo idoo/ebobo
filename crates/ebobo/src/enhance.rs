@@ -88,12 +88,12 @@ pub struct Enhancer {
     x2: Vec<u32>,
     x4: Vec<u32>,
     /// Per band: in MMPX one flag per source pixel of the row in work (its neighbourhood is
-    /// not flat), in the shadow one row of strengths.
-    scratch: [Vec<u8>; BANDS],
+    /// not flat), in the shadow one row of strengths and one blended mask row.
+    scratch: [Scratch; BANDS],
     /// The result, RGBA bytes.
     out: Vec<u8>,
     /// Shadow scratch: one row of occluder flags with zero margins, the last rows of their
-    /// horizontal sums, the running column sums, the blurred plane.
+    /// horizontal sums, the running column sums, the blurred mask (2 times the source size).
     pad: Vec<u32>,
     ring: Vec<u32>,
     col: Vec<u32>,
@@ -132,14 +132,14 @@ impl Enhancer {
         let bands = if self.bands == 0 { BANDS } else { self.bands.min(BANDS) };
         self.x2.resize(n * 4, 0);
         let src = &self.src;
-        banded(&mut self.x2, 4 * w, h, bands, &mut self.scratch, |y0, part, busy| mmpx_band(src, w, h, y0, part, busy));
+        banded(&mut self.x2, 4 * w, h, bands, &mut self.scratch, |y0, part, sc| mmpx_band(src, w, h, y0, part, &mut sc.bytes));
         let (big, scale) = if h > MAX_ROWS_4X {
             (&self.x2, 2)
         } else {
             self.x4.resize(n * 16, 0);
             let x2 = &self.x2;
-            banded(&mut self.x4, 8 * w, 2 * h, bands, &mut self.scratch, |y0, part, busy| {
-                mmpx_band(x2, 2 * w, 2 * h, y0, part, busy)
+            banded(&mut self.x4, 8 * w, 2 * h, bands, &mut self.scratch, |y0, part, sc| {
+                mmpx_band(x2, 2 * w, 2 * h, y0, part, &mut sc.bytes)
             });
             (&self.x4, 4)
         };
@@ -147,15 +147,17 @@ impl Enhancer {
         self.out.resize(bw * bh * 4, 0);
 
         if mode == Mode::Depth && top > 0 {
-            soften(big, bw, bh, scale, &mut self.pad, &mut self.ring, &mut self.col, &mut self.soft);
+            let mw = 2 * w;
+            soften(&self.x2, mw, 2 * h, &mut self.pad, &mut self.ring, &mut self.col, &mut self.soft);
             let soft = &self.soft;
-            let area = ((2 * scale + 1) * (2 * scale + 1)) as u32;
-            banded(&mut self.out, bw * 4, bh, bands, &mut self.scratch, |y0, part, strength| {
-                strength.resize(bw, 0);
+            let area = STRENGTH_FULL;
+            banded(&mut self.out, bw * 4, bh, bands, &mut self.scratch, |y0, part, sc| {
+                sc.bytes.resize(bw, 0);
+                let strength = &mut sc.bytes[..bw];
                 for (i, out) in part.chunks_exact_mut(bw * 4).enumerate() {
                     let y = y0 + i;
                     let row = &big[y * bw..][..bw];
-                    if shadow_row(soft, row, y, bw, scale, top, strength) {
+                    if shadow_row(soft, mw, row, y, scale, top, strength, &mut sc.words) {
                         darken_row(row, strength, area, out);
                     } else {
                         unpack_row(row, out);
@@ -177,8 +179,8 @@ fn banded<T: Send>(
     row_len: usize,
     rows: usize,
     bands: usize,
-    scratch: &mut [Vec<u8>; BANDS],
-    f: impl Fn(usize, &mut [T], &mut Vec<u8>) + Sync,
+    scratch: &mut [Scratch; BANDS],
+    f: impl Fn(usize, &mut [T], &mut Scratch) + Sync,
 ) {
     let per = rows.div_ceil(bands.max(1)).max(1);
     let dst = &mut dst[..rows * row_len];
@@ -220,17 +222,31 @@ fn darken_row(row: &[u32], strength: &[u8], area: u32, out: &mut [u8]) {
     }
 }
 
-/// One byte-wide counter per layer 1-3 in a word: what a pixel of that layer adds to the blur.
-const OCCLUDER: [u32; 4] = [0, 1, 1 << 8, 1 << 16];
+/// What one band keeps between rows.
+#[derive(Default)]
+struct Scratch {
+    bytes: Vec<u8>,
+    words: Vec<u32>,
+}
 
-/// Blurs the occluders of the magnified picture: `soft[i]` holds, for each layer 1-3 (bits
-/// 0-7, 8-15, 16-23), how many pixels of exactly that layer lie in the (2r+1)² box around
-/// pixel i, r = `scale` (about one source pixel). Outside the picture nothing occludes.
+/// One 10-bit counter per layer 1-3 in a word: what a pixel of that layer adds to the blur.
+/// Ten bits hold the 25 of a full box times the 16 of the sampling weights.
+const OCCLUDER: [u32; 4] = [0, 1, 1 << 10, 1 << 20];
+/// Blur radius in mask pixels (halves of a source pixel): a 5×5 box, about the 9×9 output
+/// pixels the blur covered when it ran at 4 times the source size.
+const MASK_RADIUS: usize = 2;
+/// Shadow strength under a full box: 25 occluders × 16 sampling weight, halved to fit a byte.
+const STRENGTH_FULL: u32 = 200;
+
+/// Blurs the occluders at 2 times the source size (`x2`, `w`×`h`: the picture after one MMPX
+/// pass, whatever the output scale): `soft[i]` holds, for each layer 1-3 (bits 0-9, 10-19,
+/// 20-29), how many pixels of exactly that layer lie in the 5×5 box around mask pixel i.
+/// Outside the picture nothing occludes.
 ///
 /// Blurring the occluder rather than the finished shadow is what keeps the soft edge off the
 /// occluder itself: a pixel only ever looks up the counters of layers above its own.
-#[allow(clippy::too_many_arguments)]
-fn soften(big: &[u32], w: usize, h: usize, r: usize, pad: &mut Vec<u32>, ring: &mut Vec<u32>, col: &mut Vec<u32>, soft: &mut Vec<u32>) {
+fn soften(big: &[u32], w: usize, h: usize, pad: &mut Vec<u32>, ring: &mut Vec<u32>, col: &mut Vec<u32>, soft: &mut Vec<u32>) {
+    let r = MASK_RADIUS;
     let n = 2 * r + 1;
     pad.clear();
     pad.resize(w + n, 0);
@@ -267,22 +283,55 @@ fn soften(big: &[u32], w: usize, h: usize, r: usize, pad: &mut Vec<u32>, ring: &
     }
 }
 
-/// Shadow strength of one output row (0..=(2·scale+1)²): a pixel of layer p is shadowed by
+/// Shadow strength of one output row (0..=`STRENGTH_FULL`): a pixel of layer p is shadowed by
 /// layer p + k as far as that layer covers the blur box `k * 1.5` source pixels up and to the
 /// left of it; the strongest occluder counts. One pass per height difference `k`. Returns
 /// whether any pixel of the row is in shadow.
-fn shadow_row(soft: &[u32], row: &[u32], y: usize, w: usize, scale: usize, top: u8, strength: &mut [u8]) -> bool {
+///
+/// The mask (`soft`, `mw` wide) is 2 times the source size. A 4x output pixel lies a quarter
+/// of a mask pixel off a mask centre, so it takes the four nearest mask values with weights
+/// 3:1 each way (16 in all); a 2x output pixel is a mask pixel and takes it 16 times. `t` is
+/// scratch: the two mask rows blended, with two zero columns in front.
+#[allow(clippy::too_many_arguments)]
+fn shadow_row(soft: &[u32], mw: usize, row: &[u32], y: usize, scale: usize, top: u8, strength: &mut [u8], t: &mut Vec<u32>) -> bool {
     strength.fill(0);
+    // Layer p + k is counted in bits 10(p+k-1)..; past layer 3 the shift runs off the counters.
+    let pick = |v: u32, p: u32, k: usize| (((u64::from(v) >> (((p >> 24) + k as u32 - 1) * 10)) as u32 & 0x3FF) >> 1) as u8;
     for k in 1..=usize::from(top) {
-        let d = k * scale * SHADOW_OFFSET_HALVES / 2;
-        if d > y || d >= w {
+        let d = k * SHADOW_OFFSET_HALVES;
+        // Mask rows r0 and r0 + 1 with weights w0 and w1 (of 4).
+        let (r0, w0, w1) = if scale == 4 {
+            let n = (y / 2) as isize - d as isize;
+            if y % 2 == 0 { (n - 1, 1, 3) } else { (n, 3, 1) }
+        } else {
+            (y as isize - d as isize, 4, 0)
+        };
+        if r0 + 1 < 0 || d >= mw {
             break;
         }
-        let from = &soft[(y - d) * w..][..w - d];
-        for ((s, &p), &b) in strength[d..].iter_mut().zip(&row[d..]).zip(from) {
-            // Layer p + k is counted in bits 8(p+k-1)..; past layer 3 the shift runs off the counters.
-            let shift = ((p >> 24) + k as u32 - 1) * 8;
-            *s = (*s).max((u64::from(b) >> shift) as u8);
+        t.clear();
+        t.resize(mw + 2, 0);
+        if r0 >= 0 {
+            for (o, &v) in t[2..].iter_mut().zip(&soft[r0 as usize * mw..][..mw]) {
+                *o = v * w0;
+            }
+        }
+        if w1 > 0 {
+            for (o, &v) in t[2..].iter_mut().zip(&soft[(r0 + 1) as usize * mw..][..mw]) {
+                *o += v * w1;
+            }
+        }
+        if scale == 4 {
+            // Output pixels 2m and 2m + 1 read mask columns m - d - 1 ..= m - d + 1, from m = d - 1.
+            let x0 = 2 * (d - 1);
+            for ((s, p), win) in strength[x0..].chunks_exact_mut(2).zip(row[x0..].chunks_exact(2)).zip(t.windows(3)) {
+                s[0] = s[0].max(pick(win[0] + 3 * win[1], p[0], k));
+                s[1] = s[1].max(pick(3 * win[1] + win[2], p[1], k));
+            }
+        } else {
+            for ((s, &p), &v) in strength[d..].iter_mut().zip(&row[d..]).zip(&t[2..]) {
+                *s = (*s).max(pick(4 * v, p, k));
+            }
         }
     }
     strength.iter().fold(0, |a, &s| a | s) != 0
@@ -656,16 +705,17 @@ mod tests {
                 changed += 1;
                 assert!(!sprite(x / 4, y / 4), "the sprite shadows itself at {x},{y}");
                 assert!(b[0] < a[0] && b[1] < a[1] && b[2] < a[2] && b[3] == 255, "not darker at {x},{y}");
-                // The offset is 6 output pixels and the soft edge 4: the shadow reaches from 2 to
-                // 10 pixels past the sprite's edges, down and to the right only.
-                assert!((34..66).contains(&x) && (34..66).contains(&y), "a shadow up or left of the sprite at {x},{y}");
+                // The offset is 6 output pixels, the blur 4 and the sampling of the half-size mask
+                // up to 2 more: the shadow reaches from 1 to 11 pixels past the sprite's edges,
+                // down and to the right only.
+                assert!((33..67).contains(&x) && (33..67).contains(&y), "a shadow up or left of the sprite at {x},{y}");
             }
         }
         assert!(changed > 100, "{changed} pixels in shadow");
         // Deep in the shadow the colour is down to 60 %.
-        assert_eq!(&depth[(57 * bw + 57) * 4..][..4], [60, 90, 120, 255]);
+        assert_eq!(&depth[(56 * bw + 56) * 4..][..4], [60, 90, 120, 255]);
         // The edge is soft: further out it is lighter but still shadowed.
-        let edge = &depth[(57 * bw + 63) * 4..][..4];
+        let edge = &depth[(56 * bw + 63) * 4..][..4];
         assert!(edge[0] > 60 && edge[0] < 100, "{edge:?}");
     }
 
@@ -717,7 +767,7 @@ mod tests {
     #[test]
     fn enhance_depth_output_is_pinned() {
         let sums = pins(Mode::Depth);
-        assert_eq!(sums, [0x4A89_B8FA_E917_CAAD, 0xF4BF_D971_B077_8309, 0xF193_56AB_ADC8_F44C, 0xB0AC_8123_2E58_417C], "{sums:#X?}");
+        assert_eq!(sums, [0x5E01_2F6D_15A4_B03D, 0x0F95_9E16_C5FD_1E69, 0x3836_1D88_2D09_F5CE, 0xB0AC_8123_2E58_417C], "{sums:#X?}");
     }
 
     /// 1, 2, 3 and 4 bands give the same bytes, on a game picture when one is on this disk.
