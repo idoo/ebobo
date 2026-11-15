@@ -3,7 +3,7 @@
 //! A frame is three layers, bottom to top: the game at its own size, the pictures the
 //! interface placed (box art), the 256x240 interface canvas with alpha. They are composed
 //! into one source picture the size of the destination rectangle; the picture effect, if
-//! any, then runs on that.
+//! any, then runs on that. Around a game's picture the bars carry its ambient light.
 
 use std::time::Instant;
 
@@ -26,6 +26,12 @@ const MAX_PRESCALE: u32 = 8;
 const MAX_PICTURES: usize = 64;
 /// Largest side of a game frame or a picture, pixels.
 const MAX_SIDE: u32 = 4096;
+/// Brightness of the ambient light at the picture's edge (1 = the blurred picture itself).
+const AMBIENT: f32 = 0.3;
+/// How much of the ambient light is left at the output's outer edge.
+const AMBIENT_EDGE: f32 = 0.12;
+/// Rings of quads the ambient light's falloff is drawn with.
+const SHADE_RINGS: u32 = 8;
 
 /// One frame to show: the layers, bottom to top.
 pub struct Frame<'a> {
@@ -37,11 +43,23 @@ pub struct Frame<'a> {
     pub pictures: &'a dyn Pictures,
 }
 
-/// The console's frame at its own size: `w * h * 4` RGBA bytes.
+/// The console's frame: `w * h * 4` RGBA bytes. `scale` is how many texture pixels one of the
+/// console's own pixels takes on each axis: 1 = the console's own pixels, more for an enhanced
+/// picture, which is then drawn with linear filtering.
 pub struct GameFrame<'a> {
     pub rgba: &'a [u8],
     pub w: u32,
     pub h: u32,
+    pub scale: u32,
+}
+
+impl GameFrame<'_> {
+    /// The console's own picture size, `w / scale` × `h / scale`: what the picture rectangle,
+    /// the pixel-perfect factors and the effect's rows and columns follow.
+    fn own_size(&self) -> (u32, u32) {
+        let k = self.scale.max(1);
+        ((self.w / k).max(1), (self.h / k).max(1))
+    }
 }
 
 /// A picture's pixels (`w * h * 4` RGBA bytes); `stamp` changes when the pixels do.
@@ -71,9 +89,9 @@ impl<'a> Layers<'a> {
         Layers { game: frame.game.as_ref(), ui: &frame.ui.px, placed: &frame.ui.placed, pictures: frame.pictures }
     }
 
-    /// Size of the source picture: the game's, else the interface's.
+    /// Size of the source picture: the game's own, else the interface's.
     fn size(&self) -> (u32, u32) {
-        self.game.map_or((W, H), |g| (g.w, g.h))
+        self.game.map_or((W, H), |g| g.own_size())
     }
 }
 
@@ -93,8 +111,9 @@ pub struct Video {
     // `unsafe_textures`: the textures are freed with the renderer; keep the creator alive.
     /// The interface: streaming 256x240, alpha blended.
     ui: Texture,
-    /// The game: streaming, recreated when its size (w, h) changes.
-    game: Option<(Texture, u32, u32)>,
+    /// The game: streaming, recreated when its size (w, h) or its filtering changes (true =
+    /// linear: an enhanced frame, `scale` above 1).
+    game: Option<(Texture, u32, u32, bool)>,
     /// Integer prescale targets for non-integer scales, keyed by (w, h, factor): the layer is
     /// drawn into it with nearest-neighbour, then scaled to the picture with linear filtering
     /// (sharp, no shimmering). `None` until needed.
@@ -124,6 +143,12 @@ pub struct Video {
     fx: Option<Fx>,
     /// Power-on animation start (tube effects only).
     power: Option<Instant>,
+    /// The blurred copy of the source picture: the effects' glow and the ambient light.
+    blur: Option<Blur>,
+    /// Ambient light in the bars around a game's picture.
+    ambient: bool,
+    /// The ambient light's falloff toward the output's edges.
+    shade: Shade,
 }
 
 /// GPU resources of one effect at one destination rect and source size; rebuilt when any changes.
@@ -136,11 +161,6 @@ struct Fx {
     mask: Texture,
     /// Additive glow weight compensating the mask's darkening.
     glow: f32,
-    /// The blurred glow copy: the source picture back at the source's resolution, then two
-    /// linear downscales.
-    base: Texture,
-    mid: Texture,
-    small: Texture,
     /// Previous frames blended in (LCD ghosting), destination-sized.
     ghost: Texture,
     vertices: Vec<Vertex>,
@@ -153,11 +173,79 @@ impl Fx {
         unsafe {
             self.scene.destroy();
             self.mask.destroy();
+            self.ghost.destroy();
+        }
+    }
+}
+
+/// The blurred copy of the composed source picture, for a source size (w, h) and a blur
+/// width; rebuilt when any changes.
+struct Blur {
+    key: (u32, u32, u32),
+    /// The glow copy: the source picture back at the source's resolution, then two linear
+    /// downscales.
+    base: Texture,
+    mid: Texture,
+    small: Texture,
+    /// The ambient light: two more halvings of `small`; `haze` carries the `AMBIENT`
+    /// colour modulation.
+    dim: Texture,
+    haze: Texture,
+}
+
+impl Blur {
+    fn new(creator: &TextureCreator<WindowContext>, key: (u32, u32, u32)) -> Result<Blur, String> {
+        let (sw, sh, blur) = key;
+        let base = make_target(creator, sw, sh, true)?;
+        let mid = make_target(creator, (sw / 2).max(1), (sh / 2).max(1), true)?;
+        let (w, h) = ((sw / blur.max(1)).max(1), (sh / blur.max(1)).max(1));
+        let small = make_target(creator, w, h, true)?;
+        let dim = make_target(creator, (w / 2).max(1), (h / 2).max(1), true)?;
+        let mut haze = make_target(creator, (w / 4).max(1), (h / 4).max(1), true)?;
+        let a = (AMBIENT * 255.0).round() as u8;
+        haze.set_blend_mode(BlendMode::None);
+        haze.set_color_mod(a, a, a);
+        Ok(Blur { key, base, mid, small, dim, haze })
+    }
+
+    /// SAFETY: the textures are not used again; the renderer is alive.
+    unsafe fn destroy(self) {
+        unsafe {
             self.base.destroy();
             self.mid.destroy();
             self.small.destroy();
-            self.ghost.destroy();
+            self.dim.destroy();
+            self.haze.destroy();
         }
+    }
+}
+
+/// The ambient light's falloff: black quads, clear at the picture rectangle's edge and
+/// growing opaque toward the output's edge, for (picture rectangle, output size).
+#[derive(Default)]
+struct Shade {
+    key: Option<(Rect, (u32, u32))>,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+}
+
+impl Shade {
+    /// Rebuilds the quads when the picture rectangle or the output size changed.
+    fn fit(&mut self, dest: Rect, out: (u32, u32)) {
+        if self.key == Some((dest, out)) {
+            return;
+        }
+        let (verts, indices) = shade_rings(dest, out);
+        self.key = Some((dest, out));
+        self.vertices = verts
+            .iter()
+            .map(|&(x, y, a)| Vertex {
+                position: FPoint::new(x, y),
+                color: Color::RGBA(0, 0, 0, a),
+                tex_coord: FPoint::new(0.0, 0.0),
+            })
+            .collect();
+        self.indices = indices;
     }
 }
 
@@ -217,7 +305,18 @@ impl Video {
             effect: Effect::Off,
             fx: None,
             power: None,
+            blur: None,
+            ambient: true,
+            shade: Shade::default(),
         })
+    }
+
+    /// Ambient light: the bars around a game's picture glow softly in its colours. Applies
+    /// from the next frame; nothing in the menus or when the picture fills the output. On
+    /// from `new` until the app passes `Config::ambient`.
+    #[allow(dead_code)]
+    pub fn set_ambient(&mut self, on: bool) {
+        self.ambient = on;
     }
 
     /// Picture effect; applies from the next frame.
@@ -295,19 +394,31 @@ impl Video {
         }
         self.tick += 1;
         self.sync_pictures(layers.placed, layers.pictures);
-        let composed = self.targets && self.draw_source(dest, layers.game.is_some(), size, layers.placed);
-        let fx = composed && self.effect != Effect::Off && self.draw_fx(dest, size);
+        let composed = self.targets && self.draw_source(dest, layers.game, size, layers.placed);
         let power = self.power.and_then(|t| crt::power_on(t.elapsed().as_secs_f32() * 1000.0));
         if power.is_none() {
             self.power = None;
         }
-        let Video { canvas, ui, game, source, pics, fx: effect, tick, .. } = self;
+        let fx_on = composed && self.effect != Effect::Off;
+        // A tube that is still switching on lights nothing around it yet.
+        let ambient = composed && power.is_none() && ambient_wanted(self.ambient, layers.game.is_some(), dest, out);
+        let blurred = (fx_on || ambient) && self.draw_blur(size, ambient);
+        let fx = fx_on && blurred && self.draw_fx(dest, size);
+        let ambient = ambient && blurred;
+        if ambient {
+            self.shade.fit(dest, out);
+        }
+        let Video { canvas, ui, game, source, pics, fx: effect, blur, shade, tick, .. } = self;
         let fx = if fx { effect.as_ref() } else { None };
+        let light = if ambient { blur.as_ref().map(|b| (&b.haze, &*shade)) } else { None };
         let mut source = if composed { source.as_mut().map(|(t, ..)| t) } else { None };
         let mut game = if layers.game.is_some() { game.as_mut().map(|(t, ..)| t) } else { None };
         let mut draw = |c: &mut WindowCanvas| -> Result<(), String> {
             c.set_draw_color(Color::RGB(0, 0, 0));
             c.clear();
+            if let Some((haze, shade)) = light {
+                draw_ambient(c, haze, shade)?;
+            }
             match (fx, source.as_deref_mut()) {
                 (Some(fx), _) if fx.params.curve > 0.0 || fx.params.vignette > 0.0 => {
                     c.render_geometry(&fx.vertices, Some(&fx.scene), VertexIndices::U32(&fx.indices))?
@@ -339,14 +450,18 @@ impl Video {
         }
     }
 
-    /// Uploads the game's pixels, recreating its texture when the size changed.
+    /// Uploads the game's pixels, recreating its texture when the size changed or the
+    /// filtering has to: an enhanced frame (`scale` above 1) is scaled with linear filtering,
+    /// the console's own pixels with nearest, and the scale-quality hint is read when a
+    /// texture is created.
     fn upload_game(&mut self, g: &GameFrame) -> Result<(), String> {
-        if self.game.as_ref().map(|(_, w, h)| (*w, *h)) != Some((g.w, g.h)) {
-            let made = self
-                ._creator
-                .create_texture_streaming(PixelFormatEnum::ABGR8888, g.w, g.h)
-                .map_err(|e| e.to_string())?;
-            if let Some((old, ..)) = self.game.replace((made, g.w, g.h)) {
+        let linear = g.scale > 1;
+        if self.game.as_ref().map(|(_, w, h, l)| (*w, *h, *l)) != Some((g.w, g.h, linear)) {
+            sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", if linear { "1" } else { "0" });
+            let made = self._creator.create_texture_streaming(PixelFormatEnum::ABGR8888, g.w, g.h);
+            sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
+            let made = made.map_err(|e| e.to_string())?;
+            if let Some((old, ..)) = self.game.replace((made, g.w, g.h, linear)) {
                 // SAFETY: the old texture is not used again; the renderer is alive.
                 unsafe { old.destroy() };
             }
@@ -400,7 +515,7 @@ impl Video {
 
     /// Composes the source picture for `dest` (game, pictures, interface); false when render
     /// targets fail (then the layers are drawn straight to the output).
-    fn draw_source(&mut self, dest: Rect, game: bool, size: (u32, u32), placed: &[Placed]) -> bool {
+    fn draw_source(&mut self, dest: Rect, game: Option<&GameFrame>, size: (u32, u32), placed: &[Placed]) -> bool {
         match self.try_source(dest, game, size, placed) {
             Ok(()) => true,
             Err(e) => {
@@ -411,13 +526,14 @@ impl Video {
         }
     }
 
-    fn try_source(&mut self, dest: Rect, game: bool, size: (u32, u32), placed: &[Placed]) -> Result<(), String> {
+    fn try_source(&mut self, dest: Rect, game: Option<&GameFrame>, size: (u32, u32), placed: &[Placed]) -> Result<(), String> {
         let (dw, dh) = (dest.width(), dest.height());
         let Video { canvas, _creator: creator, ui, game: game_tex, ui_pre, game_pre, source, pics, tick, .. } = self;
         let mut game_src: Option<&mut Texture> = None;
-        if game {
+        if let Some(g) = game {
             let (texture, ..) = game_tex.as_mut().ok_or("no game texture")?;
-            let k = prescale(dw, dh, size.0, size.1);
+            // An enhanced frame goes straight in, with linear filtering.
+            let k = if g.scale > 1 { 1 } else { prescale(dw, dh, size.0, size.1) };
             game_src = Some(if k > 1 { prescale_into(canvas, creator, game_pre, texture, size, k)? } else { texture });
         }
         let k = prescale(dw, dh, W, H);
@@ -442,6 +558,45 @@ impl Video {
         drawn
     }
 
+    /// Blurs the composed source picture into `blur` (the glow copy), and on into its haze
+    /// when `ambient`; false when render targets fail.
+    fn draw_blur(&mut self, size: (u32, u32), ambient: bool) -> bool {
+        let key = (size.0, size.1, self.effect.params().glow_blur.max(1));
+        if self.blur.as_ref().map(|b| b.key) != Some(key) {
+            if let Some(old) = self.blur.take() {
+                // SAFETY: replaced below; the renderer is alive.
+                unsafe { old.destroy() };
+            }
+            match Blur::new(&self._creator, key) {
+                Ok(blur) => self.blur = Some(blur),
+                Err(e) => {
+                    eprintln!("ebobo: no blurred picture ({e})");
+                    return false;
+                }
+            }
+        }
+        let Video { canvas, source, blur, .. } = self;
+        let (Some((source, ..)), Some(b)) = (source.as_mut(), blur.as_mut()) else { return false };
+        // The picture at the source's resolution, blurred by two linear downscales.
+        source.set_blend_mode(BlendMode::None);
+        let source = &*source;
+        let mut ok = pass(canvas, &mut b.base, &mut |c| c.copy(source, None, None));
+        let base = &b.base;
+        ok &= pass(canvas, &mut b.mid, &mut |c| c.copy(base, None, None));
+        let mid = &b.mid;
+        ok &= pass(canvas, &mut b.small, &mut |c| c.copy(mid, None, None));
+        if ambient {
+            // The effect leaves its glow weight on `small`; the haze takes it plain.
+            b.small.set_blend_mode(BlendMode::None);
+            b.small.set_color_mod(255, 255, 255);
+            let small = &b.small;
+            ok &= pass(canvas, &mut b.dim, &mut |c| c.copy(small, None, None));
+            let dim = &b.dim;
+            ok &= pass(canvas, &mut b.haze, &mut |c| c.copy(dim, None, None));
+        }
+        ok
+    }
+
     /// Composes the effect scene for `dest` from the source picture (bleed, mask, glow);
     /// false when render targets fail (then the plain source picture is drawn).
     fn draw_fx(&mut self, dest: Rect, size: (u32, u32)) -> bool {
@@ -463,46 +618,30 @@ impl Video {
                 }
             }
         }
-        let Video { canvas, source, fx, .. } = self;
-        let Some((source, ..)) = source.as_mut() else { return false };
+        let Video { canvas, source, fx, blur, .. } = self;
+        let (Some((source, ..)), Some(blur)) = (source.as_mut(), blur.as_mut()) else { return false };
         let fx = fx.as_mut().expect("made above");
         let p = fx.params;
         let (dw, dh) = (dest.width(), dest.height());
         let mut ok = true;
-        let mut run = |target: &mut Texture, f: &mut dyn FnMut(&mut WindowCanvas) -> Result<(), String>| {
-            if let Err(e) = canvas.with_texture_canvas(target, |c| {
-                if let Err(e) = f(c) {
-                    eprintln!("ebobo: picture effect: {e}");
-                }
-            }) {
-                eprintln!("ebobo: picture effect: {e}");
-                ok = false;
-            }
-        };
         // LCD ghosting: the new frame over the previous ones.
         if p.ghost > 0.0 {
             source.set_blend_mode(BlendMode::Blend);
             source.set_alpha_mod(((1.0 - p.ghost) * 255.0) as u8);
-            run(&mut fx.ghost, &mut |c| c.copy(source, None, None));
+            let frame = &*source;
+            ok &= pass(canvas, &mut fx.ghost, &mut |c| c.copy(frame, None, None));
             source.set_alpha_mod(255);
         }
-        // Glow source: the picture at the source's resolution, blurred by two linear downscales.
-        source.set_blend_mode(BlendMode::None);
-        run(&mut fx.base, &mut |c| c.copy(source, None, None));
-        let base = &fx.base;
-        run(&mut fx.mid, &mut |c| c.copy(base, None, None));
-        let mid = &fx.mid;
-        run(&mut fx.small, &mut |c| c.copy(mid, None, None));
         let src: &mut Texture = if p.ghost > 0.0 { &mut fx.ghost } else { source };
-        let (mask, small, glow) = (&fx.mask, &mut fx.small, fx.glow);
-        run(&mut fx.scene, &mut |c| {
+        let (mask, small, glow) = (&fx.mask, &mut blur.small, fx.glow);
+        ok &= pass(canvas, &mut fx.scene, &mut |c| {
             let full = Rect::new(0, 0, dw, dh);
             c.set_draw_color(Color::RGB(0, 0, 0));
             c.clear();
             src.set_blend_mode(BlendMode::None);
             c.copy(src, None, full)?;
             if p.bleed > 0.0 {
-                // Composite colour bleed: a copy ~0.6 source pixel to the right.
+                // Composite colour bleed: a copy ~0.6 of one of the console's pixels to the right.
                 let shift = (dw as f32 / size.0 as f32 * 0.6).round() as i32;
                 src.set_blend_mode(BlendMode::Blend);
                 src.set_alpha_mod((p.bleed * 255.0) as u8);
@@ -528,10 +667,6 @@ impl Video {
         let (dw, dh) = (dest.width(), dest.height());
         let creator = &self._creator;
         let scene = make_target(creator, dw, dh, true)?;
-        let base = make_target(creator, sw, sh, true)?;
-        let mid = make_target(creator, (sw / 2).max(1), (sh / 2).max(1), true)?;
-        let blur = p.glow_blur.max(1);
-        let small = make_target(creator, (sw / blur).max(1), (sh / blur).max(1), true)?;
         let mut ghost = make_target(creator, dw, dh, false)?;
         let m = crt::mask(effect, dw, dh, sw, sh);
         let mut mask = creator
@@ -561,7 +696,7 @@ impl Video {
                 }
             })
             .collect();
-        Ok(Fx { key, params: p, scene, mask, glow: m.glow, base, mid, small, ghost, vertices, indices })
+        Ok(Fx { key, params: p, scene, mask, glow: m.glow, ghost, vertices, indices })
     }
 
     /// "Screen" setting; applies from the next frame.
@@ -617,6 +752,61 @@ impl Video {
         let (ow, oh) = self.canvas.output_size().ok()?;
         map_to_canvas(self.screen, self.effect.params().curve, self.canvas.window().size(), (ow, oh), self.shown, pos)
     }
+}
+
+/// Runs `f` drawing into `target`; false when the target cannot be drawn into.
+fn pass(canvas: &mut WindowCanvas, target: &mut Texture, f: &mut dyn FnMut(&mut WindowCanvas) -> Result<(), String>) -> bool {
+    let done = canvas.with_texture_canvas(target, |c| {
+        if let Err(e) = f(c) {
+            eprintln!("ebobo: picture effect: {e}");
+        }
+    });
+    if let Err(e) = &done {
+        eprintln!("ebobo: picture effect: {e}");
+    }
+    done.is_ok()
+}
+
+/// The ambient light shows: switched on, a game on screen, and its picture rectangle `dest`
+/// leaves bars in an `out`-sized output.
+fn ambient_wanted(on: bool, game: bool, dest: Rect, out: (u32, u32)) -> bool {
+    on && game && (dest.width() < out.0 || dest.height() < out.1)
+}
+
+/// The ambient light over the whole (cleared) output: `haze`, dimmed by its colour
+/// modulation, then `shade` darkening it toward the edges. The picture is drawn on top.
+fn draw_ambient(c: &mut WindowCanvas, haze: &Texture, shade: &Shade) -> Result<(), String> {
+    c.copy(haze, None, None)?;
+    c.set_blend_mode(BlendMode::Blend);
+    let drawn = c.render_geometry(&shade.vertices, None::<&Texture>, VertexIndices::U32(&shade.indices));
+    c.set_blend_mode(BlendMode::None);
+    Ok(drawn?)
+}
+
+/// The ambient light's falloff around the picture rectangle `dest` in an `out`-sized output:
+/// `SHADE_RINGS` + 1 rectangles from the picture's edge to the output's, four corners each
+/// (x, y, black's alpha), and the triangles between neighbours. The light drops fast next to
+/// the picture and slowly further out, down to `AMBIENT_EDGE` of itself.
+fn shade_rings(dest: Rect, out: (u32, u32)) -> (Vec<(f32, f32, u8)>, Vec<u32>) {
+    let n = SHADE_RINGS;
+    let (l, t, r, b) = (dest.x() as f32, dest.y() as f32, dest.right() as f32, dest.bottom() as f32);
+    let (ow, oh) = (out.0 as f32, out.1 as f32);
+    let mut verts = Vec::with_capacity(((n + 1) * 4) as usize);
+    for i in 0..=n {
+        let f = i as f32 / n as f32;
+        let a = ((1.0 - AMBIENT_EDGE) * (1.0 - (1.0 - f) * (1.0 - f)) * 255.0).round() as u8;
+        let (x0, y0, x1, y1) = (l * (1.0 - f), t * (1.0 - f), r + (ow - r) * f, b + (oh - b) * f);
+        verts.extend([(x0, y0, a), (x1, y0, a), (x1, y1, a), (x0, y1, a)]);
+    }
+    let mut idx = Vec::with_capacity((n * 24) as usize);
+    for i in 0..n {
+        let (inner, outer) = (i * 4, i * 4 + 4);
+        for side in 0..4 {
+            let (p, q) = (side, (side + 1) % 4);
+            idx.extend([inner + p, inner + q, outer + q, inner + p, outer + q, outer + p]);
+        }
+    }
+    (verts, idx)
 }
 
 /// A render target; `linear` picks the filtering when it is drawn scaled.
@@ -833,6 +1023,93 @@ fn prescale(w: u32, h: u32, sw: u32, sh: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoPictures;
+
+    impl Pictures for NoPictures {
+        fn picture(&self, _: u64) -> Option<PictureRef<'_>> {
+            None
+        }
+    }
+
+    fn game(w: u32, h: u32, scale: u32) -> GameFrame<'static> {
+        GameFrame { rgba: &[], w, h, scale }
+    }
+
+    #[test]
+    fn enhanced_frames_keep_the_console_rectangle() {
+        assert_eq!(game(256, 240, 1).own_size(), (256, 240));
+        assert_eq!(game(1024, 960, 4).own_size(), (256, 240));
+        assert_eq!(game(1280, 896, 4).own_size(), (320, 224));
+        assert_eq!(game(640, 896, 2).own_size(), (320, 448));
+        // A scale of 0 counts as 1; the picture is never empty.
+        assert_eq!(game(320, 224, 0).own_size(), (320, 224));
+        assert_eq!(game(2, 2, 4).own_size(), (1, 1));
+        let outs = [(1280, 800), (640, 480), (600, 800), (1920, 1080), (300, 200)];
+        for (hd, plain) in [(game(1024, 960, 4), game(256, 240, 1)), (game(1280, 896, 4), game(320, 224, 1))] {
+            let size = |g| Layers { game: Some(g), ui: &[], placed: &[], pictures: &NoPictures }.size();
+            let (sw, sh) = size(&hd);
+            assert_eq!((sw, sh), (plain.w, plain.h));
+            assert_eq!((sw, sh), size(&plain));
+            for mode in [ScreenMode::Stretch, ScreenMode::Fit, ScreenMode::Pixel] {
+                for (ow, oh) in outs {
+                    assert_eq!(dest_rect(mode, ow, oh, sw, sh), dest_rect(mode, ow, oh, plain.w, plain.h), "{mode:?} {ow}x{oh}");
+                    assert_eq!(prescale(ow, oh, sw, sh), prescale(ow, oh, plain.w, plain.h));
+                }
+            }
+        }
+        // The rectangles themselves, on the Deck's screen.
+        let (sw, sh) = game(1024, 960, 4).own_size();
+        assert_eq!(dest_rect(ScreenMode::Stretch, 1280, 800, sw, sh), Rect::new(0, 0, 1280, 800));
+        assert_eq!(dest_rect(ScreenMode::Fit, 1280, 800, sw, sh), Rect::new(213, 0, 853, 800));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 1280, 800, sw, sh), Rect::new(256, 40, 768, 720));
+        let (sw, sh) = game(1280, 896, 4).own_size();
+        assert_eq!(dest_rect(ScreenMode::Stretch, 1280, 800, sw, sh), Rect::new(0, 0, 1280, 800));
+        assert_eq!(dest_rect(ScreenMode::Fit, 1280, 800, sw, sh), Rect::new(106, 0, 1067, 800));
+        assert_eq!(dest_rect(ScreenMode::Pixel, 1280, 800, sw, sh), Rect::new(160, 64, 960, 672));
+        // Taps map through the same rectangle.
+        let tap = |src| map_to_canvas(ScreenMode::Pixel, 0.0, (1280, 800), (1280, 800), src, WindowPos::Point(1119.0, 735.0));
+        assert_eq!(tap((sw, sh)), Some((255, 239)));
+    }
+
+    #[test]
+    fn crt_mask_rows_follow_the_console_lines() {
+        for (w, h, scale, lines) in [(1024, 960, 4, 240usize), (1280, 896, 4, 224), (256, 240, 1, 240), (320, 224, 1, 224)] {
+            let (sw, sh) = game(w, h, scale).own_size();
+            for effect in [Effect::CrtTv, Effect::Pvm] {
+                // A column too narrow for phosphor cells: only the scanlines shape it.
+                let m = crt::mask(effect, 64, 1920, sw, sh);
+                let at = |y: u32| m.rgba[(y * 64 * 4) as usize];
+                let beams = (0..1920).filter(|&y| at(y) >= 200 && (y == 0 || at(y - 1) < 200)).count();
+                assert_eq!(beams, lines, "{effect:?} {w}x{h} / {scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_light_only_in_the_bars_around_a_game() {
+        let fit = dest_rect(ScreenMode::Fit, 1280, 800, 256, 240);
+        assert!(ambient_wanted(true, true, fit, (1280, 800)));
+        assert!(!ambient_wanted(false, true, fit, (1280, 800)));
+        // Nothing in the menus, nothing when the picture fills the output.
+        assert!(!ambient_wanted(true, false, fit, (1280, 800)));
+        assert!(!ambient_wanted(true, true, dest_rect(ScreenMode::Stretch, 1280, 800, 256, 240), (1280, 800)));
+        assert!(!ambient_wanted(true, true, dest_rect(ScreenMode::Fit, 640, 480, 320, 224), (640, 480)));
+        // Bars above and below count too.
+        assert!(ambient_wanted(true, true, dest_rect(ScreenMode::Fit, 600, 800, 320, 224), (600, 800)));
+        assert!(ambient_wanted(true, true, dest_rect(ScreenMode::Pixel, 1280, 800, 320, 224), (1280, 800)));
+
+        let (v, idx) = shade_rings(fit, (1280, 800));
+        assert_eq!(v.len(), ((SHADE_RINGS + 1) * 4) as usize);
+        assert_eq!(idx.len(), (SHADE_RINGS * 24) as usize);
+        assert!(idx.iter().all(|&i| (i as usize) < v.len()));
+        // Clear on the picture's edge, darkest on the output's, never brighter going out.
+        assert_eq!((v[0], v[2]), ((213.0, 0.0, 0), (1066.0, 800.0, 0)));
+        let outer = &v[v.len() - 4..];
+        assert_eq!((outer[0].0, outer[0].1, outer[2].0, outer[2].1), (0.0, 0.0, 1280.0, 800.0));
+        assert_eq!(outer[0].2, ((1.0 - AMBIENT_EDGE) * 255.0).round() as u8);
+        assert!(v.windows(2).all(|p| p[1].2 >= p[0].2));
+    }
 
     #[test]
     fn deck_screen_modes() {

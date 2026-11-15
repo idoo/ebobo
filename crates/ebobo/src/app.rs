@@ -1403,7 +1403,7 @@ impl Pictures for ArtPictures<'_> {
 /// The frame to show: the game's picture in `frame` when `size` says one is on screen, the
 /// placed pictures and the interface.
 fn layers<'a>(frame: &'a [u8], size: Option<(u32, u32)>, ui: &'a Canvas, pictures: &'a ArtPictures<'a>) -> Frame<'a> {
-    Frame { game: size.map(|(w, h)| GameFrame { rgba: frame, w, h }), ui, pictures }
+    Frame { game: size.map(|(w, h)| GameFrame { rgba: frame, w, h, scale: 1 }), ui, pictures }
 }
 
 fn make_ctx<'a>(
