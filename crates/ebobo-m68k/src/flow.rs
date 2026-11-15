@@ -4,13 +4,12 @@ use crate::core::{Ea, Fault, Res, Size, mode, reg, reg9};
 use crate::{Bus, Cpu};
 
 /// Loads `pc` with `target` after `idle` internal cycles. An odd target is the address error of the prefetch that
-/// follows: the frame holds the target as the access address and target - 4 as the PC (`address_error` stacks
-/// `pc - 2`), and the step has spent `spent` cycles before it: the opcode word, 2 internal cycles and any push, the
-/// displacement word being already in the prefetch queue.
-fn jump(cpu: &mut Cpu, target: u32, idle: u32, spent: u32) -> Res<()> {
+/// follows: the frame holds the target as the access address and `stacked` as the PC, and the whole step costs
+/// `total` cycles (`address_error` stacks `pc - 2` and adds 46 to `cyc`).
+fn jump(cpu: &mut Cpu, target: u32, idle: u32, stacked: u32, total: u32) -> Res<()> {
     if target & 1 != 0 {
-        cpu.cyc = spent;
-        cpu.pc = target.wrapping_sub(2);
+        cpu.cyc = total - 46;
+        cpu.pc = stacked.wrapping_add(2);
         return Err(Fault::Address { addr: target, write: false, program: true });
     }
     cpu.idle(idle);
@@ -53,7 +52,8 @@ fn quick(cpu: &mut Cpu, bus: &mut impl Bus, op: u16, size: Size) -> Res<()> {
 }
 
 /// DBcc Dn,d16. Condition true: 12 cycles, nothing changes. Else the low word of Dn is decremented: not yet -1, the
-/// branch is taken (10 cycles); -1, execution falls through (14 cycles).
+/// branch is taken (10 cycles); -1, execution falls through (14 cycles). An odd target faults before the counter is
+/// written: Dn keeps its value and the step costs 60 cycles.
 fn dbcc(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let base = cpu.pc;
     if cpu.cond(op >> 8) {
@@ -62,11 +62,15 @@ fn dbcc(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
         return Ok(());
     }
     let disp = Size::Word.sext(u32::from(cpu.fetch16(bus)?));
+    let target = base.wrapping_add(disp);
     let n = reg(op);
     let count = cpu.d(n, Size::Word).wrapping_sub(1) & 0xFFFF;
+    if target & 1 != 0 {
+        return jump(cpu, target, 0, cpu.pc, 60);
+    }
     cpu.set_d(n, Size::Word, count);
     if count != 0xFFFF {
-        jump(cpu, base.wrapping_add(disp), 2, 6)
+        jump(cpu, target, 2, cpu.pc, 60)
     } else {
         cpu.idle(6);
         Ok(())
@@ -92,7 +96,9 @@ fn scc(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
 
 /// Bcc, BRA (condition 0) and BSR (condition 1). The displacement is the low byte of the opcode, or the next word
 /// when that byte is 0, and counts from the address after the opcode word. Taken: 10 cycles; not taken: 8 (byte
-/// form) or 12 (word form); BSR pushes the address of the next instruction and costs 18.
+/// form) or 12 (word form); BSR pushes the address of the next instruction and costs 18. An odd target: Bcc and BRA
+/// stack the address after the opcode word (60 cycles); BSR has pushed its return address and stacks the target
+/// itself (68 cycles).
 fn branch(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     let base = cpu.pc;
     let cc = (op >> 8) & 15;
@@ -103,10 +109,10 @@ fn branch(cpu: &mut Cpu, bus: &mut impl Bus, op: u16) -> Res<()> {
     if cc == 1 {
         cpu.idle(idle);
         cpu.push32(bus, cpu.pc)?;
-        return jump(cpu, target, 0, 14);
+        return jump(cpu, target, 0, target, 68);
     }
     if cc == 0 || cpu.cond(cc) {
-        return jump(cpu, target, idle, 6);
+        return jump(cpu, target, idle, base, 60);
     }
     cpu.idle(4);
     Ok(())
