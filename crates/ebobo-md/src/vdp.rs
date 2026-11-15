@@ -968,6 +968,49 @@ mod tests {
     }
 
     #[test]
+    fn vblank_flag_falls_a_line_before_line_0() {
+        for (pal, total) in [(false, 262u64), (true, 313)] {
+            let mut v = Vdp::new(pal);
+            v.run_to(0, None);
+            set_reg(&mut v, 1, 0x44);
+            let hint = timing::hint_point(false) as u64;
+            let mut flag = |line: u64, m: u64| {
+                let t = total * 3420 + line * 3420 + m;
+                v.run_to(t, None);
+                v.read(4, t) & 0x08
+            };
+            assert_eq!(flag(223, hint - 1), 0);
+            assert_eq!(flag(223, hint), 0x08);
+            assert_eq!(flag(total - 2, hint - 1), 0x08);
+            assert_eq!(flag(total - 2, hint), 0);
+        }
+    }
+
+    #[test]
+    fn horizontal_interrupt_lines_follow_the_v_counter() {
+        for (r10, first, step) in [(0u8, 261u64, 1usize), (1, 0, 2), (7, 6, 8)] {
+            let mut v = Vdp::new(false);
+            v.run_to(0, None);
+            set_reg(&mut v, 0, 0x10);
+            set_reg(&mut v, 10, r10);
+            let frame = 262 * 3420u64;
+            v.run_to(frame - 3420, None);
+            v.irq_ack(4);
+            let mut seen = Vec::new();
+            for i in 0..262u64 {
+                let line = (261 + i) % 262;
+                v.run_to(frame - 3420 + i * 3420 + timing::hint_point(false) as u64, None);
+                if v.irq_level() == 4 {
+                    seen.push(line);
+                    v.irq_ack(4);
+                }
+            }
+            let want: Vec<u64> = std::iter::once(261).chain(0..224).skip_while(|&l| l != first).step_by(step).collect();
+            assert_eq!(seen, want, "register 10 = {r10}");
+        }
+    }
+
+    #[test]
     fn hv_counter_samples() {
         assert_eq!(timing::h_counter(0, false), 0x00);
         assert_eq!(timing::h_counter(0x127 * 10, false), 0x93);
