@@ -6,7 +6,7 @@ license.workspace = true
 description = "NES emulator with online play for friends (Mac + Steam Deck)"
 
 [dependencies]
-ebobo-core = { path = "../ebobo-core" }
+ebobo-console = { path = "../ebobo-console" }
 ebobo-net = { path = "../ebobo-net" }
 sdl2 = { version = "0.38", features = ["bundled", "static-link", "unsafe_textures"] }
 fontdue = "0.9"

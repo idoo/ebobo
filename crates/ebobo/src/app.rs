@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ebobo_core::{Nes, Region, Snapshot};
+use ebobo_console::{Console, Snapshot};
 use ebobo_net::{
     GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, NetDiag, NetError, NetEvent, NetSession, NetStats, PeerId,
     Resume, ResumeInfo, ResumeKind, Stage,
@@ -54,7 +54,7 @@ const CURSOR_IDLE: Duration = Duration::from_secs(2);
 const KEYS_HINT_SECS: f32 = 8.0;
 
 struct Solo {
-    nes: Nes,
+    console: Console,
     name: String,
     /// Battery file and the bytes last written (or loaded).
     save_path: Option<PathBuf>,
@@ -64,7 +64,7 @@ struct Solo {
     slot: u8,
     slot_times: [Option<std::time::SystemTime>; slots::SLOTS as usize],
     /// Rewind history: a snapshot and the pads of the frame run right after it.
-    rewind: rewind::Ring<(Snapshot, [u8; 4])>,
+    rewind: rewind::Ring<(Snapshot, [u16; 4])>,
     /// Frames run since the last snapshot was pushed (one every `rewind::EVERY`).
     since_snapshot: u32,
     /// Rewind is held this tick (audio muted).
@@ -76,12 +76,12 @@ struct Solo {
 
 impl Solo {
     fn slot_path(&self, slot: u8) -> PathBuf {
-        slots::path(&config::data_dir().join("states"), &self.name, self.nes.info().crc32, slot)
+        slots::path(&config::data_dir().join("states"), &self.name, self.console.crc32(), slot)
     }
 }
 
 struct Net {
-    nes: Nes,
+    console: Console,
     session: NetSession,
     me: PeerId,
     slots: Vec<PeerId>,
@@ -138,7 +138,12 @@ struct App {
     config_saved: Config,
     state: State,
     lobby_status: Option<LobbyStatus>,
+    /// Interleaved stereo drained from the console this tick.
     samples: Vec<f32>,
+    /// Reusable buffer for [`Console::drain_audio`].
+    scratch: Vec<f32>,
+    /// The console's last picture, RGBA, at its own size.
+    frame: Vec<u8>,
     title_rom: Option<String>,
     quit: bool,
     /// `--autostart N`: host starts once N players are in and the game can start.
@@ -321,7 +326,9 @@ impl App {
             config_saved,
             state: State::Menu,
             lobby_status: None,
-            samples: Vec::with_capacity(2048),
+            samples: Vec::with_capacity(4096),
+            scratch: Vec::with_capacity(2048),
+            frame: Vec::new(),
             title_rom: None,
             quit: false,
             autostart: cli.autostart,
@@ -387,8 +394,8 @@ impl App {
 
     fn period(&self) -> Duration {
         match &self.state {
-            State::Solo(s) => logic::frame_period(s.nes.frame_rate(), 0),
-            State::Net(n) => logic::frame_period(n.nes.frame_rate(), n.session.frames_ahead()),
+            State::Solo(s) => logic::frame_period(s.console.frame_rate(), 0),
+            State::Net(n) => logic::frame_period(n.console.frame_rate(), n.session.frames_ahead()),
             _ => logic::frame_period(MENU_FPS, 0),
         }
     }
@@ -421,7 +428,7 @@ impl App {
             self.pads = self.input.pads();
             if let State::Solo(s) = &mut self.state {
                 if frame.seated >= 3 {
-                    s.nes.set_four_score(true);
+                    s.console.set_multitap(true);
                 }
                 if frame.gamepads >= 2 {
                     for event in &frame.pad_events {
@@ -664,7 +671,7 @@ impl App {
             UiAction::Reset => {
                 match &mut self.state {
                     State::Solo(s) => {
-                        s.nes.reset();
+                        s.console.reset();
                         if let Some(audio) = &mut self.audio {
                             audio.clear();
                         }
@@ -691,7 +698,7 @@ impl App {
                 }
                 State::Solo(s) => {
                     let path = s.slot_path(s.slot);
-                    let text = match slots::save(&s.nes, &path) {
+                    let text = match slots::save(&s.console, &path) {
                         Ok(()) => {
                             s.slot_times[s.slot as usize] = slots::saved_at(&path);
                             self.ui.hide();
@@ -715,11 +722,11 @@ impl App {
                 }
                 State::Solo(s) => {
                     let path = s.slot_path(s.slot);
-                    let text = match slots::load(&mut s.nes, &path) {
+                    let text = match slots::load(&mut s.console, &path) {
                         Ok(()) => {
                             s.rewind.clear();
                             s.since_snapshot = 0;
-                            s.nes.clear_audio();
+                            s.console.clear_audio();
                             if let Some(audio) = &mut self.audio {
                                 audio.clear();
                             }
@@ -772,12 +779,15 @@ impl App {
 
     /// Local display setting: each peer may differ, emulated state does not change.
     fn apply_sprite_limit(&mut self) {
-        let nes = match &mut self.state {
-            State::Solo(s) => &mut s.nes,
-            State::Net(n) => &mut n.nes,
+        let console = match &mut self.state {
+            State::Solo(s) => &mut s.console,
+            State::Net(n) => &mut n.console,
             _ => return,
         };
-        nes.set_sprite_limit(self.config.sprite_limit.applies(nes.four_score()));
+        let limit = self.config.sprite_limit.applies(console.multitap());
+        if let Some(nes) = console.as_nes_mut() {
+            nes.set_sprite_limit(limit);
+        }
     }
 
     /// Saves what changed since the last save, leaving command-line overrides out.
@@ -793,25 +803,27 @@ impl App {
             Ok(rom) => rom,
             Err(err) => return self.fail(&format!("{}: {err}", entry.name)),
         };
-        let mut nes = match Nes::new(&rom, logic::region_hint(&entry.name, entry.region)) {
-            Ok(nes) => nes,
+        let mut console = match Console::new(&rom, logic::region_hint(&entry.name, entry.region)) {
+            Ok(console) => console,
             Err(err) => return self.fail(&format!("{}: {err}", entry.name)),
         };
-        let four_score = nes.info().four_score;
-        nes.set_four_score(four_score);
-        nes.set_sprite_limit(self.config.sprite_limit.applies(four_score));
+        let multitap = ebobo_console::identify(&rom).map(|id| id.multitap).unwrap_or(false);
+        console.set_multitap(multitap);
+        if let Some(nes) = console.as_nes_mut() {
+            nes.set_sprite_limit(self.config.sprite_limit.applies(multitap));
+        }
         let mut save_path = None;
         let mut saved_ram = Vec::new();
-        if nes.battery_ram().is_some() {
-            let path = config::saves_dir().join(logic::save_file_name(&entry.name, nes.info().crc32));
+        if console.battery_ram().is_some() {
+            let path = config::saves_dir().join(logic::save_file_name(&entry.name, console.crc32()));
             if let Ok(bytes) = std::fs::read(&path) {
-                nes.load_battery_ram(&bytes);
+                console.load_battery_ram(&bytes);
             }
-            saved_ram = nes.battery_ram().map(<[u8]>::to_vec).unwrap_or_default();
+            saved_ram = console.battery_ram().map(<[u8]>::to_vec).unwrap_or_default();
             save_path = Some(path);
         }
         let mut solo = Solo {
-            nes,
+            console,
             name: entry.name,
             save_path,
             saved_ram,
@@ -848,7 +860,7 @@ impl App {
         let rom_name = entry.name;
         // What this game can continue from; a scratch machine of the header region (the one
         // the lobby announces) checks that each file loads.
-        let options = match Nes::new(&rom, None) {
+        let options = match Console::new(&rom, None) {
             Ok(mut scratch) => netsave::candidates(&netsave::dir(), &mut scratch),
             Err(_) => Vec::new(),
         };
@@ -890,8 +902,8 @@ impl App {
     fn start_net(&mut self, start: GameStart) {
         let resume = start.resume.map(|r| r.kind);
         self.end_game();
-        let mut nes = match Nes::new(&start.rom, Some(start.region)) {
-            Ok(nes) => nes,
+        let mut console = match Console::new(&start.rom, Some(start.region)) {
+            Ok(console) => console,
             Err(err) => {
                 self.ui.show_main();
                 return self.net_error(&NetError::BadRom(err.to_string()));
@@ -899,27 +911,29 @@ impl App {
         };
         // PeerId(0) is the host, who already has the file.
         if start.me != PeerId(0) {
-            self.keep_received_rom(&start.rom_name, nes.info().crc32, &start.rom);
+            self.keep_received_rom(&start.rom_name, console.crc32(), &start.rom);
         }
-        nes.set_four_score(start.four_score);
-        nes.set_sprite_limit(self.config.sprite_limit.applies(start.four_score));
-        let fps = if start.region == Region::Pal { 50 } else { 60 };
+        console.set_multitap(start.four_score);
+        if let Some(nes) = console.as_nes_mut() {
+            nes.set_sprite_limit(self.config.sprite_limit.applies(start.four_score));
+        }
+        let fps = if start.region.is_pal() { 50 } else { 60 };
         // A continued game: every peer loads the host's bytes before frame 0, and that state is
         // the shared save "Load for everyone" returns to until somebody saves.
         let shared_save = match &start.state {
             None => None,
-            Some(state) => match nes.load_state(state) {
+            Some(state) => match console.load_state(state) {
                 Ok(()) => {
                     // The adapter is part of the saved machine; this game's player count
                     // decides, as for a game from power-on (a save made by two players can be
                     // continued by four).
-                    nes.set_four_score(start.four_score);
+                    console.set_multitap(start.four_score);
                     let kind = resume.unwrap_or(ResumeKind::Save);
                     println!("ebobo: resumed {} sha {}", netsave::kind_name(kind), netsave::sha16(state));
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                     let text = if kind == ResumeKind::Last { Text::ResumedLast } else { Text::ResumedSave };
                     self.ui.toast_secs(self.ui.text(text), MENU_HINT_SECS);
-                    Some(nes.snapshot())
+                    Some(console.snapshot())
                 }
                 Err(err) => {
                     eprintln!("ebobo: the host's saved game does not load: {err}");
@@ -940,7 +954,7 @@ impl App {
         self.input.reset_seats();
         self.pads = self.input.pads();
         self.state = State::Net(Box::new(Net {
-            nes,
+            console,
             stats: session.stats(),
             session,
             me: start.me,
@@ -1013,7 +1027,7 @@ impl App {
             return;
         }
         s.battery_at = Instant::now();
-        let Some(ram) = s.nes.battery_ram() else { return };
+        let Some(ram) = s.console.battery_ram() else { return };
         if ram == s.saved_ram.as_slice() {
             return;
         }
@@ -1035,11 +1049,11 @@ impl App {
                 if s.rewinding {
                     // One snapshot back (2 frames); re-run the frame after it to show it.
                     if let Some((snap, pads)) = s.rewind.step_back() {
-                        s.nes.restore(&snap);
-                        s.nes.set_fast_forward(false);
-                        s.nes.run_frame(pads);
+                        s.console.restore(&snap);
+                        s.console.set_fast_forward(false);
+                        s.console.run_frame(pads);
                     }
-                    s.nes.clear_audio();
+                    s.console.clear_audio();
                     s.since_snapshot = 0;
                 } else if !ui_visible {
                     s.ff_on = logic::fast_forward(self.config.ff_toggle, frame.fast_forward, s.ff_held, s.ff_on);
@@ -1048,12 +1062,12 @@ impl App {
                     let pads = frame.solo_pads();
                     for i in 0..n {
                         if s.since_snapshot == 0 {
-                            s.rewind.push((s.nes.snapshot(), pads));
+                            s.rewind.push((s.console.snapshot(), pads));
                         }
                         s.since_snapshot = (s.since_snapshot + 1) % rewind::EVERY;
                         // Only the last frame of a fast-forward tick draws pixels and sound.
-                        s.nes.set_fast_forward(i + 1 < n);
-                        s.nes.run_frame(pads);
+                        s.console.set_fast_forward(i + 1 < n);
+                        s.console.run_frame(pads);
                     }
                 }
             }
@@ -1122,9 +1136,9 @@ impl App {
                 if failed && !std::mem::replace(&mut n.write_failed, true) {
                     self.ui.toast(self.ui.text(Text::StateSaveFailed));
                 }
-                let mut local: u16 = 0;
+                let mut local: u32 = 0;
                 if !ui_visible {
-                    local = logic::net_input(&frame.pads, &frame.turbo);
+                    local = u32::from(logic::net_input(&frame.pads, &frame.turbo));
                 }
                 // Each request goes to the session once; it keeps the bit until GGRS takes an
                 // input of this player.
@@ -1137,13 +1151,13 @@ impl App {
                 if std::mem::take(&mut n.load_pending) {
                     local |= INPUT_LOAD;
                 }
-                match n.session.advance(&mut n.nes, local) {
+                match n.session.advance(&mut n.console, local) {
                     Ok(outcome) => {
                         if outcome.advanced {
                             n.advanced += 1;
                             n.last_advance = Instant::now();
                             if n.advanced % 300 == 0 {
-                                println!("ebobo: frame {} hash {:016x}", n.advanced, n.nes.state_hash());
+                                println!("ebobo: frame {} hash {:016x}", n.advanced, n.console.state_hash());
                                 let _ = std::io::Write::flush(&mut std::io::stdout());
                             }
                             while let Some(&(at, key)) = n.script.get(n.script_at) {
@@ -1183,14 +1197,10 @@ impl App {
     fn pump_audio(&mut self, ui_visible: bool) {
         let Some(audio) = &mut self.audio else { return };
         let rewinding = matches!(&self.state, State::Solo(s) if s.rewinding);
-        let nes = match &mut self.state {
-            State::Solo(s) => Some(&mut s.nes),
-            State::Net(n) => Some(&mut n.nes),
-            _ => None,
-        };
+        let playing = matches!(self.state, State::Solo(_) | State::Net(_));
         // Solo pauses audio with the game and mutes it while rewinding; netplay keeps playing
         // under the menu.
-        let paused = nes.is_none() || (ui_visible && matches!(self.state, State::Solo(_))) || rewinding;
+        let paused = !playing || (ui_visible && matches!(self.state, State::Solo(_))) || rewinding;
         if paused != self.audio_paused {
             audio.set_paused(paused);
             if rewinding {
@@ -1198,25 +1208,29 @@ impl App {
             }
             self.audio_paused = paused;
         }
-        let (nes, stretch) = match &mut self.state {
-            State::Solo(s) if !paused => (&mut s.nes, 0.0),
+        let (console, stretch) = match &mut self.state {
+            State::Solo(s) if !paused => (&mut s.console, 0.0),
             State::Net(n) => {
                 let stretch = logic::frame_stretch(n.session.frames_ahead());
-                (&mut n.nes, stretch)
+                (&mut n.console, stretch)
             }
             _ => return,
         };
-        nes.set_sample_rate(audio.sample_rate() * audio.rate_factor() * (1.0 + stretch));
+        console.set_sample_rate(audio.sample_rate() * audio.rate_factor() * (1.0 + stretch));
         self.samples.clear();
-        nes.drain_audio(&mut self.samples);
+        console.drain_audio(&mut self.samples, &mut self.scratch);
         audio.push(&self.samples);
     }
 
     fn compose(&mut self, frame: &InputFrame) {
-        match &self.state {
-            State::Solo(s) => s.nes.frame_rgba(&mut self.canvas.px),
-            State::Net(n) => n.nes.frame_rgba(&mut self.canvas.px),
-            State::Menu | State::Lobby(_) => self.canvas.clear(BACKDROP),
+        let size = match &self.state {
+            State::Solo(s) => Some(s.console.frame_rgba(&mut self.frame)),
+            State::Net(n) => Some(n.console.frame_rgba(&mut self.frame)),
+            State::Menu | State::Lobby(_) => None,
+        };
+        match size {
+            Some((w, h)) => game_frame_to_canvas(&mut self.canvas, &self.frame, w, h),
+            None => self.canvas.clear(BACKDROP),
         }
         let notice = self.net_notice();
         let ctx = make_ctx(
@@ -1234,9 +1248,9 @@ impl App {
     /// F12 / Back+North: the game frame ×3 (nearest) as PNG into the pictures folder.
     fn screenshot(&mut self) {
         let State::Solo(s) = &self.state else { return };
-        let (w, h, k) = (ebobo_core::WIDTH, ebobo_core::HEIGHT, 3);
-        let mut rgba = vec![0u8; w * h * 4];
-        s.nes.frame_rgba(&mut rgba);
+        let k = 3;
+        let mut rgba = Vec::new();
+        let (w, h) = s.console.frame_rgba(&mut rgba);
         let mut big = Vec::new();
         logic::scale_nearest(&rgba, w, h, k, &mut big);
         let png = png::encode_rgba((w * k) as u32, (h * k) as u32, &big);
@@ -1317,7 +1331,7 @@ impl Net {
         if !netsave::last_due(self.advanced) {
             return;
         }
-        if let Ok(sha) = self.write_state(ResumeKind::Last, &self.nes.snapshot()) {
+        if let Ok(sha) = self.write_state(ResumeKind::Last, &self.console.snapshot()) {
             println!("ebobo: last moment on leave sha {sha}");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
@@ -1326,17 +1340,28 @@ impl Net {
     /// Writes an online save file of this ROM; `Ok` holds the first 16 hex digits of its
     /// SHA-256. The first failure of a session is printed (later ones every 5 s would flood).
     fn write_state(&self, kind: ResumeKind, snapshot: &Snapshot) -> Result<String, ()> {
-        let bytes = self.nes.encode_state(snapshot);
+        let bytes = self.console.encode_state(snapshot);
         let dir = netsave::dir();
-        match netsave::write(&dir, self.nes.info().crc32, kind, &bytes) {
+        match netsave::write(&dir, self.console.crc32(), kind, &bytes) {
             Ok(()) => Ok(netsave::sha16(&bytes)),
             Err(err) => {
                 if !self.write_failed {
-                    eprintln!("ebobo: cannot write {}: {err}", netsave::path(&dir, self.nes.info().crc32, kind).display());
+                    eprintln!("ebobo: cannot write {}: {err}", netsave::path(&dir, self.console.crc32(), kind).display());
                 }
                 Err(())
             }
         }
+    }
+}
+
+/// Where the game's picture reaches the screen: a `w`x`h` RGBA frame becomes the canvas the
+/// interface draws on. A 256x240 frame (the NES) is copied as is; other sizes (the Mega Drive's
+/// 320x224, ...) are not shown yet and leave a black canvas. Stage B (layered picture) replaces this.
+fn game_frame_to_canvas(canvas: &mut Canvas, rgba: &[u8], w: usize, h: usize) {
+    if (w, h) == (canvas::W, canvas::H) {
+        canvas.px.copy_from_slice(&rgba[..w * h * 4]);
+    } else {
+        canvas.clear([0, 0, 0, 255]);
     }
 }
 
