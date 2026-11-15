@@ -1,0 +1,20 @@
+# reference emulator Genesis Plus GX v1.7.4 b9c2316, pal, 12 frames
+00E0
+00FF
+0000
+0037
+0040
+0055
+0069
+007D
+0092
+00A6
+00E8
+00FA
+000E
+0022
+0037
+004B
+0060
+0074
+0088

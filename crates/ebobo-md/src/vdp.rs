@@ -221,7 +221,9 @@ impl Vdp {
         }
         if self.fired & FIRED_HINT == 0 && self.mclk >= hint {
             self.fired |= FIRED_HINT;
-            if self.line <= active {
+            // The V counter steps here; the counter counts on the lines it then shows as
+            // 0 to `active` (the step into line 0 counts already) and reloads on the others.
+            if (self.line + 1) % self.lines() <= active {
                 if self.hint_counter == 0 {
                     self.hint_counter = self.regs[10];
                     self.hint_pending = true;
@@ -301,12 +303,13 @@ impl Vdp {
         if self.regs[0] & 0x10 != 0 {
             let total = self.lines();
             let mut hc = self.hint_counter;
+            // `l` is the line whose step (at its `hint_point`) comes next.
             let mut l = self.line;
             if self.fired & FIRED_HINT != 0 {
                 l = (l + 1) % total;
             }
             for _ in 0..2 * total {
-                if l <= active {
+                if (l + 1) % total <= active {
                     if hc == 0 {
                         best = best.min(self.clock + self.time_to(l, timing::hint_point(h40)));
                         break;
@@ -361,12 +364,15 @@ impl Vdp {
         self.m68k_frozen_until
     }
 
+    /// The line the V counter shows: it moves on to the next line at `hint_point`.
+    fn shown_line(&self) -> u32 {
+        if self.mclk >= timing::hint_point(self.h40()) { (self.line + 1) % self.lines() } else { self.line }
+    }
+
     /// HV counter now: V counter in the high byte, H counter in the low byte.
     fn hv_counter(&self) -> u16 {
-        let h40 = self.h40();
-        let line = if self.mclk >= timing::hint_point(h40) { (self.line + 1) % self.lines() } else { self.line };
-        let v = timing::v_counter(line, self.pal, self.regs[1] & 0x08 != 0, self.interlace());
-        (v as u16) << 8 | timing::h_counter(self.mclk, h40) as u16
+        let v = timing::v_counter(self.shown_line(), self.pal, self.regs[1] & 0x08 != 0, self.interlace());
+        (v as u16) << 8 | timing::h_counter(self.mclk, self.h40()) as u16
     }
 
     /// Data-port writes waiting in the FIFO now: 0-4.
@@ -401,7 +407,10 @@ impl Vdp {
 
     fn status(&self) -> u16 {
         let h40 = self.h40();
-        let vblank = self.line >= self.active_lines() || !self.display_on();
+        // Vertical blanking follows the V counter: from its first line after the picture to
+        // the line before its last one (the flag falls a line before line 0).
+        let shown = self.shown_line();
+        let vblank = (shown >= self.active_lines() && shown != self.lines() - 1) || !self.display_on();
         let hblank = self.mclk >= timing::hblank_start(h40) || self.mclk < timing::hblank_end(h40);
         let waiting = self.fifo_pending();
         0x3400
@@ -945,7 +954,7 @@ mod tests {
         let mut seen = Vec::new();
         for line in 0..262u64 {
             let t = frame + line * 3420 + timing::hint_point(false) as u64;
-            if line % 4 == 3 && line < 224 {
+            if line % 4 == 2 && line < 223 {
                 assert_eq!(v.next_event(), t);
             }
             v.run_to(t, None);
@@ -954,7 +963,8 @@ mod tests {
                 v.irq_ack(4);
             }
         }
-        assert_eq!(seen, (3..224).step_by(4).collect::<Vec<_>>());
+        // The interrupt is raised at the step into V counter 3, 7, ...: on the line before.
+        assert_eq!(seen, (2..223).step_by(4).collect::<Vec<_>>());
     }
 
     #[test]

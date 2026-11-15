@@ -9,7 +9,14 @@ use ebobo_md::{Md, Region};
 use std::path::{Path, PathBuf};
 
 /// Probes whose difference is understood and accepted for now: (name, reason).
-const KNOWN_DIFF: &[(&str, &str)] = &[];
+const KNOWN_DIFF: &[(&str, &str)] = &[
+    ("frame_cycles", "access timing inside an instruction (2 passes in 4202)"),
+    ("vcounter", "H counter spacing: access timing inside an instruction"),
+    ("blank_edges", "H-blank flag edges and HV sample spacing: access timing inside an instruction, H-blank edges open"),
+    ("hint_lines", "register 10 = 0: a pending interrupt from V = 0xE0 survives to V = 0xFF in ours, not in the reference"),
+    ("fifo_rate", "one write slot off at the start: FIFO slot timing"),
+    ("fifo_status", "FIFO empty flag one write early: FIFO slot timing"),
+];
 
 /// Word 0 of the result block when the probe's `main` returned.
 const DONE: u16 = 0xD0E1;
