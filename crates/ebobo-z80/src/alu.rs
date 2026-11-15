@@ -213,7 +213,6 @@ impl Cpu {
     }
 
     /// NEG: A = 0 - A with the flags of SUB.
-    #[allow(dead_code)] // first caller: the ED table
     pub(crate) fn neg(&mut self) {
         let v = self.a;
         self.a = 0;
@@ -239,7 +238,6 @@ impl Cpu {
 
     /// ADC HL,rr: HL = HL + `v` + C; all flags from the 16-bit result (S bit 15, Z whole word, H bit 11,
     /// P/V overflow, X/Y high byte); `wz` = old HL + 1.
-    #[allow(dead_code)] // first caller: the ED table
     pub(crate) fn adc16(&mut self, v: u16) {
         let hl = self.hl();
         let sum = hl as u32 + v as u32 + (self.f & flag::C) as u32;
@@ -263,7 +261,6 @@ impl Cpu {
     }
 
     /// SBC HL,rr: HL = HL - `v` - C; all flags from the 16-bit result, N set; `wz` = old HL + 1.
-    #[allow(dead_code)] // first caller: the ED table
     pub(crate) fn sbc16(&mut self, v: u16) {
         let hl = self.hl();
         let diff = (hl as u32).wrapping_sub(v as u32).wrapping_sub((self.f & flag::C) as u32);
