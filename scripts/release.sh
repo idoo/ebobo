@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Publishes a release: scripts/release.sh v0.2.0
+# Publishes a release: [RELEASE_NOTES=whats-new.md] scripts/release.sh v0.2.0
+# RELEASE_NOTES names a Markdown file with what is new; it goes above the install steps.
 # Builds both downloads from a clean snapshot of the tag (no stray working-tree files, no ROMs),
 # then creates the GitHub release with stable asset names so these links always work:
 #   https://github.com/idoo/ebobo/releases/latest/download/ebobo-mac.zip
@@ -45,7 +46,11 @@ fi
 (cd "$src/dist" && shasum -a 256 ebobo-mac.zip ebobo-steamdeck.tar.gz install-steamdeck.sh > SHA256SUMS)
 
 notes="$(mktemp)"
-cat > "$notes" <<EOF
+if [ -n "${RELEASE_NOTES:-}" ]; then
+    cat "$RELEASE_NOTES" > "$notes"
+    printf '\n' >> "$notes"
+fi
+cat >> "$notes" <<EOF
 **Mac** (macOS 11+): download \`ebobo-mac.zip\`, unzip it and drag ebobo.app to Applications.
 
 **Steam Deck**: in Desktop Mode open Konsole and run
