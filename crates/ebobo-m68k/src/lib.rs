@@ -249,20 +249,25 @@ impl Cpu {
     /// Address error exception, vector 3, with the 14-byte frame of the manual, from the top
     /// of the stack: status word (bit 4 read, bit 3 not an instruction, bits 2-0 function
     /// code: 1 data or 2 program, plus 4 in supervisor mode; the bits above are those of the
-    /// instruction register), access address, instruction register, SR, PC. 50 cycles for the
-    /// whole step.
+    /// instruction register), access address, instruction register, SR, PC.
+    ///
+    /// The stacked PC is `pc - 2` (the chip's program counter runs one prefetched word
+    /// behind ours); an instruction whose frame differs moves `pc` before it returns the
+    /// fault. The step costs 50 cycles plus what the instruction spent before the fault,
+    /// its opcode fetch not counted.
     fn address_error(&mut self, bus: &mut impl Bus, addr: u32, write: bool, program: bool, op: u16, in_exception: bool) -> Res<()> {
         let old = self.sr;
         self.sr = (old | sr::S) & !sr::T;
         let function_code = if old & sr::S != 0 { 4 } else { 0 } | if program { 2 } else { 1 };
         let status = (op & 0xFFE0) | (u16::from(!write) << 4) | (u16::from(in_exception) << 3) | function_code;
-        self.push32(bus, self.pc)?;
+        let spent = self.cyc;
+        self.push32(bus, self.pc.wrapping_sub(2))?;
         self.push16(bus, old)?;
         self.push16(bus, op)?;
         self.push32(bus, addr)?;
         self.push16(bus, status)?;
         self.pc = self.read(bus, 12, Size::Long)?;
-        self.cyc = 50;
+        self.cyc = spent + 46;
         Ok(())
     }
 }
