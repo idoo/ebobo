@@ -176,11 +176,20 @@ pub fn dma_duration(kind: DmaKind, units: u32, s: DmaStart) -> u64 {
     }
 }
 
+/// Access slots of a drawing line in the 320-pixel mode: master clock of the line of each of the 18.
+/// Measured with the `fifo_pace` probe (when a held data-port write resumes, video RAM words from
+/// H 0x10, 0x80 and 0xE8): the slots crowd near both edges of the picture and are sparse in its
+/// middle, one falls in horizontal blanking.
+const DRAW_SLOTS_H40: [u16; 18] = [32, 144, 256, 432, 624, 720, 816, 1008, 1200, 1392, 1584, 1840, 2096, 2176, 2304, 2464, 2608, 3138];
+
+/// As [`DRAW_SLOTS_H40`], the 16 slots of a drawing line in the 256-pixel mode.
+const DRAW_SLOTS_H32: [u16; 16] = [380, 560, 740, 1020, 1320, 1460, 1600, 1940, 2280, 2400, 2560, 2720, 2880, 3020, 3180, 3340];
+
 /// Master clocks from the position `s` to the `n`-th access slot after it (`n` ≥ 1): the slots in
-/// which the chip takes a write from its FIFO. A line has as many as a 68k DMA moves units
-/// ([`dma_rate`] of [`DmaKind::Bus`]: 18 while drawing and 205 while blanked in the 320-pixel
-/// mode, 16 and 167 in the 256-pixel mode), spread evenly: slot `k` of a line with `r` slots is
-/// at master clock `(2k + 1) * 3420 / 2r`.
+/// which the chip takes a write from its FIFO. A drawing line has the slots of [`DRAW_SLOTS_H40`]
+/// / [`DRAW_SLOTS_H32`]; a blanked line (display off or outside the picture) as many as a 68k DMA
+/// moves units ([`dma_rate`] of [`DmaKind::Bus`]: 205 in the 320-pixel mode, 167 in the 256-pixel
+/// mode), spread evenly: slot `k` of a line with `r` slots is at master clock `(2k + 1) * 3420 / 2r`.
 pub fn slot_after(n: u32, s: DmaStart) -> u64 {
     let lc = LINE_CLOCKS as u64;
     let at = s.mclk.min(LINE_CLOCKS - 1) as u64;
@@ -189,17 +198,30 @@ pub fn slot_after(n: u32, s: DmaStart) -> u64 {
     let mut from = at + 1;
     let mut left = n.max(1);
     loop {
-        let rate = dma_rate(DmaKind::Bus, s.h40, !s.display_on || line >= s.active_lines) as u64;
-        let mut k = from * rate / lc;
-        while k < rate {
-            let pos = (2 * k + 1) * lc / (2 * rate);
-            if pos >= from {
-                left -= 1;
-                if left == 0 {
-                    return base + pos - at;
+        if s.display_on && line < s.active_lines {
+            let table: &[u16] = if s.h40 { &DRAW_SLOTS_H40 } else { &DRAW_SLOTS_H32 };
+            for &p in table {
+                let pos = p as u64;
+                if pos >= from {
+                    left -= 1;
+                    if left == 0 {
+                        return base + pos - at;
+                    }
                 }
             }
-            k += 1;
+        } else {
+            let rate = dma_rate(DmaKind::Bus, s.h40, true) as u64;
+            let mut k = from * rate / lc;
+            while k < rate {
+                let pos = (2 * k + 1) * lc / (2 * rate);
+                if pos >= from {
+                    left -= 1;
+                    if left == 0 {
+                        return base + pos - at;
+                    }
+                }
+                k += 1;
+            }
         }
         base += lc;
         from = 0;
