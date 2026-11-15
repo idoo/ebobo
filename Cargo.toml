@@ -6,6 +6,7 @@ members = [
     "crates/ebobo-z80",
     "crates/ebobo-md",
     "crates/ebobo-console",
+    "crates/ebobo-art",
     "crates/ebobo-net",
     "crates/ebobo",
 ]

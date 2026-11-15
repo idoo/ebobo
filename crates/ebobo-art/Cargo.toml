@@ -1,0 +1,10 @@
+[package]
+name = "ebobo-art"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pictures and proper names for ebobo's game cards"
+
+[dependencies]
+ebobo-console = { path = "../ebobo-console" }
+png = "0.17"
