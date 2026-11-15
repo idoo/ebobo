@@ -111,6 +111,8 @@ masiaka.bin	https://github.com/ResistanceVault/demo-Masiaka/releases/download/pa
 titan-overdrive.bin	https://files.scene.org/get/parties/2013/evoke13/wild/titan-overdrivemegademo-v1.1-final.zip	8c093b911a154d0fc8767724ca2bca16ed4c3383c2115b3fe366c471b6015f70	TiTAN - Overdrive (Rev1.1-106-Final) (Hardware).bin
 # Overdrive 2: demo by Titan, Revision 2017, free scene release uploaded by the group; 8 MB with the SSF bank mapper, extreme VDP timing (FIFO, mid-line changes, border); https://www.pouet.net/prod.php?which=69648
 titan-overdrive2.bin	https://files.scene.org/get/parties/2017/revision17/oldskool_demo/titan-overdrive2.zip	f722fc342bbd7008a743b9970e9ccaa7f2891c4b841126cb98d5dad93da45611	titan-overdrive2.bin
+# 240p Test Suite 1.21: video and audio hardware tests by Artemio Urbina; GPL; test patterns, scroll and sprite tests, 240p/480i switch, sound test; https://sourceforge.net/projects/testsuite240p/files/OldFiles/Sega_Genesis-MegaDrive-SegaCD_MegaCD/
+240p-suite.bin	https://downloads.sourceforge.net/project/testsuite240p/OldFiles/Sega_Genesis-MegaDrive-SegaCD_MegaCD/240pSuite-GenesisMD-1.21.zip	1776009ab324c18e4f046b4781fed11b897281f407ec04f2ac43649bcebae28f	240pSuite-1.21.bin
 EOF
 
 echo
