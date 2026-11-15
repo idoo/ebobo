@@ -117,6 +117,10 @@ impl Vdp {
     /// vertical blanking comes 32 lines (NTSC) / 58 lines (PAL) after the 68000's first instruction
     /// (probes `boot_phase`, `boot_clock`), so the counters start at line 191 + 780 clocks
     /// (NTSC) / 164 + 720 clocks (PAL); the line points before that position count as passed.
+    /// Register 10 (lines between horizontal interrupts) powers on as 0xFF, the others as 0: the
+    /// reference latches no horizontal request on the lines before a program first writes it
+    /// (probes `int_boot`, `hint_lines`); with 0 a request would wait from the first line on and
+    /// fire the moment a game enables the interrupt.
     pub fn new(pal: bool) -> Vdp {
         let (line, mclk) = if pal { (164, 720) } else { (191, 780) };
         let mut v = Vdp {
@@ -140,7 +144,7 @@ impl Vdp {
             fired: 0,
             vint_pending: false,
             hint_pending: false,
-            hint_counter: 0,
+            hint_counter: 0xFF,
             z80_int_until: 0,
             frame_done: false,
             m68k_frozen_until: 0,
@@ -149,6 +153,7 @@ impl Vdp {
             fifo_tail: 0,
             hv_latch: None,
         };
+        v.regs[10] = 0xFF;
         v.fired = v.points().iter().filter(|&&(_, p)| p <= mclk).fold(0, |f, &(bit, _)| f | bit);
         v
     }
