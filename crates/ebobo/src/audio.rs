@@ -9,7 +9,10 @@ const TARGET_MS: f64 = 60.0;
 const OVERFLOW_MS: f64 = 200.0;
 const MAX_ADJUST: f64 = 0.005;
 
-/// SDL audio queue: 48 kHz mono f32.
+/// Interleaved channels per frame: left, right.
+const CHANNELS: usize = 2;
+
+/// SDL audio queue: 48 kHz stereo f32, interleaved left/right.
 pub struct Audio {
     queue: AudioQueue<f32>,
     rate: f64,
@@ -19,7 +22,7 @@ pub struct Audio {
     buf: Vec<f32>,
 }
 
-/// Proportional drift control: more samples when the queue runs short, fewer when it is long.
+/// Proportional drift control: more frames when the queue runs short, fewer when it is long.
 fn drift_factor(queued_ms: f64) -> f64 {
     let err = (TARGET_MS - queued_ms) / TARGET_MS;
     1.0 + (err * MAX_ADJUST).clamp(-MAX_ADJUST, MAX_ADJUST)
@@ -30,7 +33,7 @@ impl Audio {
         let audio = sdl.audio()?;
         let desired = AudioSpecDesired {
             freq: Some(48_000),
-            channels: Some(1),
+            channels: Some(CHANNELS as u8),
             samples: Some(512),
         };
         let queue: AudioQueue<f32> = audio.open_queue(None, &desired)?;
@@ -45,18 +48,20 @@ impl Audio {
         })
     }
 
+    /// Queued audio in milliseconds: counts frames (left/right pairs), not single samples.
     fn queued_ms(&self) -> f64 {
-        let samples = self.queue.size() as f64 / std::mem::size_of::<f32>() as f64;
-        samples * 1000.0 / self.rate
+        let frames = self.queue.size() as f64 / (std::mem::size_of::<f32>() * CHANNELS) as f64;
+        frames * 1000.0 / self.rate
     }
 
-    /// Device sample rate (what the core should produce, before `rate_factor`).
+    /// Device sample rate in frames per second (what the core should produce, before `rate_factor`).
     pub fn sample_rate(&self) -> f64 {
         self.rate
     }
 
-    /// Queues samples (volume applied here). Starts playback once ~40 ms are buffered; when the
-    /// queue nearly runs dry (< 5 ms) playback pauses and prebuffers again.
+    /// Queues interleaved stereo samples: left/right pairs, so `samples.len() / 2` frames (volume
+    /// applied here). Starts playback once ~40 ms are buffered; when the queue nearly runs dry
+    /// (< 5 ms) playback pauses and prebuffers again.
     pub fn push(&mut self, samples: &[f32]) {
         if self.paused || samples.is_empty() {
             return;

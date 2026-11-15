@@ -3,18 +3,27 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ebobo_core::{pad, Region};
+use ebobo_console::Region;
+use ebobo_console::nes::pad;
 use ebobo_net::{INPUT_TURBO_A, INPUT_TURBO_B};
 
 use crate::config::Config;
 
-/// Region override for solo play: PAL when the file name says Europe and the header does not.
-/// (The header cannot say "unknown", so an NTSC header with a European name is treated as PAL.)
+/// Region override for solo play from the file name, `None` = keep the header's region.
+/// The tags `(Japan)`, `(USA)` and `(Europe)` win over the header for any system when exactly
+/// one of them is in the name (a NES machine runs `Japan` as NTSC). Otherwise: PAL when the
+/// name says Europe (`(E)`, `(Europe)`, `(PAL)`) and the header says NTSC (the NES header
+/// cannot say "unknown", so an NTSC header with a European name is treated as PAL).
 pub fn region_hint(name: &str, header: Region) -> Option<Region> {
+    let upper = name.to_uppercase();
+    let tags = [("(JAPAN)", Region::Japan), ("(USA)", Region::Ntsc), ("(EUROPE)", Region::Pal)];
+    let mut found = tags.iter().filter(|(tag, _)| upper.contains(tag));
+    if let (Some(&(_, region)), None) = (found.next(), found.next()) {
+        return (region != header).then_some(region);
+    }
     if header != Region::Ntsc {
         return None;
     }
-    let upper = name.to_uppercase();
     ["(E)", "(EUROPE)", "(PAL)"].iter().any(|m| upper.contains(m)).then_some(Region::Pal)
 }
 
@@ -30,14 +39,14 @@ pub fn frame_stretch(frames_ahead: i32) -> f64 {
     }
 }
 
-/// Local netplay input word: low byte = the pads of every seat merged (all local players
+/// Local netplay input word: bits 0-15 = the pads of every seat merged (all local players
 /// drive one netplay pad), plus the turbo buttons as held bits. Turbo never becomes A/B
 /// presses here: every peer expands the held bits from the simulated frame number, so a held
 /// turbo button is a constant word that "repeat the last input" predicts right.
-pub fn net_input(pads: &[u8; 4], turbo: &[u8; 4]) -> u16 {
-    let held = pads.iter().fold(0u8, |acc, p| acc | p);
+pub fn net_input(pads: &[u16; 4], turbo: &[u8; 4]) -> u32 {
+    let held = pads.iter().fold(0u16, |acc, p| acc | p);
     let turbo = turbo.iter().fold(0u8, |acc, t| acc | t);
-    let mut word = held as u16;
+    let mut word = u32::from(held);
     if turbo & pad::A != 0 {
         word |= INPUT_TURBO_A;
     }
@@ -159,8 +168,19 @@ mod tests {
         assert_eq!(region_hint("Tetris (Europe) (Rev 1)", Region::Ntsc), Some(Region::Pal));
         assert_eq!(region_hint("Elite (pal)", Region::Ntsc), Some(Region::Pal));
         assert_eq!(region_hint("Contra (U)", Region::Ntsc), None);
-        assert_eq!(region_hint("Excitebike (E)", Region::Pal), None);
         assert_eq!(region_hint("Eggs (Eu)", Region::Ntsc), None);
+        // A single (Japan) / (USA) / (Europe) tag wins over the header, for any system.
+        assert_eq!(region_hint("Sonic (Japan)", Region::Ntsc), Some(Region::Japan));
+        assert_eq!(region_hint("Sonic (Japan)", Region::Pal), Some(Region::Japan));
+        assert_eq!(region_hint("Sonic (Japan)", Region::Japan), None);
+        assert_eq!(region_hint("Sonic (USA)", Region::Pal), Some(Region::Ntsc));
+        assert_eq!(region_hint("Sonic (usa)", Region::Japan), Some(Region::Ntsc));
+        assert_eq!(region_hint("Sonic (Europe)", Region::Japan), Some(Region::Pal));
+        assert_eq!(region_hint("Sonic (Europe)", Region::Pal), None);
+        // Two tags: no single winner, today's rule.
+        assert_eq!(region_hint("Sonic (USA) (Europe)", Region::Ntsc), Some(Region::Pal));
+        assert_eq!(region_hint("Sonic (Japan) (USA)", Region::Pal), None);
+        assert_eq!(region_hint("Sonic (Japan) (USA)", Region::Ntsc), None);
     }
 
     #[test]
@@ -180,17 +200,18 @@ mod tests {
     #[test]
     fn app_net_input_sends_turbo_as_held_bits() {
         assert_eq!(net_input(&[0; 4], &[0; 4]), 0);
-        // Every seat merges into the low byte.
-        assert_eq!(net_input(&[pad::A, pad::LEFT, 0, pad::START], &[0; 4]), (pad::A | pad::LEFT | pad::START) as u16);
+        // Every seat merges into the pad bits.
+        let w = |bits: u8| u16::from(bits);
+        assert_eq!(net_input(&[w(pad::A), w(pad::LEFT), 0, w(pad::START)], &[0; 4]), u32::from(pad::A | pad::LEFT | pad::START));
         // Turbo from any seat sets its own bit and never an A/B press.
         assert_eq!(net_input(&[0; 4], &[pad::A, 0, 0, 0]), INPUT_TURBO_A);
         assert_eq!(net_input(&[0; 4], &[0, 0, pad::B, 0]), INPUT_TURBO_B);
-        assert_eq!(net_input(&[pad::UP, 0, 0, 0], &[pad::B, pad::A, 0, 0]), pad::UP as u16 | INPUT_TURBO_A | INPUT_TURBO_B);
+        assert_eq!(net_input(&[w(pad::UP), 0, 0, 0], &[pad::B, pad::A, 0, 0]), u32::from(pad::UP) | INPUT_TURBO_A | INPUT_TURBO_B);
         // Plain A next to turbo B stays plain A.
-        assert_eq!(net_input(&[pad::A, 0, 0, 0], &[pad::B, 0, 0, 0]), pad::A as u16 | INPUT_TURBO_B);
+        assert_eq!(net_input(&[w(pad::A), 0, 0, 0], &[pad::B, 0, 0, 0]), u32::from(pad::A) | INPUT_TURBO_B);
         // Only A/B have turbo, and the word never touches the reset bit.
-        assert_eq!(net_input(&[0xFF; 4], &[0xFF; 4]), 0xFF | INPUT_TURBO_A | INPUT_TURBO_B);
-        assert_eq!(net_input(&[0xFF; 4], &[0xFF; 4]) & ebobo_net::INPUT_RESET, 0);
+        assert_eq!(net_input(&[0xFFFF; 4], &[0xFF; 4]), 0xFFFF | INPUT_TURBO_A | INPUT_TURBO_B);
+        assert_eq!(net_input(&[0xFFFF; 4], &[0xFF; 4]) & ebobo_net::INPUT_RESET, 0);
     }
 
     #[test]

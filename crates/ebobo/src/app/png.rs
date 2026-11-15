@@ -1,6 +1,6 @@
 //! Minimal PNG writer for `--screenshot`: RGBA8, zlib stored (uncompressed) blocks.
 
-use ebobo_core::cart::crc32;
+use ebobo_console::crc32;
 
 fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
