@@ -177,7 +177,6 @@ fn moved(cells: &[u32], before: &[u32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     /// A NES test ROM that ends on a screen of text, fetched by `scripts/fetch-test-roms.sh`.
     const KNOWN_ROM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ebobo-core/tests/roms/sprite_hit_tests_2005.10.05/01.basics.nes");
@@ -235,7 +234,6 @@ mod tests {
 
     /// Writes `/tmp/ebobo-title-<name>.png` for every `.nes` file of the folder named by
     /// `EBOBO_TITLE_ROMS`, and prints what every look found: for tuning the rule by eye.
-    /// A PPM instead while `image::encode_png` is not written.
     #[test]
     #[ignore = "needs games: EBOBO_TITLE_ROMS=<folder>"]
     fn write_title_pictures() {
@@ -253,17 +251,9 @@ mod tests {
                 println!("{name}: no picture");
                 continue;
             };
-            let out = format!("/tmp/ebobo-title-{name}");
-            let file = match std::panic::catch_unwind(|| crate::image::encode_png(&picture)) {
-                Ok(png) => (format!("{out}.png"), png),
-                Err(_) => {
-                    let mut ppm = format!("P6\n{} {}\n255\n", picture.w, picture.h).into_bytes();
-                    ppm.extend(picture.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
-                    (format!("{out}.ppm"), ppm)
-                }
-            };
-            std::fs::write(Path::new(&file.0), file.1).unwrap();
-            println!("{name}: {}x{} -> {}", picture.w, picture.h, file.0);
+            let out = format!("/tmp/ebobo-title-{name}.png");
+            std::fs::write(&out, crate::image::encode_png(&picture)).unwrap();
+            println!("{name}: {}x{} -> {out}", picture.w, picture.h);
         }
     }
 }
