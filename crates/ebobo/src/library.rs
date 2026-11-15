@@ -48,12 +48,14 @@ const EMUDECK_DIRS: [&str; 3] = ["Emulation/roms/nes", "Emulation/roms/genesis",
 /// Folders scanned by default, those that exist: ~/ROMs, ~/roms, ~/Games/NES, ~/Games/Genesis,
 /// ~/Games/MegaDrive, ~/Documents/ROMs, ~/Downloads, `config::data_dir()/roms`,
 /// ~/Emulation/roms/{nes,genesis,megadrive} and the same three under every
-/// `/run/media/**/Emulation/roms/` (EmuDeck on Steam Deck, internal and SD card).
+/// `/run/media/**/Emulation/roms/` (EmuDeck on Steam Deck, internal and SD card). A folder
+/// reached twice (a symlink, or ~/ROMs and ~/roms on a Mac's case-blind disk) is listed once,
+/// under its first spelling.
 pub fn default_dirs() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut dirs = candidate_dirs(home.as_deref(), Path::new("/run/media"));
     let mut seen = HashSet::new();
-    dirs.retain(|d| d.is_dir() && seen.insert(d.clone()));
+    dirs.retain(|d| d.is_dir() && seen.insert(std::fs::canonicalize(d).unwrap_or_else(|_| d.clone())));
     dirs
 }
 

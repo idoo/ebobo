@@ -9,7 +9,8 @@ use crate::enhance::Mode;
 pub const USAGE: &str = "\
 usage: ebobo [ROM] [options]
 
-  ROM                  play a .nes/.zip file alone (or with local pads)
+  ROM                  play a NES or Mega Drive game (.nes .md .gen .smd .bin, or a .zip of
+                       one) alone or with local pads
   --host ROM           create an online room for ROM and show its code
   --join CODE          join an online room by its code
   --listen ROM         host by IP: wait for a player on UDP --port (default 7777)

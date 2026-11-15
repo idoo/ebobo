@@ -2,7 +2,6 @@
 //! Gamepad-first (Steam Deck), keyboard works everywhere. Owner: ui slice (also owns i18n.rs).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use ebobo_art::shelf::Shelf;
@@ -431,9 +430,11 @@ pub struct Ui {
 }
 
 impl Ui {
-    /// An interface without the app around it (tests, tools): pictures come from an offline
-    /// `Art` over a fresh temporary folder, favourites and history stay in memory.
+    /// An interface without the app around it (tests): pictures come from an offline `Art`
+    /// over a fresh temporary folder, favourites and history stay in memory.
+    #[cfg(test)]
     pub fn new(lang: Lang) -> Ui {
+        use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!("ebobo-art-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         Ui::with_library(lang, Art::new(dir, false), Shelf::in_memory())

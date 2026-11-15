@@ -258,6 +258,7 @@ impl Cards {
 
     /// The selected game as an index into the games of the last `update` / `draw`; `None` on
     /// the Rescan tile or with nothing shown.
+    #[cfg(test)]
     pub fn selected(&self) -> Option<usize> {
         self.view.get(self.sel).copied()
     }
@@ -538,8 +539,9 @@ impl Cards {
         if !self.dirty && fp == self.fp && history == self.history {
             return;
         }
-        // The first build starts on the first tile, not on Rescan.
-        let was_rescan = self.epoch > 0 && self.rescan && self.sel == self.view.len();
+        // The first build starts on the first tile, not on Rescan, and so does a list that was
+        // empty (the first scan still running: Rescan was the only tile to stand on).
+        let was_rescan = self.epoch > 0 && self.rescan && !self.view.is_empty() && self.sel == self.view.len();
         self.systems = [false; 2];
         for game in games {
             self.systems[system_slot(game.key.system)] = true;
@@ -985,6 +987,25 @@ mod tests {
         assert_eq!(step(&mut cards, &games, &mut shelf, |i| i.nav.confirm = true), Some(Action::Start(2)));
         step(&mut cards, &games, &mut shelf, |i| i.nav.right = true);
         assert_eq!(step(&mut cards, &games, &mut shelf, |i| i.nav.confirm = true), Some(Action::Rescan));
+    }
+
+    #[test]
+    fn games_found_by_the_first_scan_take_the_selection_from_rescan() {
+        let roms = library(3, 0);
+        let all = games(&roms);
+        let mut shelf = Shelf::in_memory();
+        let mut cards = Cards::new();
+        // The scan has found nothing yet: Rescan is the only tile.
+        idle(&mut cards, &[], &mut shelf, 2);
+        assert_eq!((cards.entries(), cards.selected()), (1, None));
+        idle(&mut cards, &all[..2], &mut shelf, 1);
+        assert_eq!(cards.selected(), Some(0), "the first game, not Rescan");
+        // Standing on Rescan by choice: more games arriving leave the selection there.
+        step(&mut cards, &all[..2], &mut shelf, |i| i.nav.right = true);
+        step(&mut cards, &all[..2], &mut shelf, |i| i.nav.right = true);
+        assert_eq!(cards.selected(), None);
+        idle(&mut cards, &all, &mut shelf, 1);
+        assert_eq!((cards.entries(), cards.selected()), (4, None));
     }
 
     #[test]
