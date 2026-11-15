@@ -425,12 +425,17 @@ impl Cpu {
     }
 
     fn operand(&mut self, bus: &mut impl Bus, mode: u8, reg: u8, size: Size, predecrement_cost: bool) -> Res<Ea> {
+        // What an address error of this operand's access needs: see `Cpu::address_error`.
+        (self.ae_pc, self.ae_program, self.ae_restore) = (0, false, None);
         Ok(match (mode, reg) {
             (0, _) => Ea::Dn(reg),
             (1, _) => Ea::An(reg),
             (3, _) => {
                 let addr = self.a(reg);
                 self.set_a(reg, addr.wrapping_add(an_step(reg, size)));
+                if size == Size::Long {
+                    self.ae_restore = Some((reg, addr));
+                }
                 Ea::Mem(addr)
             }
             (4, _) => {
@@ -438,6 +443,9 @@ impl Cpu {
                 self.set_a(reg, addr);
                 if predecrement_cost {
                     self.idle(2);
+                }
+                if size == Size::Word {
+                    self.ae_pc = 2;
                 }
                 Ea::Mem(addr)
             }
@@ -447,7 +455,14 @@ impl Cpu {
                 Size::Word => u32::from(self.fetch16(bus)?),
                 Size::Long => self.fetch32(bus)?,
             }),
-            _ => Ea::Mem(self.ea_addr(bus, mode, reg)?),
+            _ => {
+                let addr = self.ea_addr(bus, mode, reg)?;
+                if matches!((mode, reg), (5 | 6, _) | (7, 2 | 3)) {
+                    self.ae_pc = -2;
+                }
+                self.ae_program = mode == 7 && (reg == 2 || reg == 3);
+                Ea::Mem(addr)
+            }
         })
     }
 
@@ -971,13 +986,25 @@ mod tests {
         cpu.pc = 0x402;
         let fault = cpu.write(&mut bus, 0x0012_2001, Size::Word, 0).unwrap_err();
         cpu.raise(&mut bus, fault, 0x3080, false);
-        assert_eq!((cpu.pc, cpu.ssp, cpu.usp, cpu.sr, cpu.cyc), (0x1030, 0x8000 - 14, 0x7000, 0x2000, 50));
+        assert_eq!((cpu.pc, cpu.ssp, cpu.usp, cpu.sr, cpu.cyc), (0x1030, 0x8000 - 14, 0x7000, 0x2000, 54));
         let sp = cpu.ssp;
         assert_eq!(bus.r16(sp), 0x3081); // write, instruction, user data; the rest is the opcode's
         assert_eq!(bus.r32(sp + 2), 0x0012_2001);
         assert_eq!(bus.r16(sp + 6), 0x3080);
         assert_eq!(bus.r16(sp + 8), 0x8000);
-        assert_eq!(bus.r32(sp + 10), 0x402 - 2);
+        assert_eq!(bus.r32(sp + 10), 0x402);
+    }
+
+    #[test]
+    fn long_postincrement_fault_leaves_the_register() {
+        let (mut cpu, mut bus) = machine();
+        bus.w16(0x400, 0x4A98); // TST.l (A0)+
+        cpu.a[0] = 0x1001;
+        assert_eq!(cpu.step(&mut bus), 58);
+        assert_eq!(cpu.a[0], 0x1001);
+        let sp = cpu.ssp;
+        assert_eq!(bus.r16(sp), 0x4A95); // read, instruction, supervisor data
+        assert_eq!(bus.r32(sp + 10), 0x402);
     }
 
     #[test]

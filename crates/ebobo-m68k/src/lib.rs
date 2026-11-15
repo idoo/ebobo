@@ -105,6 +105,14 @@ pub struct Cpu {
     pub(crate) op_pc: u32,
     /// `irq` as the previous step saw it: level 7 is taken on the change to 7.
     pub(crate) irq_prev: u8,
+    /// Address-error notes of the operand resolved last (`core.rs`, `operand`), read by `address_error` for a
+    /// data fault and cleared when a step begins. `ae_pc`: how far the frame's PC is ahead of `pc` (-2 for the
+    /// displacement and indexed modes, +2 for a word -(An), else 0).
+    pub(crate) ae_pc: i8,
+    /// The faulting operand is PC-relative: the frame shows the program function code.
+    pub(crate) ae_program: bool,
+    /// A long (An)+: the register and its value before the step, put back when the access faults.
+    pub(crate) ae_restore: Option<(u8, u32)>,
 }
 
 /// Cycles of bus traffic inside [`Cpu::exception`]: three words pushed, two read.
@@ -144,6 +152,7 @@ impl Cpu {
             return 4;
         }
         self.cyc = 0;
+        (self.ae_pc, self.ae_program, self.ae_restore) = (0, false, None);
 
         if self.trace_pending {
             self.trace_pending = false;
@@ -270,25 +279,39 @@ impl Cpu {
     /// code: 1 data or 2 program, plus 4 in supervisor mode; the bits above are those of the
     /// instruction register), access address, instruction register, SR, PC.
     ///
-    /// The stacked PC is `pc - 2` (the chip's program counter runs one prefetched word
-    /// behind ours); an instruction whose frame differs moves `pc` before it returns the
-    /// fault. The step costs 50 cycles plus what the instruction spent before the fault,
-    /// its opcode fetch not counted.
+    /// A data fault of an operand follows the MAME suite (TST, CLR, NEG, NOT, ADD, SUB, AND, OR, EOR, CMP, ADDA,
+    /// MULU ...), with `pc` past every extension word the instruction has fetched so far:
+    /// - the stacked PC is `pc` for (An), (An)+, abs.W, abs.L and a long -(An); `pc - 2` for d16(An), d8(An,Xn),
+    ///   d16(PC), d8(PC,Xn); `pc + 2` for a word -(An) (`operand` leaves the offset in `ae_pc`);
+    /// - the status word has "not an instruction" clear and function code 1, or 2 through a PC-relative operand;
+    /// - -(An) and a word (An)+ have stepped their register; a long (An)+ has not (`ae_restore` puts it back);
+    /// - the step costs what was spent before the faulting access (the opcode fetch included) plus 54.
+    ///
+    /// A fetch from an odd address (`program`) stacks `pc - 2` and costs 50 plus what the instruction spent
+    /// before it, its opcode fetch not counted; an instruction whose frame differs moves `pc` or `cyc` before it
+    /// returns the fault.
     fn address_error(&mut self, bus: &mut impl Bus, addr: u32, write: bool, program: bool, op: u16, in_exception: bool) -> Res<()> {
+        let (pc, program_space, cycles) = if program {
+            (self.pc.wrapping_sub(2), true, self.cyc.max(4) + 46)
+        } else {
+            // Before S changes: A7 must still be the stack pointer the instruction stepped.
+            if let Some((reg, value)) = self.ae_restore.take() {
+                self.set_a(reg, value);
+            }
+            (self.pc.wrapping_add(i32::from(self.ae_pc) as u32), self.ae_program, self.cyc + 54)
+        };
         let old = self.sr;
         self.sr = (old | sr::S) & !sr::T;
-        let function_code = if old & sr::S != 0 { 4 } else { 0 } | if program { 2 } else { 1 };
+        let function_code = if old & sr::S != 0 { 4 } else { 0 } | if program_space { 2 } else { 1 };
         // A fetch from an odd address (the target of a jump, branch or return) shows as "not an instruction" too.
         let status = (op & 0xFFE0) | (u16::from(!write) << 4) | (u16::from(in_exception || program) << 3) | function_code;
-        let spent = self.cyc;
-        self.push32(bus, self.pc.wrapping_sub(2))?;
+        self.push32(bus, pc)?;
         self.push16(bus, old)?;
         self.push16(bus, op)?;
         self.push32(bus, addr)?;
         self.push16(bus, status)?;
         self.pc = self.read(bus, 12, Size::Long)?;
-        // A fault on the opcode fetch itself has spent nothing yet and still costs 50.
-        self.cyc = spent.max(4) + 46;
+        self.cyc = cycles;
         Ok(())
     }
 }
