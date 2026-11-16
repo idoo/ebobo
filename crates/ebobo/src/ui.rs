@@ -8,8 +8,8 @@ use ebobo_art::shelf::Shelf;
 use ebobo_art::Art;
 
 use ebobo_net::{
-    normalize_code, LobbyStatus, NatKind, NetDiag, NetError, NetStats, ResumeInfo, ResumeKind, RomState, RouteKind, Stage,
-    CODE_ALPHABET, CODE_LEN,
+    normalize_code, LobbyStatus, NatKind, NetDiag, NetError, NetStats, ResumeInfo, ResumeKind, RomState, RouteKind, SavePolicy,
+    Stage, CODE_ALPHABET, CODE_LEN, EMPTY_SEAT,
 };
 
 use crate::app::slots;
@@ -366,6 +366,41 @@ impl Item {
     }
 }
 
+/// One entry of the room screen's list. Its `id` is what the selection and the rows' hits hold,
+/// so the selection stays on the same row while players come, go and change seats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoomRow {
+    Resume,
+    Saves,
+    Players,
+    Start,
+    /// Seat (controller) index; only the host selects seats.
+    Seat(usize),
+}
+
+impl RoomRow {
+    fn id(self) -> usize {
+        match self {
+            RoomRow::Resume => 0,
+            RoomRow::Saves => 1,
+            RoomRow::Players => 2,
+            RoomRow::Start => 3,
+            RoomRow::Seat(k) => 4 + k,
+        }
+    }
+}
+
+/// The room's save setting in the order ◀ ▶ step through it.
+const SAVE_POLICIES: [SavePolicy; 3] = [SavePolicy::Everyone, SavePolicy::Host, SavePolicy::Off];
+
+fn saves_label(p: SavePolicy) -> S {
+    match p {
+        SavePolicy::Everyone => S::SavesAll,
+        SavePolicy::Host => S::SavesHost,
+        SavePolicy::Off => S::SavesNone,
+    }
+}
+
 const MAIN_ITEMS: [S; 6] = [S::CreateRoom, S::JoinByCode, S::PlaySolo, S::ByIp, S::Settings, S::Quit];
 const PAUSE_SOLO: [S; 6] = [S::Resume, S::Slot, S::SaveState, S::LoadState, S::Reset, S::ExitToMenu];
 const PAUSE_NET: [S; 5] = [S::Resume, S::SaveAll, S::LoadAll, S::ResetAll, S::ExitGame];
@@ -630,11 +665,11 @@ impl Ui {
         self.resume_pick = pick;
     }
 
-    /// Lobby screen (room code, players, Start for the host). The selection starts on Start,
-    /// which is row 1 under the host's resume row and clamps to row 0 without it.
+    /// Lobby screen (room code, seats, the room's settings). The selection starts on Start for
+    /// the host and on "Players here" for a guest (see `room_sel`).
     pub fn show_lobby(&mut self) {
         self.stack = vec![Screen::Lobby];
-        self.sel[Screen::Lobby.slot()] = 1;
+        self.sel[Screen::Lobby.slot()] = usize::MAX;
         self.press = None;
     }
 
@@ -876,17 +911,63 @@ impl Ui {
                     return None;
                 }
                 let lobby = ctx.lobby?;
-                let host = lobby.is_host && lobby.stage == Stage::Lobby;
-                let choosing = host && !self.resume_options.is_empty();
-                let confirm = self.menu_step(top, if choosing { 2 } else { 1 }, &nav);
-                if choosing && self.sel[top.slot()] == 0 {
-                    if !(nav.left || nav.right || confirm.is_some()) {
-                        return None;
-                    }
-                    self.resume_pick = self.cycle_resume(nav.left);
-                    return Some(UiAction::PickResume(self.resume_pick));
+                let rows = self.room_rows(lobby);
+                if rows.is_empty() {
+                    return None;
                 }
-                (confirm.is_some() && host && lobby.can_start).then_some(UiAction::StartLobbyGame)
+                let n = rows.len();
+                let mut pos = self.room_sel(&rows);
+                if nav.up {
+                    pos = (pos + n - 1) % n;
+                }
+                if nav.down {
+                    pos = (pos + 1) % n;
+                }
+                let row = rows[pos];
+                self.sel[Screen::Lobby.slot()] = row.id();
+                match row {
+                    RoomRow::Seat(k) => {
+                        // The selection follows the moved seat.
+                        if nav.left && k > 0 {
+                            self.sel[Screen::Lobby.slot()] = RoomRow::Seat(k - 1).id();
+                            Some(UiAction::MoveSeat(k, true))
+                        } else if nav.right && k + 1 < lobby.order.len() {
+                            self.sel[Screen::Lobby.slot()] = RoomRow::Seat(k + 1).id();
+                            Some(UiAction::MoveSeat(k, false))
+                        } else {
+                            None
+                        }
+                    }
+                    RoomRow::Players => {
+                        let have = Self::seats_here(lobby);
+                        let want = if nav.left {
+                            have.saturating_sub(1).max(1)
+                        } else if nav.right {
+                            (have + 1).min(4)
+                        } else if nav.confirm {
+                            have % 4 + 1
+                        } else {
+                            return None;
+                        };
+                        (want != have).then_some(UiAction::SetSeats(want))
+                    }
+                    RoomRow::Saves => {
+                        if !(nav.left || nav.right || nav.confirm) {
+                            return None;
+                        }
+                        let i = SAVE_POLICIES.iter().position(|p| *p == lobby.saves).unwrap_or(0);
+                        let n = SAVE_POLICIES.len();
+                        Some(UiAction::SetSaves(SAVE_POLICIES[if nav.left { (i + n - 1) % n } else { (i + 1) % n }]))
+                    }
+                    RoomRow::Resume => {
+                        if !(nav.left || nav.right || nav.confirm) {
+                            return None;
+                        }
+                        self.resume_pick = self.cycle_resume(nav.left);
+                        Some(UiAction::PickResume(self.resume_pick))
+                    }
+                    RoomRow::Start => (nav.confirm && lobby.can_start).then_some(UiAction::StartLobbyGame),
+                }
             }
             Screen::Pause => {
                 if nav.back || input.menu {
@@ -1760,6 +1841,39 @@ impl Ui {
         }
     }
 
+    /// The room screen's list, top to bottom: the host's seats, then the option rows. Empty
+    /// while the game starts.
+    fn room_rows(&self, lobby: &LobbyStatus) -> Vec<RoomRow> {
+        if lobby.stage != Stage::Lobby {
+            return Vec::new();
+        }
+        if !lobby.is_host {
+            return vec![RoomRow::Players];
+        }
+        let mut rows: Vec<RoomRow> = (0..lobby.order.len()).map(RoomRow::Seat).collect();
+        // A room back from a game continues it; nothing to pick.
+        if !self.resume_options.is_empty() && !lobby.regrouped {
+            rows.push(RoomRow::Resume);
+        }
+        rows.extend([RoomRow::Saves, RoomRow::Players, RoomRow::Start]);
+        rows
+    }
+
+    /// Position of the selection in `rows`. None yet, or a row that is gone (a seat whose
+    /// player left): Start for the host, "Players here" for a guest.
+    fn room_sel(&self, rows: &[RoomRow]) -> usize {
+        let id = self.sel[Screen::Lobby.slot()];
+        rows.iter()
+            .position(|r| r.id() == id)
+            .or_else(|| rows.iter().position(|r| *r == RoomRow::Start))
+            .unwrap_or(0)
+    }
+
+    /// Players the host granted this device.
+    fn seats_here(lobby: &LobbyStatus) -> u8 {
+        lobby.players.iter().find(|p| p.is_self).map_or(1, |p| p.seats.clamp(1, 4))
+    }
+
     // -----------------------------------------------------------------------------------------
     // Drawing
 
@@ -2000,77 +2114,129 @@ impl Ui {
             f.draw(c, x + f.width(base, 1), 108, self.ticker(), WHITE, 1);
             return;
         };
-        f.draw_centered(c, 8, self.t(S::Room), SEC, 1);
+        f.draw_centered(c, 4, self.t(S::Room), SEC, 1);
         match &lobby.code {
             Some(code) => {
-                f.draw_centered(c, 20, code, WHITE, 2);
+                f.draw_centered(c, 14, code, WHITE, 2);
                 let keys = keyboard.then_some(COPY_KEYS);
-                f.draw_centered(c, 40, &tell_code_line(self.t(S::TellCode), keys), SEC, 1);
+                f.draw_centered(c, 34, &tell_code_line(self.t(S::TellCode), keys), SEC, 1);
             }
-            None => f.draw_centered(c, 20, "IP", WHITE, 2),
+            None => f.draw_centered(c, 14, "IP", WHITE, 2),
         }
+        let rows = self.room_rows(lobby);
+        let selected = rows.get(self.room_sel(&rows)).copied();
         for i in 0..4 {
-            let y = 58 + i as i32 * 22;
-            c.fill_rect(8, y - 4, 240, 20, PANEL);
+            let y = 50 + i as i32 * 18;
+            let on = selected == Some(RoomRow::Seat(i));
+            c.fill_rect(8, y - 4, 240, 16, if on { ACCENT } else { PANEL });
             f.draw(c, 12, y, &(i + 1).to_string(), SLOT[i], 1);
-            let Some(p) = lobby.players.get(i) else {
-                f.draw(c, 28, y, self.t(S::Waiting), DIS, 1);
+            let Some(&peer) = lobby.order.get(i) else {
+                if i == lobby.order.len() {
+                    f.draw(c, 28, y, self.t(S::Waiting), DIS, 1);
+                }
                 continue;
             };
-            let name = if p.is_self { format!("{} ({})", trunc(&p.name, 16), self.t(S::You)) } else { trunc(&p.name, 22) };
+            if rows.contains(&RoomRow::Seat(i)) {
+                h.push((row_area(y, 16), Hit::Row { i: RoomRow::Seat(i).id(), back: None, enabled: true }));
+            }
+            if on {
+                tri(c, 21, y, WHITE, false);
+                tri(c, 228, y, WHITE, true);
+            }
+            if peer == EMPTY_SEAT {
+                f.draw(c, 28, y, self.t(S::SeatFree), DIS, 1);
+                continue;
+            }
+            let Some(p) = lobby.players.iter().find(|p| p.id == peer) else { continue };
+            // A device's further seats are its 2nd, 3rd, 4th local player.
+            let nth = lobby.order[..i].iter().filter(|&&q| q == peer).count();
+            // What stands right of the name, ending before the ▶ at 228: the first seat only.
+            let mut right: Vec<(String, Color)> = Vec::new();
+            if nth == 0 {
+                if p.away {
+                    right.push((self.t(S::Reconnecting).to_string(), WARN));
+                } else if p.rom == RomState::Have {
+                    if let Some(route) = p.route {
+                        right.push(((if route == RouteKind::Direct { "P2P" } else { "relay" }).to_string(), SEC));
+                    }
+                    if let Some(ms) = p.rtt_ms {
+                        right.push((format!("{ms} ms"), ping_color(ms)));
+                    }
+                } else {
+                    right.push(match p.rom {
+                        RomState::Receiving { percent } => (format!("ROM {percent}%"), WARN),
+                        RomState::Missing => ("ROM -".to_string(), ERR),
+                        _ => ("ROM ?".to_string(), DIS),
+                    });
+                }
+            }
+            let width: i32 = right.iter().map(|(s, _)| f.width(s, 1) + 8).sum();
+            let mut x = 224 + 8 - width;
+            for (s, col) in &right {
+                f.draw(c, x, y, s, *col, 1);
+                x += f.width(s, 1) + 8;
+            }
+            let suffix = match nth {
+                0 if p.is_self => format!(" ({})", self.t(S::You)),
+                0 => String::new(),
+                n => format!(" {}", n + 1),
+            };
+            let cols = ((224 - width - 28) / 8 - 1).max(4) as usize;
+            let name = format!("{}{suffix}", trunc(&p.name, cols.saturating_sub(suffix.chars().count()).max(3)));
             f.draw(c, 28, y, &name, if p.away { SEC } else { WHITE }, 1);
-            if p.ready {
+            if p.ready && nth == 0 {
                 tick(c, 236, y, OK);
-            }
-            let y2 = y + 9;
-            if p.away {
-                f.draw(c, 28, y2, self.t(S::Reconnecting), WARN, 1);
-                continue;
-            }
-            if let Some(route) = p.route {
-                f.draw(c, 28, y2, if route == RouteKind::Direct { "P2P" } else { "relay" }, SEC, 1);
-            }
-            if let Some(ms) = p.rtt_ms {
-                f.draw(c, 76, y2, &format!("{ms} ms"), ping_color(ms), 1);
-            }
-            let (rom, col) = match p.rom {
-                RomState::Have => ("ROM".to_string(), OK),
-                RomState::Receiving { percent } => (format!("ROM {percent}%"), WARN),
-                RomState::Missing => ("ROM -".to_string(), ERR),
-                RomState::Unknown => ("ROM ?".to_string(), DIS),
-            };
-            f.draw(c, 148, y2, &rom, col, 1);
-            if p.rom == RomState::Have {
-                tick(c, 176, y2, OK);
             }
         }
         if let Some(rom) = &lobby.rom_name {
-            f.draw_centered(c, 150, &trunc(rom, 30), SEC, 1);
+            f.draw_centered(c, 124, &trunc(rom, 30), SEC, 1);
         }
         if lobby.stage == Stage::Starting {
-            f.draw_centered(c, 172, &format!("{}...", self.t(S::Starting)), WHITE, 1);
-        } else if lobby.is_host {
-            let block = self.lobby_block(lobby);
-            let mut rows = Vec::with_capacity(2);
-            if !self.resume_options.is_empty() {
-                rows.push(self.resume_item());
+            f.draw_centered(c, 150, &format!("{}...", self.t(S::Starting)), WHITE, 1);
+            return;
+        }
+        let y0 = 138;
+        let block = self.lobby_block(lobby);
+        let options: Vec<RoomRow> = rows.iter().copied().filter(|r| !matches!(r, RoomRow::Seat(_))).collect();
+        let items: Vec<Item> = options
+            .iter()
+            .map(|row| match row {
+                RoomRow::Resume => self.resume_item(),
+                RoomRow::Saves => Item::value(self.t(S::NetSaves), self.t(saves_label(lobby.saves)).to_string(), true),
+                RoomRow::Players => Item::value(self.t(S::PlayersHere), Self::seats_here(lobby).to_string(), true),
+                RoomRow::Start | RoomRow::Seat(_) => {
+                    let mut start = Item::new(self.t(if lobby.regrouped { S::ContinueGame } else { S::Start }));
+                    start.disabled = block.is_some();
+                    start
+                }
+            })
+            .collect();
+        // `draw_rows` numbers its hits by position; they carry the row ids instead.
+        let first = h.len();
+        let sel = selected.and_then(|s| options.iter().position(|r| *r == s)).unwrap_or(usize::MAX);
+        Self::draw_rows(c, f, &items, sel, y0, 16, h);
+        for (_, hit) in &mut h[first..] {
+            if let Hit::Row { i, .. } = hit {
+                *i = options[*i].id();
             }
-            let mut start = Item::new(self.t(S::Start));
-            start.disabled = block.is_some();
-            rows.push(start);
-            // Two rows start higher so the reason line keeps clear of the toasts.
-            let y0 = if rows.len() == 2 { 164 } else { 172 };
-            let sel = self.sel[Screen::Lobby.slot()].min(rows.len() - 1);
-            Self::draw_rows(c, f, &rows, sel, y0, 16, h);
+        }
+        let below = y0 + items.len() as i32 * 16 + 4;
+        if lobby.is_host {
             if let Some(reason) = block {
-                f.draw_centered(c, y0 + rows.len() as i32 * 16 + 4, self.t(reason), WARN, 1);
+                f.draw_centered(c, below, self.t(reason), WARN, 1);
             }
         } else {
-            if let Some(r) = lobby.resume {
-                let line = format!("{} ({})", self.t(resume_label(r.kind)), self.unix_age(r.saved_at));
-                f.draw_centered(c, 161, &trunc(&line, 30), WHITE, 1);
+            let resume = if lobby.regrouped {
+                Some(self.t(S::GameContinues).to_string())
+            } else {
+                lobby.resume.map(|r| format!("{} ({})", self.t(resume_label(r.kind)), self.unix_age(r.saved_at)))
+            };
+            if let Some(line) = resume {
+                f.draw_centered(c, below, &trunc(&line, 30), WHITE, 1);
             }
-            f.draw_centered(c, 174, self.t(S::WaitHost), SEC, 1);
+            let saves = format!("{}: {}", self.t(S::NetSaves), self.t(saves_label(lobby.saves)));
+            f.draw_centered(c, below + 12, &saves, SEC, 1);
+            f.draw_centered(c, below + 24, self.t(S::WaitHost), SEC, 1);
         }
     }
 
@@ -2334,12 +2500,16 @@ impl Ui {
                     Some(Screen::NetCheck) if self.diag_running => vec![(Glyph::Back, S::Back)],
                     Some(Screen::NetCheck) => vec![(Glyph::Confirm, S::Recheck), (Glyph::Back, S::Back)],
                     Some(Screen::Lobby) => {
-                        let host = ctx.lobby.is_some_and(|l| l.is_host && l.stage == Stage::Lobby);
                         let mut v = vec![(Glyph::Back, S::Leave)];
-                        if host && !self.resume_options.is_empty() && self.sel[Screen::Lobby.slot()] == 0 {
-                            v.insert(0, (Glyph::LeftRight, S::Change));
-                        } else if host {
-                            v.insert(0, (Glyph::Confirm, S::Start));
+                        if let Some(lobby) = ctx.lobby {
+                            let rows = self.room_rows(lobby);
+                            if let Some(row) = rows.get(self.room_sel(&rows)) {
+                                v.insert(0, match row {
+                                    RoomRow::Seat(_) => (Glyph::LeftRight, S::HintSeat),
+                                    RoomRow::Start => (Glyph::Confirm, S::Start),
+                                    _ => (Glyph::LeftRight, S::Change),
+                                });
+                            }
                         }
                         v
                     }
