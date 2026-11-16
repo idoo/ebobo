@@ -256,6 +256,11 @@ impl Video {
     pub fn new(sdl: &sdl2::Sdl, fullscreen: bool, scale: u32, screen: ScreenMode) -> Result<Video, String> {
         let video = sdl.video()?;
         sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
+        // Windows, on a display scaled to 125-200%: window sizes in points and drawing in real
+        // pixels, as on a Mac (`allow_highdpi` below). Without it Windows stretches the picture.
+        if cfg!(windows) {
+            sdl2::hint::set("SDL_WINDOWS_DPI_SCALING", "1");
+        }
         let scale = scale.clamp(1, 6);
         let make = |accelerated: bool| -> Result<WindowCanvas, String> {
             let mut builder = video.window("ebobo", W * scale, H * scale);

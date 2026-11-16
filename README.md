@@ -1,6 +1,6 @@
 # ebobo
 
-A NES and Sega Mega Drive / Genesis emulator for playing with friends over the internet, on a Mac or a Steam Deck. Up to four players. Both cores are written from scratch for this.
+A NES and Sega Mega Drive / Genesis emulator for playing with friends over the internet, on a Mac, a Windows PC or a Steam Deck. Up to four players. Both cores are written from scratch for this.
 
 It uses rollback netcode, like fighting games do. A bad connection makes a sprite jump now and then, and the game never slows down. The input delay follows the connection during the game: up to three frames on a slow link, the rest is rollback. If the Wi-Fi drops or a phone hotspot switches networks mid-game, ebobo reroutes through the server within a few seconds, goes back to a direct link when one works again, and waits up to 20 seconds for a player to come back. IPv6 is used when both sides have it, which gets many mobile connections a direct link.
 
@@ -9,6 +9,8 @@ No games included. Bring your own ROMs. The Mega Drive core is new and so far ch
 ## Install
 
 **Mac** (macOS 11+): download [ebobo-mac.zip](https://github.com/idoo/ebobo/releases/latest/download/ebobo-mac.zip), unzip it, drag ebobo.app to Applications.
+
+**Windows** (10 or later, 64-bit): download [ebobo-windows.zip](https://github.com/idoo/ebobo/releases/latest/download/ebobo-windows.zip), unzip it and run ebobo.exe. Windows may warn about an unknown publisher: More info, then Run anyway. Put your ROMs in a `ROMs` folder in your home folder (`C:\Users\<you>\ROMs`).
 
 **Steam Deck**: in Desktop Mode open Konsole and run
 

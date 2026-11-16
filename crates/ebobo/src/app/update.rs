@@ -108,6 +108,8 @@ pub enum Target {
     Mac { bundle: PathBuf },
     /// The running executable (Steam Deck install).
     Linux { exe: PathBuf },
+    /// The running `ebobo.exe` (unzipped anywhere the player chose).
+    Windows { exe: PathBuf },
 }
 
 impl Target {
@@ -120,7 +122,7 @@ impl Target {
     fn dir(&self) -> &Path {
         match self {
             Target::Mac { bundle } => bundle.parent().unwrap_or(Path::new("/")),
-            Target::Linux { exe } => exe.parent().unwrap_or(Path::new("/")),
+            Target::Linux { exe } | Target::Windows { exe } => exe.parent().unwrap_or(Path::new("/")),
         }
     }
 
@@ -128,6 +130,7 @@ impl Target {
         match self {
             Target::Mac { .. } => "ebobo-mac.zip",
             Target::Linux { .. } => "ebobo-steamdeck.tar.gz",
+            Target::Windows { .. } => "ebobo-windows.zip",
         }
     }
 }
@@ -143,6 +146,8 @@ fn target_for(exe: &Path) -> Option<Target> {
         is_bundle.then(|| Target::Mac { bundle: bundle.to_path_buf() })
     } else if cfg!(target_os = "linux") {
         Some(Target::Linux { exe: exe.to_path_buf() })
+    } else if cfg!(windows) {
+        Some(Target::Windows { exe: exe.to_path_buf() })
     } else {
         None
     }
@@ -155,6 +160,8 @@ pub enum Blocker {
     MoveToApplications,
     /// Linux: install dir not writable; re-run the installer.
     RerunInstaller,
+    /// Windows: the program's folder is not writable; download ebobo again somewhere else.
+    DownloadAgain,
 }
 
 fn blocker(target: &Target) -> Option<Blocker> {
@@ -164,6 +171,7 @@ fn blocker(target: &Target) -> Option<Blocker> {
             Some(Blocker::MoveToApplications)
         }
         Target::Linux { .. } if !ok => Some(Blocker::RerunInstaller),
+        Target::Windows { .. } if !ok => Some(Blocker::DownloadAgain),
         _ => None,
     }
 }
@@ -211,6 +219,10 @@ pub struct Updater {
 
 impl Updater {
     pub fn new() -> Updater {
+        // The copy an update replaced on Windows stays next to the exe until the next start.
+        if let Some(Target::Windows { exe }) = Target::detect() {
+            remove_old_copies(&exe);
+        }
         Updater { rx: None, status: Status::Idle, blocker_shown: false, changed: false }
     }
 
@@ -326,6 +338,7 @@ impl Updater {
         let swapped = match &p.target {
             Target::Mac { bundle } => swap_mac(bundle, &p.new_path, verify_mac),
             Target::Linux { exe } => swap_linux(exe, &p.new_path),
+            Target::Windows { exe } => swap_windows(exe, &p.new_path, std::process::id()),
         };
         let _ = std::fs::remove_dir_all(&p.staging);
         let result = swapped.and_then(|()| {
@@ -344,7 +357,7 @@ impl Updater {
                     Err(e) => Err(format!("open: {e}")),
                 }
             }
-            (Target::Linux { exe }, true) => exec(exe, args),
+            (Target::Linux { exe } | Target::Windows { exe }, true) => exec(exe, args),
         });
         match result {
             Ok(()) => eprintln!("ebobo: update: v{} installed", p.version),
@@ -359,9 +372,25 @@ fn exec(exe: &Path, args: &[String]) -> Result<(), String> {
     Err(format!("exec {}: {}", exe.display(), Command::new(exe).args(args).exec()))
 }
 
+/// Windows cannot replace a running process: the new program starts with the same arguments
+/// and this one exits.
 #[cfg(not(unix))]
-fn exec(_exe: &Path, _args: &[String]) -> Result<(), String> {
-    Err("relaunch is not supported on this platform".into())
+fn exec(exe: &Path, args: &[String]) -> Result<(), String> {
+    match quiet(Command::new(exe).args(args)).spawn() {
+        Ok(_) => std::process::exit(0),
+        Err(e) => Err(format!("start {}: {e}", exe.display())),
+    }
+}
+
+/// Windows opens a console window for every console program a windowed program starts
+/// (`curl`, `tar`); this flag (CREATE_NO_WINDOW) keeps it hidden. Elsewhere nothing to hide.
+fn quiet(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
 }
 
 /// Holds the version of the last update installed (see `prepare`).
@@ -379,12 +408,12 @@ fn run(cmd: &mut Command) -> Result<String, String> {
 }
 
 fn latest_version() -> Result<Version, String> {
-    let headers = run(Command::new("curl").args(["-fsSI", "--max-time", "20", &format!("{REPO}/latest")]))?;
+    let headers = run(quiet(&mut Command::new("curl")).args(["-fsSI", "--max-time", "20", &format!("{REPO}/latest")]))?;
     parse_location(&headers).ok_or_else(|| "no release tag in the Location header".to_string())
 }
 
 fn download(url: &str, to: &Path) -> Result<(), String> {
-    run(Command::new("curl").args(["-fsSL", "--max-time", "600", "-o"]).arg(to).arg(url)).map(drop)
+    run(quiet(&mut Command::new("curl")).args(["-fsSL", "--max-time", "600", "-o"]).arg(to).arg(url)).map(drop)
 }
 
 /// Worker: check, download, verify, unpack. `Ok(None)`: nothing to install.
@@ -457,6 +486,16 @@ fn fetch_and_unpack(
                 Err(format!("{asset} has no ebobo-steamdeck/ebobo"))
             }
         }
+        Target::Windows { .. } => {
+            // Windows 10 and later ship bsdtar as tar.exe, which reads zip files.
+            run(quiet(&mut Command::new("tar")).arg("-xf").arg(&archive).arg("-C").arg(&out))?;
+            let exe = windows_program(&out);
+            if exe.is_file() {
+                Ok(exe)
+            } else {
+                Err(format!("{asset} has no ebobo-windows/ebobo.exe"))
+            }
+        }
     }
 }
 
@@ -502,9 +541,88 @@ fn swap_linux(exe: &Path, new: &Path) -> Result<(), String> {
     std::fs::rename(new, exe).map_err(|e| format!("replace {}: {e}", exe.display()))
 }
 
+/// Where the Windows zip, unpacked into `out`, has the new program.
+fn windows_program(out: &Path) -> PathBuf {
+    out.join("ebobo-windows").join("ebobo.exe")
+}
+
+/// `ebobo.exe` → `ebobo.exe.old-<pid>` in the same folder.
+fn old_copy(exe: &Path, pid: u32) -> PathBuf {
+    let name = exe.file_name().unwrap_or_default().to_string_lossy();
+    exe.with_file_name(format!("{name}.old-{pid}"))
+}
+
+/// Windows refuses to overwrite or delete a running program but lets it be renamed: the
+/// running `exe` moves aside to `exe.old-<pid>` and `new` takes its name. On failure the old
+/// one is put back. The old copy is deleted at the next start (`remove_old_copies`).
+fn swap_windows(exe: &Path, new: &Path, pid: u32) -> Result<(), String> {
+    let aside = old_copy(exe, pid);
+    std::fs::rename(exe, &aside).map_err(|e| format!("move {} aside: {e}", exe.display()))?;
+    if let Err(e) = std::fs::rename(new, exe) {
+        let _ = std::fs::rename(&aside, exe);
+        return Err(format!("move new {} into place: {e}", exe.display()));
+    }
+    Ok(())
+}
+
+/// Deletes the `exe.old-*` copies earlier updates left next to `exe` (errors ignored: one
+/// still running is tried again at the next start).
+fn remove_old_copies(exe: &Path) {
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else { return };
+    let prefix = format!("{}.old-", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_asset_per_target() {
+        assert_eq!(Target::Mac { bundle: "/Applications/ebobo.app".into() }.asset(), "ebobo-mac.zip");
+        assert_eq!(Target::Linux { exe: "/home/deck/ebobo".into() }.asset(), "ebobo-steamdeck.tar.gz");
+        let win = Target::Windows { exe: "/games/ebobo-windows/ebobo.exe".into() };
+        assert_eq!(win.asset(), "ebobo-windows.zip");
+        assert_eq!(win.dir(), Path::new("/games/ebobo-windows"));
+        assert_eq!(
+            windows_program(Path::new("/games/.ebobo-update-7/new")),
+            Path::new("/games/.ebobo-update-7/new/ebobo-windows/ebobo.exe")
+        );
+    }
+
+    #[test]
+    fn update_windows_swap_rollback_and_cleanup() {
+        let dir = tmp("windows");
+        let exe = dir.join("ebobo.exe");
+        std::fs::write(&exe, b"old").unwrap();
+        let other = dir.join("ebobo.exe.config");
+        std::fs::write(&other, b"keep").unwrap();
+
+        // The new program is missing: the running one is back under its name, nothing aside.
+        let missing = dir.join(".ebobo-update-1/new/ebobo-windows/ebobo.exe");
+        assert!(swap_windows(&exe, &missing, 41).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+        assert!(!old_copy(&exe, 41).exists());
+
+        let new = windows_program(&dir.join(".ebobo-update-1/new"));
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::write(&new, b"new").unwrap();
+        swap_windows(&exe, &new, 42).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        assert!(!new.exists());
+        assert_eq!(std::fs::read(dir.join("ebobo.exe.old-42")).unwrap(), b"old");
+
+        remove_old_copies(&exe);
+        assert!(!dir.join("ebobo.exe.old-42").exists());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        assert!(other.exists(), "only the old copies go");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ebobo-update-test-{name}-{}", std::process::id()));

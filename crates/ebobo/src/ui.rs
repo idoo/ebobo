@@ -123,6 +123,8 @@ pub enum Text {
     UpdateMoveToApps,
     /// Linux self-update impossible (install dir not writable).
     UpdateRerunInstaller,
+    /// Windows self-update impossible (the program's folder is not writable).
+    UpdateDownloadAgain,
     /// The Deck's buttons arrive as keyboard keys (Steam's Desktop Layout).
     DeckKeys,
     /// How to switch the Deck to its gamepad layout.
@@ -718,6 +720,7 @@ impl Ui {
             Text::ScreenshotFailed => S::ScreenshotFailed,
             Text::UpdateMoveToApps => S::UpdateMoveToApps,
             Text::UpdateRerunInstaller => S::UpdateRerunInstaller,
+            Text::UpdateDownloadAgain => S::UpdateDownloadAgain,
             Text::DeckKeys => S::DeckKeys,
             Text::DeckKeysFix => S::DeckKeysFix,
             Text::MenuHintPad => S::MenuHintPad,
@@ -1791,10 +1794,19 @@ impl Ui {
                 let base = self.t(S::Scanning);
                 f.draw(c, 64, 60, &format!("{base}{}", self.ticker()), WARN, 1);
             }
-            let lines = [S::PutRomsIn, S::PutRomsKinds, S::RomsHome, S::RomsDeck, S::RomsDeckMd, S::RomsDownloads];
-            // Six lines 10 px apart between "No games found" (y 124) and the detail line (y 196).
-            for (i, s) in lines.into_iter().enumerate() {
-                f.draw(c, 16, 136 + i as i32 * 10, self.t(s), SEC, 1);
+            // On Windows `~` means nothing and there is no Steam Deck: the real folders are
+            // named, cut from the left when longer than the line (28 characters).
+            let mut lines = vec![self.t(S::PutRomsIn).to_string(), self.t(S::PutRomsKinds).to_string()];
+            if cfg!(windows) {
+                let home = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()).unwrap_or_default();
+                lines.extend(["ROMs", "Downloads"].map(|name| trunc_left(&home.join(name).display().to_string(), 28)));
+            } else {
+                let named = [S::RomsHome, S::RomsDeck, S::RomsDeckMd, S::RomsDownloads];
+                lines.extend(named.map(|s| self.t(s).to_string()));
+            }
+            // Up to six lines 10 px apart between "No games found" (y 124) and the detail line (y 196).
+            for (i, line) in lines.iter().enumerate() {
+                f.draw(c, 16, 136 + i as i32 * 10, line, SEC, 1);
             }
         }
     }

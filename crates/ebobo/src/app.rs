@@ -603,6 +603,7 @@ impl App {
             self.ui.toast(self.ui.text(match blocker {
                 update::Blocker::MoveToApplications => Text::UpdateMoveToApps,
                 update::Blocker::RerunInstaller => Text::UpdateRerunInstaller,
+                update::Blocker::DownloadAgain => Text::UpdateDownloadAgain,
             }));
         }
         if self.updater.take_changed() {

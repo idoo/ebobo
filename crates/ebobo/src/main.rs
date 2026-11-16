@@ -1,4 +1,7 @@
-//! ebobo: NES emulator with online play for 2-4 friends (macOS, Steam Deck / Linux).
+//! ebobo: NES emulator with online play for 2-4 friends (macOS, Windows, Steam Deck / Linux).
+
+// A release build on Windows is a windowed program: no console window opens with the game.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
 mod audio;

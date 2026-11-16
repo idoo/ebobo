@@ -34,10 +34,21 @@ pub fn fetch(url: &str, to: &Path, timeout_secs: u32) -> Result<(), FetchError> 
     result
 }
 
+/// Windows opens a console window for every console program a windowed program starts; this
+/// flag (CREATE_NO_WINDOW) keeps it hidden. Elsewhere there is nothing to hide.
+fn quiet(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
 /// Runs `curl` writing the body to `part`. `Ok` when it exited with 0 and the status is 200
 /// (or 000: a `file://` URL has no status).
 fn download(url: &str, part: &Path, timeout_secs: u32) -> Result<(), FetchError> {
-    let output = Command::new("curl")
+    let output = quiet(&mut Command::new("curl"))
         .args(["-sSL", "--max-time", &timeout_secs.to_string(), "-o"])
         .arg(part)
         // `--url` so that a URL starting with a dash is never taken for an option.

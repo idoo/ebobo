@@ -52,7 +52,8 @@ const EMUDECK_DIRS: [&str; 3] = ["Emulation/roms/nes", "Emulation/roms/genesis",
 /// reached twice (a symlink, or ~/ROMs and ~/roms on a Mac's case-blind disk) is listed once,
 /// under its first spelling.
 pub fn default_dirs() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // Windows has no HOME variable; on a Mac and Linux this reads HOME.
+    let home = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
     let mut dirs = candidate_dirs(home.as_deref(), Path::new("/run/media"));
     let mut seen = HashSet::new();
     dirs.retain(|d| d.is_dir() && seen.insert(std::fs::canonicalize(d).unwrap_or_else(|_| d.clone())));

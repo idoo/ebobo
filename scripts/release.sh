@@ -5,6 +5,7 @@
 # then creates the GitHub release with stable asset names so these links always work:
 #   https://github.com/idoo/ebobo/releases/latest/download/ebobo-mac.zip
 #   https://github.com/idoo/ebobo/releases/latest/download/ebobo-steamdeck.tar.gz
+#   https://github.com/idoo/ebobo/releases/latest/download/ebobo-windows.zip
 #   https://github.com/idoo/ebobo/releases/latest/download/install-steamdeck.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -35,15 +36,16 @@ git archive "$tag" | tar -x -m -C "$src"
 cache="${CARGO_TARGET_DIR:-$PWD/target-pkg}"
 (cd "$src" && CARGO_TARGET_DIR="$cache" scripts/package-mac.sh)
 (cd "$src" && scripts/build-linux.sh)
+(cd "$src" && scripts/build-windows.sh)
 
 # Gate: nothing game-derived in the downloads.
-if (cd "$src/dist" && unzip -l ebobo-mac.zip; tar -tzf ebobo-steamdeck.tar.gz) | grep -i -E '\.(nes|chr|zip|md|gen|smd|bin)$' | grep -v -E 'ebobo-mac\.zip|README\.md$'; then
+if (cd "$src/dist" && unzip -l ebobo-mac.zip; tar -tzf ebobo-steamdeck.tar.gz; unzip -l ebobo-windows.zip) | grep -i -E '\.(nes|chr|zip|md|gen|smd|bin)$' | grep -v -E 'ebobo-mac\.zip|ebobo-windows\.zip|README\.md$'; then
     echo "a ROM or tile file ended up in a download, refusing" >&2
     exit 1
 fi
 
 # Checksums the in-app updater verifies downloads against (`shasum -a 256` format, bare names).
-(cd "$src/dist" && shasum -a 256 ebobo-mac.zip ebobo-steamdeck.tar.gz install-steamdeck.sh > SHA256SUMS)
+(cd "$src/dist" && shasum -a 256 ebobo-mac.zip ebobo-steamdeck.tar.gz ebobo-windows.zip install-steamdeck.sh > SHA256SUMS)
 
 notes="$(mktemp)"
 if [ -n "${RELEASE_NOTES:-}" ]; then
@@ -53,6 +55,8 @@ fi
 cat >> "$notes" <<EOF
 **Mac** (macOS 11+): download \`ebobo-mac.zip\`, unzip it and drag ebobo.app to Applications.
 
+**Windows** (10 or later, 64-bit): download \`ebobo-windows.zip\`, unzip it and run ebobo.exe. Windows may warn about an unknown publisher: More info, then Run anyway.
+
 **Steam Deck**: in Desktop Mode open Konsole and run
 \`\`\`
 curl -sL https://github.com/idoo/ebobo/releases/latest/download/install-steamdeck.sh | bash
@@ -61,5 +65,6 @@ curl -sL https://github.com/idoo/ebobo/releases/latest/download/install-steamdec
 ebobo updates itself after that. No games included, bring your own ROMs.
 EOF
 gh release create "$tag" --repo idoo/ebobo --title "ebobo $version" --notes-file "$notes" \
-    "$src/dist/ebobo-mac.zip" "$src/dist/ebobo-steamdeck.tar.gz" "$src/dist/install-steamdeck.sh" "$src/dist/SHA256SUMS"
+    "$src/dist/ebobo-mac.zip" "$src/dist/ebobo-steamdeck.tar.gz" "$src/dist/ebobo-windows.zip" \
+    "$src/dist/install-steamdeck.sh" "$src/dist/SHA256SUMS"
 echo "released $tag"
