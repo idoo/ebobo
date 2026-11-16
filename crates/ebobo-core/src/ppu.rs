@@ -707,20 +707,20 @@ impl Ppu {
 
     // ---------------------------------------------------------------- stepping
 
-    /// Advances one dot. Visible pixels go to `fb` (`WIDTH * HEIGHT`, value = palette index
-    /// | emphasis bits << 6 | [`FRAME_SPRITE`] for a sprite pixel). Pattern fetches go through
-    /// `cart.ppu_read(addr, dot_counter)`.
-    #[inline]
+    /// [`Ppu::tick_planes`] without the planes.
+    #[cfg(test)]
     pub fn tick(&mut self, cart: &mut Cartridge, fb: &mut [u16]) {
         self.tick_planes(cart, fb, &mut []);
     }
 
-    /// [`Ppu::tick`] that also keeps the background and the sprites of every visible pixel
-    /// apart in `planes`, unless it is empty: `WIDTH * HEIGHT` background words, then as many
-    /// sprite words. Each is a picture word (colour, emphasis, layer) of what that plane
-    /// alone shows there, plus [`PLANE_OPAQUE`] and, for sprites, [`PLANE_FRONT`]; a
-    /// transparent background word carries the backdrop colour, a transparent sprite word
-    /// is 0. Nothing is written when `fb` is empty.
+    /// Advances one dot. Visible pixels go to `fb` (`WIDTH * HEIGHT`, value = palette index
+    /// | emphasis bits << 6 | [`FRAME_SPRITE`] for a sprite pixel). Pattern fetches go through
+    /// `cart.ppu_read(addr, dot_counter)`. Unless `planes` is empty, the background and the
+    /// sprites of every visible pixel are also kept apart in it: `WIDTH * HEIGHT` background
+    /// words, then as many sprite words. Each is a picture word (colour, emphasis, layer) of
+    /// what that plane alone shows there, plus [`PLANE_OPAQUE`] and, for sprites,
+    /// [`PLANE_FRONT`]; a transparent background word carries the backdrop colour, a
+    /// transparent sprite word is 0. Nothing is written when `fb` is empty.
     #[inline]
     pub fn tick_planes(&mut self, cart: &mut Cartridge, fb: &mut [u16], planes: &mut [u16]) {
         let line = self.scanline;
