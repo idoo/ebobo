@@ -100,6 +100,9 @@ pub struct InputFrame {
     pub backspace: bool,
     /// Cmd+V / Ctrl+V clipboard text.
     pub paste: Option<String>,
+    /// Cmd+C / Ctrl+C went down (not an auto-repeat): the screen that has something worth
+    /// copying puts it on the clipboard with [`Input::copy_text`].
+    pub copy: bool,
     /// Open/close the menu: Esc, a click of the right stick, gamepad Guide/PS button,
     /// PlayStation touchpad click, or Back+Start held for 0.6 s.
     pub menu: bool,
@@ -1094,6 +1097,7 @@ impl Input {
                                 .ok()
                                 .filter(|t| !t.is_empty());
                         }
+                        Scancode::C if (cmd || ctrl) && !repeat => f.copy = true,
                         Scancode::F5 if !repeat => f.save_state = true,
                         Scancode::F7 if !repeat => f.load_state = true,
                         Scancode::F12 if !repeat => f.screenshot = true,
@@ -1224,6 +1228,13 @@ impl Input {
             self.text_input.start();
         } else {
             self.text_input.stop();
+        }
+    }
+
+    /// Puts `text` on the system clipboard (Cmd+C / Ctrl+C on a screen with something to copy).
+    pub fn copy_text(&mut self, text: &str) {
+        if let Err(err) = self.clipboard.set_clipboard_text(text) {
+            eprintln!("ebobo: clipboard: {err}");
         }
     }
 

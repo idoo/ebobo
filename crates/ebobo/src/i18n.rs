@@ -340,6 +340,7 @@ pub(crate) enum S {
     SavesStay,
     AnswerTrash,
     AnswerForGood,
+    CodeCopied,
 }
 
 impl S {
@@ -569,6 +570,7 @@ impl S {
             SavesStay => ("Сохранения останутся.", "Your saves stay."),
             AnswerTrash => ("В корзину", "Move to Trash"),
             AnswerForGood => ("Удалить навсегда", "Delete for good"),
+            CodeCopied => ("Код скопирован", "Code copied"),
         }
     }
 }

@@ -129,6 +129,8 @@ pub enum Text {
     MovedToTrash,
     FileDeleted,
     CantDelete,
+    /// The room code went to the clipboard.
+    CodeCopied,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -204,6 +206,18 @@ fn wrap(text: &str, cols: usize) -> Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+/// The shortcut that copies a room code on this platform.
+const COPY_KEYS: &str = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
+
+/// The line under a room code: "Tell friends the code", plus the copy shortcut in brackets
+/// when the player is on a keyboard.
+fn tell_code_line(text: &str, keys: Option<&str>) -> String {
+    match keys {
+        Some(keys) => format!("{text} ({keys})"),
+        None => text.to_string(),
+    }
 }
 
 /// Full-width hit region of a row whose text sits at `y`, `step` px pitch, at least `MIN_TAP`
@@ -654,6 +668,7 @@ impl Ui {
             Text::MovedToTrash => S::MovedToTrash,
             Text::FileDeleted => S::FileDeleted,
             Text::CantDelete => S::CantDelete,
+            Text::CodeCopied => S::CodeCopied,
         })
     }
 
@@ -846,7 +861,7 @@ impl Ui {
             Some(Screen::Settings) => self.draw_settings(canvas, font, ctx, input.hint_kind, &mut h),
             Some(Screen::Advanced) => self.draw_advanced(canvas, font, ctx, &mut h),
             Some(Screen::NetCheck) => self.draw_net_check(canvas, font),
-            Some(Screen::Lobby) => self.draw_lobby(canvas, font, ctx, &mut h),
+            Some(Screen::Lobby) => self.draw_lobby(canvas, font, ctx, input.hint_kind.is_none(), &mut h),
             Some(Screen::Pause) => self.draw_pause(canvas, font, ctx, input.hint_kind, &mut h),
             None => {
                 if let Some(game) = &ctx.game {
@@ -1856,7 +1871,9 @@ impl Ui {
         Self::draw_rows(c, f, &items, self.sel[Screen::Advanced.slot()], 28, 14, h);
     }
 
-    fn draw_lobby(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, h: &mut Vec<(Area, Hit)>) {
+    /// `keyboard`: the device used last is a keyboard, so the line under the code names the
+    /// shortcut that copies it.
+    fn draw_lobby(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, keyboard: bool, h: &mut Vec<(Area, Hit)>) {
         let lobby = ctx.lobby.filter(|l| l.stage != Stage::Connecting);
         let Some(lobby) = lobby else {
             let base = self.t(S::Connecting);
@@ -1869,7 +1886,8 @@ impl Ui {
         match &lobby.code {
             Some(code) => {
                 f.draw_centered(c, 20, code, WHITE, 2);
-                f.draw_centered(c, 40, self.t(S::TellCode), SEC, 1);
+                let keys = keyboard.then_some(COPY_KEYS);
+                f.draw_centered(c, 40, &tell_code_line(self.t(S::TellCode), keys), SEC, 1);
             }
             None => f.draw_centered(c, 20, "IP", WHITE, 2),
         }
@@ -2853,6 +2871,19 @@ mod tests {
         ui.update(&nav(|n| n.back = true), &mut c, DT);
         ui.update(&nav(|n| n.up = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::LeaveLobby));
+    }
+
+    #[test]
+    fn ui_lobby_tell_code_line_fits_with_the_shortcut() {
+        for lang in [Lang::Ru, Lang::En] {
+            let text = lang.tr(S::TellCode);
+            assert_eq!(tell_code_line(text, None), text, "a gamepad sees the line as it was");
+            for keys in ["Cmd+C", "Ctrl+C"] {
+                let line = tell_code_line(text, Some(keys));
+                assert!(line.ends_with(&format!("({keys})")));
+                assert!(line.chars().count() <= 32, "{line:?} fits the 32-column screen");
+            }
+        }
     }
 
     #[test]

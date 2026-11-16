@@ -43,15 +43,17 @@ pub fn save(console: &Console, path: &Path) -> io::Result<()> {
     write(path, &console.save_state())
 }
 
-/// Writes save-state bytes atomically (temp file `<path>.tmp`, then a rename over the old
-/// file), creating the directory; a crash mid-write never leaves a cut file.
+/// Writes a file atomically (temp file `<path>.tmp`, then a rename over the old file),
+/// creating the directory; a crash mid-write never leaves a cut file. Save states, battery
+/// saves and received ROMs all go through it.
 pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("state.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }

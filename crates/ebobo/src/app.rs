@@ -509,8 +509,14 @@ impl App {
                 self.perform(UiAction::LoadState);
             }
         }
-        if frame.screenshot && matches!(self.state, State::Solo(_)) {
+        if frame.screenshot {
             self.screenshot();
+        }
+        if frame.copy {
+            if let Some(code) = self.lobby_status.as_ref().and_then(|l| l.code.as_deref()) {
+                self.input.copy_text(code);
+                self.ui.toast(self.ui.text(Text::CodeCopied));
+            }
         }
 
         self.poll_lobby();
@@ -1043,16 +1049,10 @@ impl App {
             return;
         }
         let path = logic::received_rom_path(&config::data_dir().join("roms"), crc32, name);
-        let tmp = path.with_extension("tmp");
-        let saved = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&tmp, rom))
-            .and_then(|()| std::fs::rename(&tmp, &path));
+        let saved = slots::write(&path, rom);
         match saved {
             Ok(()) => self.library.rescan(),
             Err(err) => {
-                let _ = std::fs::remove_file(&tmp);
                 eprintln!("ebobo: keeping {}: {err}", path.display());
             }
         }
@@ -1087,7 +1087,7 @@ impl App {
         if ram == s.saved_ram.as_slice() {
             return;
         }
-        let result = std::fs::create_dir_all(config::saves_dir()).and_then(|_| std::fs::write(path, ram));
+        let result = slots::write(path, ram);
         match result {
             Ok(()) => {
                 s.saved_ram.clear();
@@ -1312,12 +1312,17 @@ impl App {
         self.ui.draw(&mut self.canvas, &mut self.font, &ctx, frame);
     }
 
-    /// F12 / Back+North: the game frame ×3 (nearest) as PNG into the pictures folder.
+    /// F12 / Back+North: the running game's frame ×3 (nearest) as PNG into the pictures folder,
+    /// solo and online alike.
     fn screenshot(&mut self) {
-        let State::Solo(s) = &self.state else { return };
+        let (console, name) = match &self.state {
+            State::Solo(s) => (&s.console, &s.name),
+            State::Net(n) => (&n.console, &n.rom_name),
+            State::Menu | State::Lobby(_) => return,
+        };
         let k = 3;
         let mut rgba = Vec::new();
-        let (w, h) = s.console.frame_rgba(&mut rgba);
+        let (w, h) = console.frame_rgba(&mut rgba);
         let mut big = Vec::new();
         logic::scale_nearest(&rgba, w, h, k, &mut big);
         let png = png::encode_rgba((w * k) as u32, (h * k) as u32, &big);
@@ -1326,7 +1331,7 @@ impl App {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let dir = config::pictures_dir();
-        let path = dir.join(logic::screenshot_file_name(&s.name, secs));
+        let path = dir.join(logic::screenshot_file_name(name, secs));
         match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, png)) {
             Ok(()) => {
                 println!("ebobo: screenshot {}", path.display());
