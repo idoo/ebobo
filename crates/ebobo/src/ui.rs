@@ -84,6 +84,8 @@ pub struct GameView<'a> {
     pub slot_thumb: Option<&'a [u8]>,
     /// Netplay: a shared save exists, so "Load for everyone" can load it.
     pub can_load: bool,
+    /// Solo: the window is not in front, so the game stands still and says so.
+    pub away: bool,
 }
 
 pub struct UiCtx<'a> {
@@ -2073,6 +2075,12 @@ impl Ui {
             c.fill_rect((256 - w) / 2 - 4, y - 3, w + 8, 14, SHADE);
             f.draw_centered(c, y, &line, ERR, 1);
         }
+        if game.away && !game.netplay {
+            let line = self.t(S::Paused);
+            let w = f.width(line, 1);
+            c.fill_rect((256 - w) / 2 - 4, 112 - 3, w + 8, 14, SHADE);
+            f.draw_centered(c, 112, line, WHITE, 1);
+        }
     }
 
     /// Settings ▸ Advanced ▸ Network check: five fixed rows (filled in when the check ends, so
@@ -2995,7 +3003,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.show_pause();
-        let solo = |slot| GameView { rom_name: "X", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((slot, None)), slot_thumb: None, can_load: false };
+        let solo = |slot| GameView { rom_name: "X", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((slot, None)), slot_thumb: None, can_load: false, away: false };
         let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(solo(0)), pads: &[], config: &mut cfg, version: "0.1.0" };
         ui.update(&nav(|n| n.down = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::SelectSlot(1)));
@@ -3018,7 +3026,7 @@ mod tests {
         let names = vec!["A".to_string(), "B".to_string()];
         let mut ui = Ui::new(Lang::Ru);
         ui.show_pause();
-        let game = GameView { rom_name: "X", netplay: true, names: &names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, slot_thumb: None, can_load: false };
+        let game = GameView { rom_name: "X", netplay: true, names: &names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, slot_thumb: None, can_load: false, away: false };
         let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &[], config: &mut cfg, version: "0.1.0" };
         ui.update(&nav(|n| n.up = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "exit must confirm");
@@ -3095,7 +3103,7 @@ mod tests {
     }
 
     fn net_game(names: &[String], can_load: bool) -> GameView<'_> {
-        GameView { rom_name: "X", netplay: true, names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, slot_thumb: None, can_load }
+        GameView { rom_name: "X", netplay: true, names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, slot_thumb: None, can_load, away: false }
     }
 
     #[test]
@@ -3803,7 +3811,7 @@ mod tests {
             ui.stack = vec![screen];
             ui.toast("Геймпад DualSense → игрок 2");
             let mut canvas = Canvas::new();
-            let game = (screen == Screen::Pause).then(|| GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice: None, desync: false, stalled: false, save_slot: None, slot_thumb: None, can_load: true });
+            let game = (screen == Screen::Pause).then(|| GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice: None, desync: false, stalled: false, save_slot: None, slot_thumb: None, can_load: true, away: false });
             if game.is_some() {
                 canvas.clear(rgb(0x5C, 0x94, 0xFC));
             }
@@ -3832,7 +3840,7 @@ mod tests {
             ui.sel[Screen::Pause.slot()] = sel;
             let mut canvas = Canvas::new();
             canvas.clear(rgb(0x5C, 0x94, 0xFC));
-            let game = GameView { rom_name: "Test Game (USA)", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((1, Some(saved))), slot_thumb: Some(&thumb), can_load: false };
+            let game = GameView { rom_name: "Test Game (USA)", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((1, Some(saved))), slot_thumb: Some(&thumb), can_load: false, away: false };
             let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
             ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
             write_png(path, &canvas.px, 256, 240);
@@ -3992,7 +4000,7 @@ mod tests {
         let mut canvas = Canvas::new();
         canvas.clear(rgb(0x5C, 0x94, 0xFC));
         let notice = Some("Ждём Саша... 7 с".to_string());
-        let game = GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice, desync: false, stalled: true, save_slot: None, slot_thumb: None, can_load: false };
+        let game = GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice, desync: false, stalled: true, save_slot: None, slot_thumb: None, can_load: false, away: false };
         let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
         ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
         write_png("/tmp/ebobo-ui-game-wait.png", &canvas.px, 256, 240);

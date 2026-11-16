@@ -122,6 +122,9 @@ pub struct InputFrame {
     pub screenshot: bool,
     /// Window closed or Cmd+Q.
     pub quit: bool,
+    /// The window stopped being the front one (`Some(false)`) or became it again
+    /// (`Some(true)`) on this frame; `None` when nothing changed.
+    pub focus: Option<bool>,
     /// A file dropped onto the window.
     pub dropped_file: Option<PathBuf>,
     /// Connected gamepads.
@@ -1036,6 +1039,15 @@ impl Input {
                     win_event: WindowEvent::Close,
                     ..
                 } => f.quit = true,
+                // Only these events tell about focus: headless runs never get one and keep running.
+                Event::Window {
+                    win_event: WindowEvent::FocusLost,
+                    ..
+                } => f.focus = Some(false),
+                Event::Window {
+                    win_event: WindowEvent::FocusGained,
+                    ..
+                } => f.focus = Some(true),
                 Event::DropFile { filename, .. } => f.dropped_file = Some(PathBuf::from(filename)),
                 Event::TextInput { text, .. } if self.text_on => f.text.push_str(&text),
                 Event::ControllerDeviceAdded { which, .. } => self.open(which),

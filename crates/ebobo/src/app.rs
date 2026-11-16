@@ -167,6 +167,8 @@ struct App {
     enhancer: Enhancer,
     title_rom: Option<String>,
     quit: bool,
+    /// The window is not the front one: a solo game stands still until it is again.
+    away: bool,
     /// `--autostart N`: host starts once N players are in and the game can start.
     autostart: Option<usize>,
     /// Room code already printed to stdout.
@@ -363,6 +365,7 @@ impl App {
             enhancer: Enhancer::new(),
             title_rom: None,
             quit: false,
+            away: false,
             autostart: cli.autostart,
             room_printed: false,
             net_check: None,
@@ -443,6 +446,15 @@ impl App {
         self.ui.art_mut().set_online(self.config.online_art);
         self.ui.art_mut().poll();
         self.ui.tick(&frame, dt);
+        if let Some(focused) = frame.focus {
+            // Leaving the window pauses a solo game: drop the sound still queued, once.
+            if !focused && !self.away && matches!(self.state, State::Solo(_)) {
+                if let Some(audio) = &mut self.audio {
+                    audio.clear();
+                }
+            }
+            self.away = !focused;
+        }
         if std::mem::take(&mut self.menu_hint) && self.in_game() {
             let hint = if frame.hint_kind.is_some() { Text::MenuHintPad } else { Text::MenuHintKeys };
             self.ui.toast_secs(self.ui.text(hint), MENU_HINT_SECS);
@@ -548,6 +560,7 @@ impl App {
                 &self.pads,
                 &mut self.config,
                 notice,
+                self.away,
             );
             let action = self.ui.update(&frame, &mut ctx, dt);
             if let Some(action) = action {
@@ -1169,9 +1182,11 @@ impl App {
 
     fn advance(&mut self, frame: &InputFrame) {
         let ui_visible = self.ui.is_visible();
+        // A solo game stands still under the menu and while the window is not in front.
+        let halted = ui_visible || (self.away && matches!(self.state, State::Solo(_)));
         match &mut self.state {
             State::Solo(s) => {
-                s.rewinding = !ui_visible && frame.rewind;
+                s.rewinding = !halted && frame.rewind;
                 if s.rewinding {
                     // One snapshot back (2 frames); re-run the frame after it to show it.
                     if let Some((snap, pads)) = s.rewind.step_back() {
@@ -1181,7 +1196,7 @@ impl App {
                     }
                     s.console.clear_audio();
                     s.since_snapshot = 0;
-                } else if !ui_visible {
+                } else if !halted {
                     s.ff_on = logic::fast_forward(self.config.ff_toggle, frame.fast_forward, s.ff_held, s.ff_on);
                     s.ff_held = frame.fast_forward;
                     let n = if s.ff_on { 3 } else { 1 };
@@ -1317,16 +1332,17 @@ impl App {
             }
             State::Menu | State::Lobby(_) => {}
         }
-        self.pump_audio(ui_visible);
+        self.pump_audio(halted);
     }
 
-    fn pump_audio(&mut self, ui_visible: bool) {
+    /// `halted`: the menu is open, or a solo game waits for its window to come back.
+    fn pump_audio(&mut self, halted: bool) {
         let Some(audio) = &mut self.audio else { return };
         let rewinding = matches!(&self.state, State::Solo(s) if s.rewinding);
         let playing = matches!(self.state, State::Solo(_) | State::Net(_));
         // Solo pauses audio with the game and mutes it while rewinding; netplay keeps playing
         // under the menu.
-        let paused = !playing || (ui_visible && matches!(self.state, State::Solo(_))) || rewinding;
+        let paused = !playing || (halted && matches!(self.state, State::Solo(_))) || rewinding;
         if paused != self.audio_paused {
             audio.set_paused(paused);
             if rewinding {
@@ -1378,6 +1394,7 @@ impl App {
             &self.pads,
             &mut self.config,
             notice,
+            self.away,
         );
         self.ui.draw(&mut self.canvas, &mut self.font, &ctx, frame);
     }
@@ -1541,6 +1558,7 @@ fn make_ctx<'a>(
     pads: &'a [PadInfo],
     config: &'a mut Config,
     notice: Option<String>,
+    away: bool,
 ) -> UiCtx<'a> {
     let game = match state {
         State::Solo(s) => Some(GameView {
@@ -1554,6 +1572,7 @@ fn make_ctx<'a>(
             save_slot: Some((s.slot, s.slot_times[s.slot as usize])),
             slot_thumb: s.slot_thumbs[s.slot as usize].as_deref(),
             can_load: false,
+            away,
         }),
         State::Net(n) => Some(GameView {
             rom_name: &n.rom_name,
@@ -1566,6 +1585,7 @@ fn make_ctx<'a>(
             save_slot: None,
             slot_thumb: None,
             can_load: n.session.has_save(),
+            away: false,
         }),
         State::Menu | State::Lobby(_) => None,
     };
