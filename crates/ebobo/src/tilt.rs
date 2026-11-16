@@ -10,8 +10,9 @@
 const RANGE: f32 = 12.0 * DEG;
 /// Time constant of the return to centre, seconds.
 const LEAK_SECS: f32 = 4.0;
-/// Time constant of the rest bias estimate, seconds.
-const BIAS_SECS: f32 = 2.0;
+/// Time constant of the rest bias estimate once it has settled, seconds. Long, so that a
+/// slow turn of the device is not taken for bias and lost.
+const BIAS_SECS: f32 = 20.0;
 /// The device counts as still while every axis is this close to the rest bias estimate.
 const STILL_BAND: f32 = 3.0 * DEG;
 /// It also counts as still after turning this evenly (around its own short average)...
