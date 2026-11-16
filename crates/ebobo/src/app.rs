@@ -23,8 +23,7 @@ use ebobo_art::{Art, Key, Kind};
 use ebobo_console::{Console, Snapshot, System};
 use ebobo_net::{
     GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, NetDiag, NetError, NetEvent, NetSession, NetStats, PeerId,
-    SavePolicy,
-    Resume, ResumeInfo, ResumeKind, Stage,
+    Resume, ResumeInfo, ResumeKind, SavePolicy, Stage,
     INPUT_LOAD, INPUT_RESET, INPUT_SAVE,
 };
 
