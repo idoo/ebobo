@@ -20,8 +20,15 @@ use crate::enhance::Mode;
 use crate::i18n::{Lang, S};
 use crate::input::{InputFrame, Nav, PadEvent, PadInfo, PadKind, PointerEvent};
 use crate::osk::{self, Charset, Osk, OskNav, OskOutput};
-use crate::library::RomEntry;
+use crate::library::{RomEntry, RomFileError};
 use crate::trash::Disposal;
+
+/// Why a game did not open: the file could not be read as a ROM, or the console rejected it.
+#[derive(Clone, Copy, Debug)]
+pub enum OpenFailure<'a> {
+    File(&'a RomFileError),
+    Console(&'a ebobo_console::RomError),
+}
 
 /// What the user asked for; the app performs it.
 #[derive(Clone, Debug, PartialEq)]
@@ -613,6 +620,28 @@ impl Ui {
     /// Modal message box (dismissed with confirm/back).
     pub fn error(&mut self, message: &str) {
         self.modal = Some(Modal { title: self.t(S::Error).to_string(), lines: wrap(message, 27), confirm: None, sel: 0 });
+    }
+
+    /// Why a game did not open, in the interface's language: "<name>: <reason>".
+    pub fn open_failure(&self, name: &str, why: OpenFailure<'_>) -> String {
+        use ebobo_console::{md, nes, RomError};
+        let reason = match why {
+            OpenFailure::File(RomFileError::NotRom)
+            | OpenFailure::Console(
+                RomError::Unknown | RomError::Nes(nes::RomError::NotNes) | RomError::Md(md::RomError::NotMegaDrive),
+            ) => self.t(S::OpenNotRom).to_string(),
+            OpenFailure::Console(
+                RomError::Nes(nes::RomError::Truncated | nes::RomError::Invalid(_))
+                | RomError::Md(md::RomError::Truncated | md::RomError::Invalid(_)),
+            ) => self.t(S::OpenDamaged).to_string(),
+            OpenFailure::Console(RomError::Nes(nes::RomError::UnsupportedMapper(n))) => {
+                self.t(S::OpenMapper).replace("{n}", &n.to_string())
+            }
+            OpenFailure::File(RomFileError::TooLarge) => self.t(S::OpenTooLarge).to_string(),
+            OpenFailure::File(RomFileError::NoRomInZip) => self.t(S::OpenNoRomInZip).to_string(),
+            OpenFailure::File(RomFileError::Read(system)) => format!("{} ({system})", self.t(S::OpenUnreadable)),
+        };
+        format!("{name}: {reason}")
     }
 
     /// Modal for a network failure, localised per variant with a hint (e.g. RomMissing →
@@ -2671,6 +2700,39 @@ mod tests {
             })
             .collect();
         LobbyStatus { stage: Stage::Lobby, code: Some("K7QPA".into()), me: Some(PeerId(0)), is_host: host, players, rom_name: Some("Super Mario Bros. 3 (USA)".into()), can_start, error: None, resume: None }
+    }
+
+    #[test]
+    fn ui_open_failure_speaks_the_interface_language_and_fits_the_box() {
+        use ebobo_console::{md, nes, RomError};
+        let read = RomFileError::Read(std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string());
+        let cases: [(OpenFailure, &str, &str); 9] = [
+            (OpenFailure::Console(&RomError::Unknown), "это не игра NES или Sega", "not a NES or Genesis game"),
+            (OpenFailure::Console(&RomError::Nes(nes::RomError::NotNes)), "это не игра NES или Sega", "not a NES or Genesis game"),
+            (OpenFailure::Console(&RomError::Md(md::RomError::NotMegaDrive)), "это не игра NES или Sega", "not a NES or Genesis game"),
+            (OpenFailure::File(&RomFileError::NotRom), "это не игра NES или Sega", "not a NES or Genesis game"),
+            (OpenFailure::Console(&RomError::Md(md::RomError::Truncated)), "файл игры повреждён", "the game's file is damaged"),
+            (OpenFailure::Console(&RomError::Nes(nes::RomError::Invalid("x"))), "файл игры повреждён", "the game's file is damaged"),
+            (
+                OpenFailure::Console(&RomError::Nes(nes::RomError::UnsupportedMapper(123))),
+                "картридж такого типа пока не поддерживается (mapper 123)",
+                "this cartridge type is not supported yet (mapper 123)",
+            ),
+            (OpenFailure::File(&RomFileError::TooLarge), "файл больше 8 МБ", "the file is larger than 8 MB"),
+            (OpenFailure::File(&RomFileError::NoRomInZip), "в архиве нет игры", "no game inside the archive"),
+        ];
+        let unreadable = (OpenFailure::File(&read), "файл не читается (permission denied)", "the file cannot be read (permission denied)");
+        for (why, ru, en) in cases.into_iter().chain([unreadable]) {
+            for (lang, want) in [(Lang::Ru, ru), (Lang::En, en)] {
+                let mut ui = Ui::new(lang);
+                let text = ui.open_failure("Chip 'n Dale (Europe)", why);
+                assert_eq!(text, format!("Chip 'n Dale (Europe): {want}"));
+                ui.error(&text);
+                let lines = &ui.modal.as_ref().unwrap().lines;
+                assert!(lines.iter().all(|l| l.chars().count() <= 27), "{lines:?}");
+                assert_eq!(lines.join(" "), text, "no word is cut by the box");
+            }
+        }
     }
 
     fn pointer(events: &[PointerEvent]) -> InputFrame {

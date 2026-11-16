@@ -96,54 +96,76 @@ fn stem(path: &Path) -> String {
     path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// Why a file cannot be read as a ROM. `Display` is English, for logs and tests; the
+/// interface words it in its own language from the variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RomFileError {
+    /// The file, or the ROM inside a zip, is larger than `MAX_ROM_BYTES`.
+    TooLarge,
+    /// A zip with no entry that has one of `ROM_EXTS`.
+    NoRomInZip,
+    /// The bytes are not a ROM of a console ebobo knows.
+    NotRom,
+    /// The file (or the zip) could not be read; the system's message.
+    Read(String),
+}
+
+impl std::fmt::Display for RomFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RomFileError::TooLarge => write!(f, "file is larger than 8 MiB"),
+            RomFileError::NoRomInZip => write!(f, "no ROM file inside the zip"),
+            RomFileError::NotRom => write!(f, "not a ROM"),
+            RomFileError::Read(why) => write!(f, "{why}"),
+        }
+    }
+}
+
 /// Reads the ROM bytes and, for a zip, the stem of the ROM entry inside: the first file with
 /// one of `ROM_EXTS`.
-fn read_rom(path: &Path) -> Result<(Vec<u8>, Option<String>), String> {
-    let shown = path.display();
-    let meta = fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
+fn read_rom(path: &Path) -> Result<(Vec<u8>, Option<String>), RomFileError> {
+    let read = |e: &dyn std::fmt::Display| RomFileError::Read(e.to_string());
+    let meta = fs::metadata(path).map_err(|e| read(&e))?;
     if meta.len() > MAX_ROM_BYTES {
-        return Err(format!("{shown}: file is larger than 8 MiB"));
+        return Err(RomFileError::TooLarge);
     }
     match ext_lower(path).as_deref() {
         Some("zip") => {
-            let file = fs::File::open(path).map_err(|e| format!("{shown}: {e}"))?;
-            let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("{shown}: {e}"))?;
+            let file = fs::File::open(path).map_err(|e| read(&e))?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e| read(&e))?;
             for i in 0..zip.len() {
-                let mut entry = zip.by_index(i).map_err(|e| format!("{shown}: {e}"))?;
+                let mut entry = zip.by_index(i).map_err(|e| read(&e))?;
                 let name = entry.name().to_string();
                 if !entry.is_file() || !is_rom_ext(Path::new(&name)) {
                     continue;
                 }
                 if entry.size() > MAX_ROM_BYTES {
-                    return Err(format!("{shown}: {name} is larger than 8 MiB"));
+                    return Err(RomFileError::TooLarge);
                 }
                 let mut bytes = Vec::with_capacity(entry.size() as usize);
-                (&mut entry)
-                    .take(MAX_ROM_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| format!("{shown}: {name}: {e}"))?;
+                (&mut entry).take(MAX_ROM_BYTES + 1).read_to_end(&mut bytes).map_err(|e| read(&e))?;
                 if bytes.len() as u64 > MAX_ROM_BYTES {
-                    return Err(format!("{shown}: {name} is larger than 8 MiB"));
+                    return Err(RomFileError::TooLarge);
                 }
                 let inner = name.rsplit(['/', '\\']).next().unwrap_or(&name);
                 return Ok((bytes, Some(stem(Path::new(inner)))));
             }
-            Err(format!("{shown}: no ROM file inside the zip"))
+            Err(RomFileError::NoRomInZip)
         }
-        _ => fs::read(path).map(|b| (b, None)).map_err(|e| format!("{shown}: {e}")),
+        _ => fs::read(path).map(|b| (b, None)).map_err(|e| read(&e)),
     }
 }
 
 /// Reads a ROM file: `.nes`, `.md`, `.gen`, `.smd`, `.bin` as is, `.zip` = the first entry
 /// inside with one of those extensions.
-pub fn load_rom_file(path: &Path) -> Result<Vec<u8>, String> {
+pub fn load_rom_file(path: &Path) -> Result<Vec<u8>, RomFileError> {
     read_rom(path).map(|(bytes, _)| bytes)
 }
 
 /// The library entry of a file's bytes; an error when `ebobo_console::identify` does not know
 /// them as a ROM.
-fn make_entry(path: &Path, bytes: &[u8], inner_stem: Option<String>, mtime: u64) -> Result<RomEntry, String> {
-    let id = ebobo_console::identify(bytes).ok_or_else(|| format!("{}: not a ROM", path.display()))?;
+fn make_entry(path: &Path, bytes: &[u8], inner_stem: Option<String>, mtime: u64) -> Result<RomEntry, RomFileError> {
+    let id = ebobo_console::identify(bytes).ok_or(RomFileError::NotRom)?;
     Ok(RomEntry {
         path: path.to_path_buf(),
         name: inner_stem.unwrap_or_else(|| stem(path)),
@@ -307,7 +329,7 @@ impl Shared {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    fn read_entry(&self, path: &Path) -> Result<RomEntry, String> {
+    fn read_entry(&self, path: &Path) -> Result<RomEntry, RomFileError> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         let (bytes, inner) = read_rom(path)?;
         let mtime = fs::metadata(path).map_or(0, |m| mtime_secs(mtime_nanos(&m)));
@@ -474,7 +496,7 @@ impl Library {
     }
 
     /// Adds a file that is outside the scanned folders (drag and drop, command line).
-    pub fn add_file(&self, path: &Path) -> Result<RomEntry, String> {
+    pub fn add_file(&self, path: &Path) -> Result<RomEntry, RomFileError> {
         let entry = self.shared.read_entry(path)?;
         {
             let mut extra = lock(&self.shared.extra);
@@ -661,7 +683,7 @@ mod tests {
         let mut z = zip::ZipWriter::new(fs::File::create(&p).unwrap());
         z.start_file("a.txt", zip::write::SimpleFileOptions::default()).unwrap();
         z.finish().unwrap();
-        assert!(load_rom_file(&p).is_err());
+        assert_eq!(load_rom_file(&p), Err(RomFileError::NoRomInZip));
         let _ = fs::remove_dir_all(&root);
     }
 

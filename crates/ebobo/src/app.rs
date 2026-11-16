@@ -34,7 +34,7 @@ use crate::i18n::Lang;
 use crate::input::{Input, InputFrame, PadEvent, PadInfo, PointerEvent};
 use crate::library::{self, Library, RomEntry};
 use crate::trash::{self, Disposal};
-use crate::ui::{GameView, Text, Ui, UiAction, UiCtx};
+use crate::ui::{GameView, OpenFailure, Text, Ui, UiAction, UiCtx};
 use crate::video::{Frame, GameFrame, PictureRef, Pictures, Video};
 
 use cli::{Parsed, ResumeFrom, ScriptKey, Start};
@@ -373,7 +373,8 @@ impl App {
         let file = |app: &mut App, path: PathBuf| match app.library.add_file(&path) {
             Ok(entry) => Some(entry),
             Err(err) => {
-                app.ui.error(&format!("{}: {err}", path.display()));
+                let text = app.ui.open_failure(&path.display().to_string(), OpenFailure::File(&err));
+                app.ui.error(&text);
                 None
             }
         };
@@ -481,7 +482,10 @@ impl App {
                         self.refresh_entries();
                         self.start_solo(entry);
                     }
-                    Err(err) => self.ui.error(&format!("{}: {err}", path.display())),
+                    Err(err) => {
+                        let text = self.ui.open_failure(&path.display().to_string(), OpenFailure::File(&err));
+                        self.ui.error(&text);
+                    }
                 }
             } else {
                 self.ui.toast(self.ui.text(Text::CantOpenRomOnline));
@@ -852,11 +856,11 @@ impl App {
         self.end_game();
         let rom = match library::load_rom_file(&entry.path) {
             Ok(rom) => rom,
-            Err(err) => return self.fail(&format!("{}: {err}", entry.name)),
+            Err(err) => return self.fail(&self.ui.open_failure(&entry.name, OpenFailure::File(&err))),
         };
         let mut console = match Console::new(&rom, logic::region_hint(&entry.name, entry.region)) {
             Ok(console) => console,
-            Err(err) => return self.fail(&format!("{}: {err}", entry.name)),
+            Err(err) => return self.fail(&self.ui.open_failure(&entry.name, OpenFailure::Console(&err))),
         };
         let multitap = ebobo_console::identify(&rom).map(|id| id.multitap).unwrap_or(false);
         console.set_multitap(multitap);
@@ -908,7 +912,7 @@ impl App {
     fn host(&mut self, entry: RomEntry, direct: bool) {
         let rom = match library::load_rom_file(&entry.path) {
             Ok(rom) => rom,
-            Err(err) => return self.fail(&format!("{}: {err}", entry.name)),
+            Err(err) => return self.fail(&self.ui.open_failure(&entry.name, OpenFailure::File(&err))),
         };
         let rom_name = entry.name;
         // What this game can continue from; a scratch machine of the header region (the one

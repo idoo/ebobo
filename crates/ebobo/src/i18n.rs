@@ -341,6 +341,12 @@ pub(crate) enum S {
     AnswerTrash,
     AnswerForGood,
     CodeCopied,
+    OpenNotRom,
+    OpenDamaged,
+    OpenMapper,
+    OpenTooLarge,
+    OpenNoRomInZip,
+    OpenUnreadable,
 }
 
 impl S {
@@ -571,6 +577,15 @@ impl S {
             AnswerTrash => ("В корзину", "Move to Trash"),
             AnswerForGood => ("Удалить навсегда", "Delete for good"),
             CodeCopied => ("Код скопирован", "Code copied"),
+            OpenNotRom => ("это не игра NES или Sega", "not a NES or Genesis game"),
+            OpenDamaged => ("файл игры повреждён", "the game's file is damaged"),
+            OpenMapper => (
+                "картридж такого типа пока не поддерживается (mapper {n})",
+                "this cartridge type is not supported yet (mapper {n})",
+            ),
+            OpenTooLarge => ("файл больше 8 МБ", "the file is larger than 8 MB"),
+            OpenNoRomInZip => ("в архиве нет игры", "no game inside the archive"),
+            OpenUnreadable => ("файл не читается", "the file cannot be read"),
         }
     }
 }
