@@ -1294,6 +1294,13 @@ impl Input {
         v.sort_by_key(|p| p.slot.unwrap_or(usize::MAX));
         v
     }
+
+    /// Turn rate of a connected gamepad that has a gyroscope, in rad/s on SDL's controller
+    /// axes (x: pitch, y: yaw, z: roll); the pad used last when several have one. `None`
+    /// without such a pad.
+    pub fn gyro(&self) -> Option<[f32; 3]> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -272,6 +272,50 @@ impl Md {
         (w, h)
     }
 
+    /// Display only: while on, every finished picture also keeps its planes apart (what a
+    /// nearer plane covers), which [`Md::frame_tilted`] needs to move them against each
+    /// other. Not emulated state: no snapshot, hash or saved state holds it, and loading one
+    /// leaves it as it was.
+    pub fn set_tilt(&mut self, _on: bool) {}
+
+    /// Farthest plane B moves in [`Md::frame_tilted`], in pixels across and down, for the
+    /// last finished picture (rows count double in interlace mode 2). The tilted picture is
+    /// this much smaller on every side.
+    pub fn tilt_reach(&self) -> (i32, i32) {
+        let (_, h) = self.frame_size();
+        (8, if h > 240 { 8 } else { 4 })
+    }
+
+    /// The last finished picture with plane B moved `shift` pixels (right, down; each taken
+    /// within ±[`Md::tilt_reach`]), plane A and the window half as far, and the sprites
+    /// where they are. The picture loses the reach on every side, so no shift shows past an
+    /// edge; its size is returned. `rgba` gets RGBA8888 and `layers` one byte per pixel as
+    /// [`Md::frame_layers`] gives them (both resized). With no shift, and until a picture
+    /// was finished with [`Md::set_tilt`] on, it is the middle of the plain picture, byte
+    /// for byte.
+    pub fn frame_tilted(&self, _shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
+        let (fw, fh) = self.frame_size();
+        let (rx, ry) = self.tilt_reach();
+        let (rx, ry) = (rx as usize, ry as usize);
+        if fw <= 2 * rx || fh <= 2 * ry {
+            rgba.clear();
+            layers.clear();
+            return (0, 0);
+        }
+        let (w, h) = (fw - 2 * rx, fh - 2 * ry);
+        rgba.resize(w * h * 4, 0);
+        layers.resize(w * h, 0);
+        for y in 0..h {
+            let line = &self.m.screen.px[(y + ry) * MAX_W + rx..][..w];
+            let out = rgba[y * w * 4..][..w * 4].chunks_exact_mut(4).zip(&mut layers[y * w..][..w]);
+            for ((rgba, layer), &px) in out.zip(line) {
+                rgba.copy_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, px as u8, 255]);
+                *layer = (px >> 24) as u8;
+            }
+        }
+        (w, h)
+    }
+
     /// Output sample rate in Hz. May be nudged every frame to keep the audio queue level.
     pub fn set_sample_rate(&mut self, hz: f64) {
         self.m.audio.set_sample_rate(hz);

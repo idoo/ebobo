@@ -349,6 +349,35 @@ impl Console {
         }
     }
 
+    /// Display only: while on, every finished picture also keeps its planes apart, which
+    /// [`Console::frame_tilted`] needs. Not emulated state; loading a state leaves it on.
+    pub fn set_tilt(&mut self, on: bool) {
+        match self {
+            Console::Nes(nes) => nes.set_tilt(on),
+            Console::Md(md) => md.set_tilt(on),
+        }
+    }
+
+    /// Farthest the far plane moves in [`Console::frame_tilted`], in pixels across and down,
+    /// for the last finished picture. The tilted picture is this much smaller on every side.
+    pub fn tilt_reach(&self) -> (i32, i32) {
+        match self {
+            Console::Nes(_) => (nes::TILT_REACH.0 as i32, nes::TILT_REACH.1 as i32),
+            Console::Md(md) => md.tilt_reach(),
+        }
+    }
+
+    /// The last finished picture with its far plane moved `shift` pixels (right, down; each
+    /// taken within ±[`Console::tilt_reach`]) and the planes between it and the sprites
+    /// less; the sprites stay. Cropped by the reach on every side; returns the size. `rgba`
+    /// and `layers` are filled as by [`Console::frame_rgba`] and [`Console::frame_layers`].
+    pub fn frame_tilted(&self, shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
+        match self {
+            Console::Nes(nes) => nes.frame_tilted(shift, rgba, layers),
+            Console::Md(md) => md.frame_tilted(shift, rgba, layers),
+        }
+    }
+
     /// Output sample rate in Hz. May be nudged every frame to keep the audio queue level.
     pub fn set_sample_rate(&mut self, hz: f64) {
         match self {

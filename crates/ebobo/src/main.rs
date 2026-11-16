@@ -14,6 +14,7 @@ mod i18n;
 mod input;
 mod library;
 mod osk;
+mod tilt;
 mod ui;
 mod video;
 mod whatsnew;

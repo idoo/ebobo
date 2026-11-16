@@ -28,6 +28,9 @@ pub use mapper::SUPPORTED_MAPPERS;
 
 pub const WIDTH: usize = 256;
 pub const HEIGHT: usize = 240;
+/// Farthest the background moves in [`Nes::frame_tilted`], in pixels across and down; the
+/// tilted picture is this much smaller on every side.
+pub const TILT_REACH: (usize, usize) = (4, 4);
 
 /// Controller bits in the order the game shifts them out of $4016/$4017 (bit 0 first).
 pub mod pad {
@@ -151,6 +154,36 @@ impl Nes {
         for (o, px) in out.iter_mut().zip(self.bus.frame()) {
             *o = (px >> ppu::FRAME_LAYER_SHIFT) as u8;
         }
+    }
+
+    /// Display only: while on, every completed picture also keeps its background and its
+    /// sprites apart (what a sprite covers, what the background hides), which
+    /// [`Nes::frame_tilted`] needs to move one under the other. Like the sprite limit it is
+    /// not emulated state: no snapshot, hash or saved state holds it, and loading one leaves
+    /// it as it was.
+    pub fn set_tilt(&mut self, _on: bool) {}
+
+    /// The last completed picture with its background moved `shift` pixels (right, down;
+    /// each taken within ±[`TILT_REACH`]) under the sprites, which stay where they are. The
+    /// picture loses `TILT_REACH` pixels on every side, so no shift shows past an edge; its
+    /// size is returned. `rgba` gets RGBA8888 and `layers` one byte per pixel as
+    /// [`Nes::frame_layers`] gives them (both resized). With no shift, and until a picture
+    /// was completed with [`Nes::set_tilt`] on, it is the middle of the plain picture, byte
+    /// for byte.
+    pub fn frame_tilted(&self, _shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
+        let (rx, ry) = TILT_REACH;
+        let (w, h) = (WIDTH - 2 * rx, HEIGHT - 2 * ry);
+        rgba.resize(w * h * 4, 0);
+        layers.resize(w * h, 0);
+        let frame = self.bus.frame();
+        for y in 0..h {
+            let row = &frame[(y + ry) * WIDTH + rx..][..w];
+            palette::write_rgba(row, self.info.region, &mut rgba[y * w * 4..][..w * 4]);
+            for (o, px) in layers[y * w..][..w].iter_mut().zip(row) {
+                *o = (px >> ppu::FRAME_LAYER_SHIFT) as u8;
+            }
+        }
+        (w, h)
     }
 
     /// Output sample rate of [`Nes::drain_audio`]. Fractional so the frontend can nudge it
