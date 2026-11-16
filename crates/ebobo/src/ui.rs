@@ -2014,28 +2014,24 @@ impl Ui {
         let y0 = if netplay { 96 } else { 84 };
         Self::draw_rows(c, f, &items, self.sel[Screen::Pause.slot()].min(items.len() - 1), y0, 16, h);
         // The selected slot's picture, under the Slot row's value at the right end of the
-        // Save / Load / Reset rows (their labels are on the left). Drawn after the rows so the
-        // selection bar passes under it.
+        // Save / Load / Reset rows (their labels are on the left). Drawn after the rows, its
+        // frame ending where the selection bar ends, so the bar runs into it.
         if let Some(thumb) = ctx.game.as_ref().filter(|g| !g.netplay).and_then(|g| g.slot_thumb) {
             let (w, h) = (slots::THUMB_W, slots::THUMB_H);
-            c.rect(171, 109, w as i32 + 2, h as i32 + 2, SEC);
-            c.blit(172, 110, w, h, thumb);
+            let x = 247 - w as i32;
+            c.rect(x - 1, 109, w as i32 + 2, h as i32 + 2, SEC);
+            c.blit(x, 110, w, h, thumb);
         }
         if !netplay {
-            let (lt, rt, shot) = match kind {
-                Some(PadKind::PlayStation) => ("L2", "R2", "Share+Triangle"),
-                Some(PadKind::Nintendo) => ("ZL", "ZR", "-+X"),
-                Some(PadKind::SteamDeck) => ("L2", "R2", "View+Y"),
-                Some(_) => ("LT", "RT", "Back+Y"),
-                None => ("", "", ""),
+            // The keys of the device used last, like the hint bar: both sets do not fit a line.
+            let keys = match kind {
+                Some(PadKind::PlayStation) => ["L2", "R2", "Share+Triangle"],
+                Some(PadKind::Nintendo) => ["ZL", "ZR", "-+X"],
+                Some(PadKind::SteamDeck) => ["L2", "R2", "View+Y"],
+                Some(_) => ["LT", "RT", "Back+Y"],
+                None => ["Backspace", "Tab", "F12"],
             };
-            let keys = |key: &str, pad: &str| if pad.is_empty() { key.to_string() } else { format!("{key} / {pad}") };
-            let lines = [
-                (S::HintRewind, keys("Backspace", lt)),
-                (S::HintFastForward, keys("Tab", rt)),
-                (S::HintScreenshot, keys("F12", shot)),
-            ];
-            for (i, (s, k)) in lines.iter().enumerate() {
+            for (i, (s, k)) in [S::HintRewind, S::HintFastForward, S::HintScreenshot].iter().zip(keys).enumerate() {
                 f.draw_centered(c, 184 + i as i32 * 12, &self.t(*s).replace("{keys}", k), SEC, 1);
             }
         }
