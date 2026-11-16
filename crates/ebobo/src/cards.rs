@@ -613,8 +613,9 @@ impl Cards {
         // The first build starts on the first tile, not on Rescan, and so does a list that was
         // empty (the first scan still running: Rescan was the only tile to stand on).
         let was_rescan = self.epoch > 0 && self.rescan && !self.view.is_empty() && self.sel == self.view.len();
+        // A system has its chip while it has games to show: a hidden game counts for none.
         self.systems = [false; 2];
-        for game in games {
+        for game in games.iter().filter(|g| !shelf.is_hidden(g.key)) {
             self.systems[system_slot(game.key.system)] = true;
         }
         self.history = history;
@@ -633,7 +634,10 @@ impl Cards {
             Some(pos) => pos,
             None if was_rescan && self.rescan && self.sel_key.is_none() && !self.to_first => self.view.len(),
             None if self.to_first || total == 0 => 0,
-            None => self.sel.min(total - 1),
+            // The selected game is gone (hidden, renamed out of a search, its file deleted):
+            // the game that took its place or the last one, never the Rescan tile while there
+            // is a game to stand on.
+            None => self.sel.min(self.view.len().max(1) - 1),
         };
         self.sel_key = self.view.get(self.sel).map(|&i| games[i].key);
         self.dirty = false;
@@ -1399,6 +1403,35 @@ mod tests {
         shelf.set_hidden(roms[1].key, false);
         idle(&mut cards, &games, &mut shelf, 1);
         assert_eq!((cards.filter, cards.chips().1, cards.view.len()), (Filter::All, 5, 5));
+    }
+
+    #[test]
+    fn hiding_the_selected_game_keeps_the_selection_on_a_game() {
+        let roms = library(2, 1);
+        let games = games(&roms);
+        let mut shelf = Shelf::in_memory();
+        let mut cards = Cards::new();
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.chips().1, 4, "All, both systems, favourites");
+        // The last game (the only Mega Drive one) goes: the one before it is selected, not the
+        // Rescan tile that took its place, and a system with nothing to show has no chip.
+        step(&mut cards, &games, &mut shelf, |i| i.nav.right = true);
+        step(&mut cards, &games, &mut shelf, |i| i.nav.right = true);
+        assert_eq!(cards.selected(), Some(2));
+        shelf.set_hidden(roms[2].key, true);
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.selected(), Some(1));
+        let (chips, n) = cards.chips();
+        assert_eq!(chips[..n], [Filter::All, Filter::Favourites, Filter::Hidden]);
+        // A game in the middle goes: the next one takes its place under the selection.
+        step(&mut cards, &games, &mut shelf, |i| i.nav.left = true);
+        shelf.set_hidden(roms[0].key, true);
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.selected(), Some(1));
+        // The last game of all: only the Rescan tile is left to stand on.
+        shelf.set_hidden(roms[1].key, true);
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!((cards.selected(), cards.entries()), (None, 1));
     }
 
     #[test]

@@ -624,6 +624,37 @@ mod tests {
     }
 
     #[test]
+    fn library_forgets_a_deleted_file_and_finds_its_copy() {
+        let root = temp_dir("forget");
+        let (first, copy, dropped) = (root.join("a.nes"), root.join("b/copy.nes"), std::env::temp_dir().join(format!("ebobo-lib-forget-drop-{}.nes", std::process::id())));
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(&first, rom(0, false, 1)).unwrap();
+        fs::write(&copy, rom(0, false, 1)).unwrap();
+        fs::write(&dropped, rom(1, false, 2)).unwrap();
+        let lib = Library::with_cache(vec![root.clone()], root.join("cache.tsv"));
+        wait(&lib);
+        lib.add_file(&dropped).unwrap();
+        let paths = |lib: &Library| lib.entries().into_iter().map(|e| e.path).collect::<Vec<_>>();
+        assert_eq!(paths(&lib), [first.clone(), dropped.clone()], "one card per game");
+        // The file is gone: its card goes at once, and the rescan shows the game's other file.
+        fs::remove_file(&first).unwrap();
+        let before = lib.generation();
+        lib.forget(&first);
+        assert_eq!(paths(&lib), [dropped.clone()]);
+        assert_ne!(lib.generation(), before);
+        lib.rescan();
+        wait(&lib);
+        assert_eq!(paths(&lib), [copy, dropped.clone()]);
+        // A dropped file does not come back with the next rescan.
+        fs::remove_file(&dropped).unwrap();
+        lib.forget(&dropped);
+        lib.rescan();
+        wait(&lib);
+        assert_eq!(lib.entries().len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn library_zip_without_nes_is_an_error() {
         let root = temp_dir("zip");
         let p = root.join("empty.zip");

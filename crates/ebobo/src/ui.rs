@@ -1758,7 +1758,13 @@ impl Ui {
             Field::Search => S::Search,
             Field::Rename(_) => S::RenameTitle,
         });
-        f.draw_centered(c, 48, title, WHITE, 1);
+        // A game's name has a second line saying what an empty field does, like the room
+        // code's hint: above the box, clear of the built-in keyboard and the toasts over it.
+        let renaming = matches!(field, Field::Rename(_));
+        f.draw_centered(c, if renaming { 36 } else { 48 }, title, WHITE, 1);
+        if renaming {
+            f.draw_centered(c, 50, self.t(S::RenameEmptyNote), SEC, 1);
+        }
         c.fill_rect(8, 70, 240, 20, PANEL);
         c.rect(8, 70, 240, 20, ACCENT);
         // Show the tail when the text is longer than the box (28 columns incl. the caret).
@@ -1769,12 +1775,6 @@ impl Ui {
         }
         f.draw(c, 16, 76, &shown, WHITE, 1);
         f.draw(c, 16 + f.width(&shown, 1), 76, "_", ACCENT, 1);
-        // Under the box, above where the built-in keyboard starts.
-        const NOTE_Y: i32 = 98;
-        const _: () = assert!(NOTE_Y + 8 <= osk::TOP);
-        if matches!(field, Field::Rename(_)) {
-            f.draw_centered(c, NOTE_Y, self.t(S::RenameEmptyNote), SEC, 1);
-        }
     }
 
     fn draw_settings(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, h: &mut Vec<(Area, Hit)>) {
