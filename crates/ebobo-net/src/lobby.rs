@@ -792,6 +792,38 @@ fn error_of(msg: &str) -> NetError {
     }
 }
 
+/// A seat is free while the room has fewer than `MAX_PLAYERS` seats or one of them is empty.
+fn has_free_seat(order: &[PeerId]) -> bool {
+    order.len() < MAX_PLAYERS || order.contains(&EMPTY_SEAT)
+}
+
+/// `id` takes the first empty seat, else a new one at the end.
+fn take_seat(order: &mut Vec<PeerId>, id: PeerId) {
+    match order.iter().position(|p| *p == EMPTY_SEAT) {
+        Some(i) => order[i] = id,
+        None => order.push(id),
+    }
+}
+
+/// Host, after every seat change: an empty seat with a newcomer's seat (anyone not in
+/// `veterans`) after it takes the first such seat, so newcomers close gaps while the players of
+/// the interrupted game keep their controllers; empty seats at the end are dropped.
+fn settle(order: &mut Vec<PeerId>, veterans: &[PeerId]) {
+    for i in 0..order.len() {
+        if order[i] != EMPTY_SEAT {
+            continue;
+        }
+        let newcomer = (i + 1..order.len()).find(|&j| order[j] != EMPTY_SEAT && !veterans.contains(&order[j]));
+        if let Some(j) = newcomer {
+            order[i] = order[j];
+            order[j] = EMPTY_SEAT;
+        }
+    }
+    while order.last() == Some(&EMPTY_SEAT) {
+        order.pop();
+    }
+}
+
 impl Worker {
     fn new(
         shared: Arc<Mutex<LobbyStatus>>,
@@ -869,8 +901,9 @@ impl Worker {
         if !self.is_host || self.order.contains(&id) || self.peers.get(&id).is_some_and(|p| p.full) {
             return;
         }
-        if self.order.len() < MAX_PLAYERS {
-            self.order.push(id);
+        if has_free_seat(&self.order) {
+            take_seat(&mut self.order, id);
+            settle(&mut self.order, &self.veterans);
             return;
         }
         self.send_ctrl(id, json!({"t": "error", "msg": "room_full"}));
@@ -880,24 +913,31 @@ impl Worker {
         p.xfer = None;
     }
 
-    /// Host: `peer` gets up to `n` seats (1..=`MAX_PLAYERS`): new ones go to the end while seats
-    /// are free, extra ones are taken from its last. Ignored once `start` went out.
+    /// Host: `peer` gets up to `n` seats (1..=`MAX_PLAYERS`): new ones (first empty seats, then
+    /// at the end) while seats are free, extra ones are given up from its last. A regrouped
+    /// room keeps a given-up seat as `EMPTY_SEAT`, so nobody else's controller changes. Ignored
+    /// once `start` went out.
     fn resize_seats(&mut self, peer: PeerId, n: u8) {
         if self.pending_start.is_some() {
             return;
         }
         let n = usize::from(n).clamp(1, MAX_PLAYERS);
         let mut have = self.seats_of(peer);
-        while have < n && self.order.len() < MAX_PLAYERS {
-            self.order.push(peer);
+        while have < n && has_free_seat(&self.order) {
+            take_seat(&mut self.order, peer);
             have += 1;
         }
         while have > n {
             if let Some(last) = self.order.iter().rposition(|p| *p == peer) {
-                self.order.remove(last);
+                if self.regrouped {
+                    self.order[last] = EMPTY_SEAT;
+                } else {
+                    self.order.remove(last);
+                }
             }
             have -= 1;
         }
+        settle(&mut self.order, &self.veterans);
     }
 
     /// This device's local players: the host changes its own seats, a guest asks the host
@@ -911,7 +951,7 @@ impl Worker {
         }
     }
 
-    /// Host: swaps seat `seat` with the one before it (`up`) or after it.
+    /// Host: swaps seat `seat` with the one before it (`up`) or after it, empty seats included.
     fn move_seat(&mut self, seat: usize, up: bool) {
         if !self.is_host || self.pending_start.is_some() {
             return;
@@ -919,6 +959,7 @@ impl Worker {
         let other = if up { seat.checked_sub(1) } else { seat.checked_add(1) };
         if let Some(other) = other.filter(|o| seat.max(*o) < self.order.len()) {
             self.order.swap(seat, other);
+            settle(&mut self.order, &self.veterans);
         }
     }
 
@@ -1012,7 +1053,15 @@ impl Worker {
     fn peer_left(&mut self, id: PeerId) {
         self.peers.remove(&id);
         if self.is_host {
-            self.order.retain(|p| *p != id);
+            // A regrouped room keeps the seats of a player who left, so the others keep theirs.
+            if self.regrouped {
+                for seat in self.order.iter_mut().filter(|p| **p == id) {
+                    *seat = EMPTY_SEAT;
+                }
+            } else {
+                self.order.retain(|p| *p != id);
+            }
+            settle(&mut self.order, &self.veterans);
         }
         if let Some(list) = &mut self.host_list {
             list.retain(|e| e.id != id);
@@ -1560,7 +1609,7 @@ impl Worker {
     /// transfer); hands over once every guest acked it or `START_ACK_WAIT` passed. The room
     /// stays open: a device that joins during the game knocks (`Link::take_knocks`).
     fn launch(&mut self, state: Option<(u32, u32, Vec<u8>)>) {
-        let (Some(_), Some(hr)) = (self.me, self.host_rom.as_ref()) else { return };
+        let (Some(me), Some(hr)) = (self.me, self.host_rom.as_ref()) else { return };
         let frame_ms = if hr.region.is_pal() { 20.0 } else { 16.64 };
         let header_four = hr.four_score;
         let worst = self.seated().filter_map(|(_, p)| p.ctrl.delay_rtt()).fold(0.0, f64::max);
@@ -1568,15 +1617,19 @@ impl Worker {
             Some(d) => d as usize,
             None => auto_input_delay(worst, frame_ms),
         };
-        let slots = self.order.clone();
+        // An empty seat is played by nobody: it goes out as the host's id, listed in `idle`.
+        let idle: Vec<usize> = (0..self.order.len()).filter(|&i| self.order[i] == EMPTY_SEAT).collect();
+        let slots: Vec<PeerId> = self.order.iter().map(|&p| if p == EMPTY_SEAT { me } else { p }).collect();
         let four_score = slots.len() > 2 || header_four;
-        let idle = Vec::new();
         let slot_ids: Vec<u8> = slots.iter().map(|p| p.0).collect();
         let delay_auto = self.input_delay.is_none();
         let mut msg = json!({
             "t": "start", "slots": slot_ids, "delay": delay, "auto": delay_auto, "four_score": four_score,
             "saves": self.saves.as_str(),
         });
+        if !idle.is_empty() {
+            msg["idle"] = json!(idle);
+        }
         let resume = state.as_ref().and_then(|_| self.resume_info());
         if let Some((id, crc, bytes)) = &state {
             let mut announce = json!({"id": id, "size": bytes.len(), "crc32": format!("{crc:08x}")});
@@ -1628,14 +1681,20 @@ impl Worker {
     }
 
     /// Player names by slot: the second and later seats of one device are "<name> 2", "<name> 3",
-    /// "<name> 4".
-    fn slot_names(&self, slots: &[PeerId]) -> Vec<String> {
+    /// "<name> 4". An `idle` slot (nobody's) has no name and does not count for the numbering.
+    fn slot_names(&self, slots: &[PeerId], idle: &[usize]) -> Vec<String> {
+        let real = |i: usize| !idle.contains(&i);
         slots
             .iter()
             .enumerate()
-            .map(|(i, id)| match slots[..i].iter().filter(|p| *p == id).count() {
-                0 => self.name_of(*id),
-                before => format!("{} {}", self.name_of(*id), before + 1),
+            .map(|(i, id)| {
+                if !real(i) {
+                    return String::new();
+                }
+                match (0..i).filter(|&j| real(j) && slots[j] == *id).count() {
+                    0 => self.name_of(*id),
+                    before => format!("{} {}", self.name_of(*id), before + 1),
+                }
             })
             .collect()
     }
@@ -1655,7 +1714,7 @@ impl Worker {
         resume: Option<ResumeInfo>,
     ) {
         let (Some(me), Some(mesh)) = (self.me, self.mesh.take()) else { return };
-        let names = self.slot_names(&slots);
+        let names = self.slot_names(&slots, &idle);
         let game = GameStart {
             link: mesh.into_link(),
             me,
@@ -1721,6 +1780,7 @@ impl Worker {
             }
         }
         if self.is_host {
+            settle(&mut self.order, &self.veterans);
             self.resume = resume;
             let guests: Vec<PeerId> =
                 self.veterans.iter().copied().filter(|id| self.peers.contains_key(id)).collect();

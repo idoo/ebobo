@@ -681,7 +681,7 @@ fn full_room_refuses_guest_and_starts_with_repeated_slots() {
     assert_eq!(ps.slots, vec![PeerId(0), PeerId(0), PeerId(1), PeerId(1)]);
     assert!(ps.four_score);
     assert_eq!(ps.acks.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![PeerId(1)]);
-    assert_eq!(h.slot_names(&ps.slots), ["H", "H 2", "G", "G 2"]);
+    assert_eq!(h.slot_names(&ps.slots, &ps.idle), ["H", "H 2", "G", "G 2"]);
 }
 
 /// The host reorders seats; the guest's status shows the same order. A guest cannot reorder.
@@ -702,6 +702,119 @@ fn moved_seat_reaches_the_guest() {
     assert_eq!(g.order, h.order);
     h.start_game();
     assert_eq!(h.pending_start.as_ref().unwrap().slots, vec![PeerId(1), PeerId(1), PeerId(0)]);
+}
+
+const E: PeerId = EMPTY_SEAT;
+
+/// Newcomers close the gaps veterans leave; veterans never move; empty seats at the end go.
+#[test]
+fn settle_moves_only_newcomers() {
+    let p = PeerId;
+    let mut o = vec![p(0), E, p(2), p(3)];
+    settle(&mut o, &[p(0), p(2)]);
+    assert_eq!(o, [p(0), p(3), p(2)]);
+    let mut o = vec![p(0), E, p(2)];
+    settle(&mut o, &[p(0), p(2)]);
+    assert_eq!(o, [p(0), E, p(2)]);
+    let mut o = vec![p(0), p(1), E];
+    settle(&mut o, &[p(0), p(1)]);
+    assert_eq!(o, [p(0), p(1)]);
+}
+
+/// A link the game gives back: loopback UDP, no peer routes.
+fn loopback_link() -> Link {
+    Link::udp(std::net::UdpSocket::bind("127.0.0.1:0").unwrap(), PeerId(0), &[])
+}
+
+/// Back from a game a guest left: the others keep their controllers, the room waits for the
+/// remaining guest's fresh `ready`, and the start plays the empty seat as nobody.
+#[test]
+fn regroup_keeps_seats_and_waits_for_ready() {
+    let mut h = host_worker(&[1, 2]);
+    h.nickname = "H".into();
+    h.peers.get_mut(&PeerId(2)).unwrap().name = "B".into();
+    // The game was started (a bare worker has no mesh, as a lobby whose game holds it).
+    h.launch(None);
+    let resume = Resume { kind: ResumeKind::Last, saved_at: 9, state: noise(500, 2) };
+    h.regroup(loopback_link(), vec![PeerId(1)], Some(resume));
+    assert_eq!(h.order, [PeerId(0), E, PeerId(2)]);
+    assert!(h.snapshot().regrouped && h.stage == Stage::Lobby);
+    assert!(!h.peers.contains_key(&PeerId(1)), "the gone guest is forgotten");
+    assert!(!h.can_start(), "guest 2 is not back yet");
+    h.on_ctrl(PeerId(2), &json!({"t": "ready", "links": [0]}));
+    assert!(h.can_start());
+    h.launch(None);
+    let ps = h.pending_start.as_ref().expect("start sent");
+    assert_eq!((ps.slots.clone(), ps.idle.clone()), (vec![PeerId(0), PeerId(0), PeerId(2)], vec![1]));
+    assert_eq!(h.slot_names(&ps.slots, &ps.idle), ["H", "", "B"]);
+    let sent = h.peers[&PeerId(2)].ctrl.unacked.values().last().expect("start pending").packet.clone();
+    let Some(Packet::Ctrl { json, .. }) = Packet::parse(&sent) else { panic!("not CTRL") };
+    let msg: Value = serde_json::from_slice(json).unwrap();
+    assert_eq!((msg["slots"].clone(), msg["idle"].clone()), (json!([0, 0, 2]), json!([1])));
+}
+
+/// A newcomer of a regrouped room fills the empty seat; a veteran leaving empties its seat.
+#[test]
+fn regrouped_newcomer_takes_empty_seat_and_leaving_keeps_gaps() {
+    let mut h = host_worker(&[1, 2]);
+    h.launch(None);
+    h.regroup(loopback_link(), vec![PeerId(1)], None);
+    h.on_event(MeshEvent::RouteUp { id: PeerId(3), kind: RouteKind::Direct });
+    assert_eq!(h.order, [PeerId(0), PeerId(3), PeerId(2)]);
+    h.peer_left(PeerId(2));
+    assert_eq!(h.order, [PeerId(0), PeerId(3)]);
+    h.set_seats(2);
+    assert_eq!(h.order, [PeerId(0), PeerId(3), PeerId(0)]);
+    h.set_seats(1);
+    assert_eq!(h.order, [PeerId(0), PeerId(3)]);
+}
+
+/// Two real lobbies play, come back to the room on the game's routes and start again from the
+/// host's state.
+#[test]
+fn lobby_direct_regroup_continues_from_state() {
+    let Some(rom) = nestest() else { return };
+    let port = free_port();
+    let mut host = Lobby::start(cfg(
+        "Host",
+        LobbyMode::HostDirect { port, rom: rom.clone(), rom_name: "nestest.nes".into() },
+        Box::new(|_| None),
+    ));
+    let r2 = rom.clone();
+    let mut guest = Lobby::start(cfg(
+        "Guest",
+        LobbyMode::JoinDirect { addr: format!("127.0.0.1:{port}") },
+        Box::new(move |_| Some(r2.clone())),
+    ));
+    let wait_startable = |host: &Lobby, guest: &Lobby, regrouped: bool| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (h, g) = (host.status(), guest.status());
+            assert!(h.error.is_none() && g.error.is_none(), "{h:#?} {g:#?}");
+            let back = h.regrouped == regrouped && g.regrouped == regrouped && g.stage == Stage::Lobby;
+            if back && h.can_start {
+                break;
+            }
+            assert!(Instant::now() < deadline, "not startable: {h:#?} {g:#?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    wait_startable(&host, &guest, false);
+    host.start_game();
+    let mut games = take_all(&mut [&mut host, &mut guest], 15);
+    assert!(games.iter().all(|g| g.state.is_none()));
+    let state = noise(30_000, 21);
+    let g_link = games.pop().unwrap().link;
+    let h_link = games.pop().unwrap().link;
+    host.regroup(h_link, vec![], Some(Resume { kind: ResumeKind::Last, saved_at: 1, state: state.clone() }));
+    guest.regroup(g_link, vec![], None);
+    wait_startable(&host, &guest, true);
+    host.start_game();
+    for g in take_all(&mut [&mut host, &mut guest], 15) {
+        assert!(g.state.as_deref() == Some(&state[..]), "state differs from the host's");
+    }
+    host.leave();
+    guest.leave();
 }
 
 /// The host's save policy reaches the guest's room screen and both games.
