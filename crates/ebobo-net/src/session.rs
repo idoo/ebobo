@@ -74,6 +74,12 @@ pub enum NetEvent {
     /// The player on controller `slot` loaded the shared save for everyone (`INPUT_LOAD`).
     /// Reported once per load, never again when its frame is re-simulated.
     Loaded { slot: usize },
+    /// A device joined the room while the game runs (its route to this device is decided).
+    /// The host answers by going back to the room (`NetSession::into_link`, `Lobby::regroup`).
+    Knock { peer: PeerId },
+    /// The host called everyone back to the room: end the session with `into_link` and hand
+    /// the link to `Lobby::regroup`.
+    Regroup,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -490,6 +496,12 @@ impl NetSession {
                 self.mark_gone(peer);
                 self.pending.push(NetEvent::Disconnected { peer });
             }
+        }
+        let (knocks, regroup) =
+            self.link.borrow_mut().as_mut().map(|l| (l.take_knocks(), l.take_regroup())).unwrap_or_default();
+        self.pending.extend(knocks.into_iter().map(|peer| NetEvent::Knock { peer }));
+        if regroup {
+            self.pending.push(NetEvent::Regroup);
         }
         self.sample_rtt(Instant::now());
     }

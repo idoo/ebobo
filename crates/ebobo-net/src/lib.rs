@@ -24,7 +24,7 @@ mod transport;
 use std::fmt;
 
 pub use diag::{NatKind, NetDiag, diagnose};
-pub use lobby::{GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, PlayerInfo, Resume, ResumeInfo, ResumeKind, RomState, Stage};
+pub use lobby::{GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, PlayerInfo, Resume, ResumeInfo, ResumeKind, RomState, Stage, EMPTY_SEAT};
 pub use session::{FrameOutcome, NetEvent, NetSession, NetStats, PeerStats};
 pub use mesh::Link;
 pub use transport::{PeerId, RouteKind};

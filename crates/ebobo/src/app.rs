@@ -1271,6 +1271,7 @@ impl App {
                             self.ui.toast(&text);
                         }
                         NetEvent::Synchronizing { .. } | NetEvent::Synchronized { .. } => {}
+                        NetEvent::Knock { .. } | NetEvent::Regroup => {}
                     }
                 }
                 if n.slots.iter().all(|p| *p == n.me || n.gone.contains(p)) {

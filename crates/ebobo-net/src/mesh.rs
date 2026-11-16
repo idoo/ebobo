@@ -361,11 +361,6 @@ impl Mesh {
         self.me
     }
 
-    /// Host: `{"t":"lock"}` to the server so nobody joins a running game.
-    pub(crate) fn lock_room(&mut self) {
-        self.transport.send_text(json!({"t": "lock"}).to_string());
-    }
-
     /// Every peer with a decided route.
     pub(crate) fn routed(&self) -> Vec<(PeerId, RouteKind)> {
         let mut list: Vec<(PeerId, RouteKind)> =

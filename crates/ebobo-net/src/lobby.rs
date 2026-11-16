@@ -49,6 +49,10 @@ const STATE_WAIT: Duration = Duration::from_secs(10);
 /// unacked for the peer's CTRL retransmit timeout is sent again.
 const STATE_WINDOW: usize = 64;
 
+/// A seat of `LobbyStatus::order` that nobody holds: a player left a game that goes on, and
+/// the seats after it keep their controllers. Only a room that came back from a game has them.
+pub const EMPTY_SEAT: PeerId = PeerId(0xFE);
+
 pub struct LobbyConfig {
     /// Signaling server base URL.
     pub server: String,
@@ -162,8 +166,11 @@ pub struct GameStart {
     /// The live mesh: routes, relay, in-game route health and roaming.
     pub link: Link,
     pub me: PeerId,
-    /// `slots[i]` = peer id on controller i+1 of the console.
+    /// `slots[i]` = peer id on controller i+1 of the console. A seat nobody plays (`idle`)
+    /// carries the host's id: the host's device feeds it no presses.
     pub slots: Vec<PeerId>,
+    /// Indexes into `slots` of the seats nobody plays (a player left a game that goes on).
+    pub idle: Vec<usize>,
     /// Player names by slot.
     pub names: Vec<String>,
     /// The ROM file both sides run (host's own, or found/received by the guest).
@@ -263,6 +270,14 @@ impl Lobby {
         let _ = self.cmd.send(Cmd::SetSaves(p));
     }
 
+    /// Back from a running game to the room, on the same connections: `link` is the game's
+    /// link (`NetSession::into_link`), `gone` the players who left during the game. The host
+    /// passes the game's state as `resume`; Start then continues from it with whoever is in
+    /// the room. A guest passes `None` and waits for the host as in any room.
+    pub fn regroup(&self, link: Link, gone: Vec<PeerId>, resume: Option<Resume>) {
+        let _ = self.cmd.send(Cmd::Regroup { link, gone, resume });
+    }
+
     /// Leaves the room (BYE/leave to peers) and stops the thread.
     pub fn leave(self) {
         drop(self);
@@ -284,6 +299,7 @@ enum Cmd {
     SetSeats(u8),
     MoveSeat(usize, bool),
     SetSaves(SavePolicy),
+    Regroup { link: Link, gone: Vec<PeerId>, resume: Option<Resume> },
     Leave,
 }
 
@@ -557,6 +573,7 @@ struct PendingStart {
     acks: Vec<(PeerId, u32)>,
     deadline: Instant,
     slots: Vec<PeerId>,
+    idle: Vec<usize>,
     delay: usize,
     delay_auto: bool,
     four_score: bool,
@@ -664,6 +681,7 @@ fn run(cfg: LobbyConfig, shared: Arc<Mutex<LobbyStatus>>, cmds: Receiver<Cmd>, g
                 Ok(Cmd::SetSeats(n)) => w.set_seats(n),
                 Ok(Cmd::MoveSeat(seat, up)) => w.move_seat(seat, up),
                 Ok(Cmd::SetSaves(p)) => w.set_saves(p),
+                Ok(Cmd::Regroup { link, gone, resume }) => w.regroup(link, gone, resume),
                 Ok(Cmd::Leave) | Err(TryRecvError::Disconnected) => {
                     w.leave();
                     return;
@@ -672,9 +690,16 @@ fn run(cfg: LobbyConfig, shared: Arc<Mutex<LobbyStatus>>, cmds: Receiver<Cmd>, g
             }
         }
         let Some(mesh) = w.mesh.as_mut() else {
+            // The game has the mesh (or the room failed): nothing to drive until the game
+            // gives it back or the room is left.
             w.publish();
-            idle(&cmds);
-            return;
+            match idle(&cmds) {
+                Some((link, gone, resume)) => {
+                    w.regroup(link, gone, resume);
+                    continue;
+                }
+                None => return,
+            }
         };
         for ev in mesh.poll() {
             w.on_event(ev);
@@ -687,13 +712,17 @@ fn run(cfg: LobbyConfig, shared: Arc<Mutex<LobbyStatus>>, cmds: Receiver<Cmd>, g
     }
 }
 
-/// Waits for `Leave` (or the handle being dropped) once there is nothing left to drive.
-fn idle(cmds: &Receiver<Cmd>) {
+/// Waits, with nothing to drive, for the game to give the mesh back (`Some`: what
+/// `Lobby::regroup` passed) or for `Leave` / the handle being dropped (`None`).
+fn idle(cmds: &Receiver<Cmd>) -> Option<(Link, Vec<PeerId>, Option<Resume>)> {
     while let Ok(cmd) = cmds.recv() {
-        if matches!(cmd, Cmd::Leave) {
-            return;
+        match cmd {
+            Cmd::Regroup { link, gone, resume } => return Some((link, gone, resume)),
+            Cmd::Leave => return None,
+            _ => {}
         }
     }
+    None
 }
 
 fn route_str(r: Option<RouteKind>) -> Value {
@@ -1148,6 +1177,10 @@ impl Worker {
                     .as_array()
                     .map(|a| a.iter().filter_map(Value::as_u64).map(|x| PeerId(x as u8)).collect())
                     .unwrap_or_default();
+                let idle: Vec<usize> = v["idle"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_u64).map(|x| x as usize).collect())
+                    .unwrap_or_default();
                 let delay = v["delay"].as_u64().unwrap_or(2) as usize;
                 let delay_auto = v["auto"].as_bool().unwrap_or(false);
                 let four = v["four_score"].as_bool().unwrap_or(slots.len() > 2);
@@ -1171,7 +1204,7 @@ impl Worker {
                 // The kind travels with the start: the `players` message that announced it may
                 // still be on its way.
                 let resume = state.as_ref().and_then(|_| resume_of(&v["state"]));
-                self.hand_over(slots, delay, delay_auto, four, rom, rom_name, region, state, resume);
+                self.hand_over(slots, idle, delay, delay_auto, four, rom, rom_name, region, state, resume);
             }
             _ => {}
         }
@@ -1508,8 +1541,9 @@ impl Worker {
         });
     }
 
-    /// Host: locks the room and sends `start` (with the `state` announcement `(id, crc, bytes)`
-    /// of a finished transfer); hands over once every guest acked it or `START_ACK_WAIT` passed.
+    /// Host: sends `start` (with the `state` announcement `(id, crc, bytes)` of a finished
+    /// transfer); hands over once every guest acked it or `START_ACK_WAIT` passed. The room
+    /// stays open: a device that joins during the game knocks (`Link::take_knocks`).
     fn launch(&mut self, state: Option<(u32, u32, Vec<u8>)>) {
         let (Some(_), Some(hr)) = (self.me, self.host_rom.as_ref()) else { return };
         let frame_ms = if hr.region.is_pal() { 20.0 } else { 16.64 };
@@ -1521,9 +1555,7 @@ impl Worker {
         };
         let slots = self.order.clone();
         let four_score = slots.len() > 2 || header_four;
-        if let Some(mesh) = self.mesh.as_mut() {
-            mesh.lock_room();
-        }
+        let idle = Vec::new();
         let slot_ids: Vec<u8> = slots.iter().map(|p| p.0).collect();
         let delay_auto = self.input_delay.is_none();
         let mut msg = json!({
@@ -1546,6 +1578,7 @@ impl Worker {
             acks,
             deadline: Instant::now() + START_ACK_WAIT,
             slots,
+            idle,
             delay,
             delay_auto,
             four_score,
@@ -1566,7 +1599,7 @@ impl Worker {
         let Some(ps) = self.pending_start.take() else { return };
         let Some(hr) = self.host_rom.as_ref() else { return };
         let (rom, name, region) = (hr.bytes.clone(), hr.name.clone(), hr.region);
-        self.hand_over(ps.slots, ps.delay, ps.delay_auto, ps.four_score, rom, name, region, ps.state, ps.resume);
+        self.hand_over(ps.slots, ps.idle, ps.delay, ps.delay_auto, ps.four_score, rom, name, region, ps.state, ps.resume);
     }
 
     fn name_of(&self, id: PeerId) -> String {
@@ -1596,6 +1629,7 @@ impl Worker {
     fn hand_over(
         &mut self,
         slots: Vec<PeerId>,
+        idle: Vec<usize>,
         delay: usize,
         delay_auto: bool,
         four_score: bool,
@@ -1611,6 +1645,7 @@ impl Worker {
             link: mesh.into_link(),
             me,
             slots,
+            idle,
             names,
             rom,
             rom_name,
@@ -1624,6 +1659,21 @@ impl Worker {
         };
         let _ = self.game_tx.send(game);
         self.stage = Stage::Starting;
+    }
+
+    /// Back from the game: the mesh is this room's again.
+    fn regroup(&mut self, link: Link, gone: Vec<PeerId>, resume: Option<Resume>) {
+        if self.mesh.is_some() {
+            return;
+        }
+        self.mesh = Some(link.into_mesh());
+        for id in gone {
+            self.peer_left(id);
+        }
+        if self.is_host {
+            self.resume = resume;
+        }
+        self.stage = Stage::Lobby;
     }
 
     fn leave(&mut self) {
