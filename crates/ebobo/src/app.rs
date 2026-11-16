@@ -394,8 +394,14 @@ impl App {
                 None
             }
         };
+        // Once per run in every kind of start, so the version counts as seen either way.
+        let whats_new = crate::whatsnew::due(&config::data_dir(), VERSION);
         match start {
-            Start::Menu => {}
+            Start::Menu => {
+                if whats_new {
+                    self.ui.whats_new(VERSION);
+                }
+            }
             Start::Solo(path) => {
                 if let Some(entry) = file(self, path) {
                     self.start_solo(entry);

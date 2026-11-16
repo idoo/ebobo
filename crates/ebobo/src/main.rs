@@ -13,6 +13,7 @@ mod library;
 mod osk;
 mod ui;
 mod video;
+mod whatsnew;
 
 fn main() {
     std::process::exit(app::run(std::env::args().skip(1).collect()));

@@ -659,6 +659,20 @@ impl Ui {
         self.modal = Some(Modal { title: title.to_string(), lines, confirm: None, sel: 0 });
     }
 
+    /// Box listing what changed in `version` (`whatsnew::NOTES`), one item per change.
+    pub fn whats_new(&mut self, version: &str) {
+        let mut lines = Vec::new();
+        for &(ru, en) in crate::whatsnew::NOTES {
+            let note = if self.lang == Lang::Ru { ru } else { en };
+            // Two columns go to the "- " marker / the indent, so a line stays within 27.
+            for (i, line) in wrap(note, 25).into_iter().enumerate() {
+                lines.push(format!("{}{line}", if i == 0 { "- " } else { "  " }));
+            }
+        }
+        let title = format!("{} {version}", self.t(S::WhatsNew));
+        self.modal = Some(Modal { title, lines, confirm: None, sel: 0 });
+    }
+
     /// Short notice at the bottom for ~2.5 s, also during play.
     pub fn toast(&mut self, message: &str) {
         self.toast_secs(message, TOAST_SECS);
@@ -3794,7 +3808,9 @@ mod tests {
         }
     }
 
-    /// Renders Main, Lobby (3 players) and Pause to /tmp/ebobo-ui-*.png for a visual check.
+    /// Renders Main, Lobby (3 players) and Pause to /tmp/ebobo-ui-*.png, a solo game paused
+    /// while away to /tmp/ebobo-away-<lang>.png and the what's-new box to
+    /// /tmp/ebobo-whatsnew-<lang>.png for a visual check.
     #[test]
     #[ignore]
     fn ui_render_snapshots() {
@@ -3844,6 +3860,23 @@ mod tests {
             let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
             ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
             write_png(path, &canvas.px, 256, 240);
+        }
+        // A solo game whose window went behind; the what's-new box over the main menu.
+        for lang in [Lang::Ru, Lang::En] {
+            let code = lang.code();
+            let mut ui = Ui::new(lang);
+            let mut canvas = Canvas::new();
+            canvas.clear(rgb(0x5C, 0x94, 0xFC));
+            let game = GameView { rom_name: "X", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((0, None)), slot_thumb: None, can_load: false, away: true };
+            let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.5.0" };
+            ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
+            write_png(&format!("/tmp/ebobo-away-{code}.png"), &canvas.px, 256, 240);
+            ui.show_main();
+            ui.whats_new("0.5.0");
+            let mut canvas = Canvas::new();
+            let c = UiCtx { library: &[], scanning: false, lobby: None, game: None, pads: &pads, config: &mut cfg, version: "0.5.0" };
+            ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
+            write_png(&format!("/tmp/ebobo-whatsnew-{code}.png"), &canvas.px, 256, 240);
         }
     }
 
