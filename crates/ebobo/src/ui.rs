@@ -21,6 +21,7 @@ use crate::i18n::{Lang, S};
 use crate::input::{InputFrame, Nav, PadEvent, PadInfo, PadKind, PointerEvent};
 use crate::osk::{self, Charset, Osk, OskNav, OskOutput};
 use crate::library::RomEntry;
+use crate::trash::Disposal;
 
 /// What the user asked for; the app performs it.
 #[derive(Clone, Debug, PartialEq)]
@@ -227,6 +228,8 @@ enum Field {
     Server,
     /// The library's search text.
     Search,
+    /// The user's own name for a game of the library.
+    Rename(ebobo_art::Key),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +274,19 @@ struct Modal {
     sel: usize,
 }
 
+/// The menu of one game of the library. It keeps what it needs of the game itself: the
+/// library may be rescanned while the menu is open.
+struct GameMenu {
+    key: ebobo_art::Key,
+    path: PathBuf,
+    /// The name the game's file gave it (the last resort of `cards::shown_name`).
+    name: String,
+    sel: usize,
+}
+
+/// The rows of a game's menu: favourite, rename, hide, delete.
+const GAME_MENU_ROWS: usize = 4;
+
 /// The two answers of a confirmation box: the first performs `action`, the second (the safe
 /// one, preselected) closes the box.
 struct Confirm {
@@ -308,8 +324,8 @@ enum Glyph {
     Confirm,
     Back,
     LeftRight,
-    /// North face button: favourite.
-    North,
+    /// The options button (Start, or Space on a keyboard): the game's menu.
+    Options,
     /// West face button: search.
     West,
     /// The shoulder pair: previous / next filter.
@@ -340,7 +356,7 @@ enum Key {
     Right,
     Up,
     Down,
-    Fav,
+    Options,
     Search,
     PrevTab,
     NextTab,
@@ -356,7 +372,7 @@ impl Key {
             Key::Right => n.right = true,
             Key::Up => n.up = true,
             Key::Down => n.down = true,
-            Key::Fav => n.fav = true,
+            Key::Options => n.options = true,
             Key::Search => n.search = true,
             Key::PrevTab => n.prev_tab = true,
             Key::NextTab => n.next_tab = true,
@@ -380,6 +396,12 @@ enum Hit {
     Key(Key),
     /// On-screen keyboard key: press holds it, release on it types.
     Osk(usize),
+    /// Row of a game's menu: press selects it, release does it.
+    MenuRow(usize),
+    /// The box of a game's menu off its rows: a tap there does nothing.
+    MenuBox,
+    /// The dimmed screen around a game's menu: a tap there closes it.
+    MenuOutside,
 }
 
 /// A press in progress (mouse button or finger down).
@@ -409,6 +431,8 @@ pub struct Ui {
     /// Last room code sent to join; pre-filled on the next code entry (kept after a failure).
     last_code: Option<String>,
     modal: Option<Modal>,
+    /// The open menu of a library game; only it takes input while it is open.
+    menu: Option<GameMenu>,
     toasts: Vec<(String, f32)>,
     clock: f32,
     /// Last network check result (`None` before the first one finishes).
@@ -464,6 +488,7 @@ impl Ui {
             field: String::new(),
             last_code: None,
             modal: None,
+            menu: None,
             toasts: Vec::new(),
             clock: 0.0,
             diag: None,
@@ -545,6 +570,7 @@ impl Ui {
     /// Hides menus (game view: only OSD and toasts are drawn).
     pub fn hide(&mut self) {
         self.stack.clear();
+        self.menu = None;
         self.press = None;
     }
 
@@ -555,7 +581,7 @@ impl Ui {
     /// The keyboard types into the interface: a text field (room code, IP, nickname, server,
     /// search) has focus, or the library is on top (typing searches).
     pub fn wants_text_input(&self) -> bool {
-        self.field_focused() || (self.modal.is_none() && matches!(self.stack.last(), Some(Screen::Picker(_))))
+        self.field_focused() || (self.modal.is_none() && self.menu.is_none() && matches!(self.stack.last(), Some(Screen::Picker(_))))
     }
 
     /// A text field screen is on top.
@@ -690,6 +716,9 @@ impl Ui {
                 self.modal = None;
             }
             return None;
+        }
+        if self.menu.is_some() {
+            return self.update_menu(&nav);
         }
 
         let top = *self.stack.last()?;
@@ -826,6 +855,12 @@ impl Ui {
             k.draw(canvas, font);
             h.extend(k.key_rects().map(|(i, r)| (Area { x: r.x, y: r.y, w: r.w, h: r.h }, Hit::Osk(i))));
         }
+        if let Some(menu) = self.menu.as_ref().filter(|_| visible) {
+            // Like a modal: only the menu takes taps, and only it reads at full strength.
+            h.clear();
+            canvas.dim(0.55);
+            self.draw_menu(canvas, font, menu, &mut h);
+        }
         if let Some(modal) = &self.modal {
             // Only the modal takes taps while it is open, and only it reads at full strength.
             h.clear();
@@ -938,22 +973,28 @@ impl Ui {
                     m.sel = i;
                 }
             }
+            Hit::MenuRow(i) => {
+                if let Some(m) = &mut self.menu {
+                    m.sel = i;
+                }
+            }
             Hit::Cell(i) => self.code_cur = i,
             Hit::Osk(i) => {
                 if let Some(k) = &mut self.osk {
                     k.set_pressed(Some(i));
                 }
             }
-            Hit::Row { .. } | Hit::Key(_) => {}
+            Hit::Row { .. } | Hit::Key(_) | Hit::MenuBox | Hit::MenuOutside => {}
         }
     }
 
     /// The button a completed tap at column `x` stands for.
     fn activate(&self, hit: Hit, x: i32) -> Nav {
         match hit {
-            Hit::Row { enabled: false, .. } | Hit::Cell(_) | Hit::Osk(_) => Nav::default(),
+            Hit::Row { enabled: false, .. } | Hit::Cell(_) | Hit::Osk(_) | Hit::MenuBox => Nav::default(),
             Hit::Row { back: Some((from, to)), .. } => (if (from..to).contains(&x) { Key::Left } else { Key::Right }).nav(),
-            Hit::Row { .. } | Hit::Modal(_) => Key::Confirm.nav(),
+            Hit::Row { .. } | Hit::Modal(_) | Hit::MenuRow(_) => Key::Confirm.nav(),
+            Hit::MenuOutside => Key::Back.nav(),
             Hit::Key(k) => k.nav(),
         }
     }
@@ -1008,7 +1049,7 @@ impl Ui {
         self.push(Screen::Field(field));
         self.open_osk(match field {
             Field::Addr => Charset::Address,
-            Field::Nick | Field::Search => Charset::Nickname,
+            Field::Nick | Field::Search | Field::Rename(_) => Charset::Nickname,
             Field::Server => Charset::Url,
         });
     }
@@ -1131,9 +1172,87 @@ impl Ui {
                 self.open_field(Field::Search, text);
                 None
             }
-            // The game's menu: owned by the game menu slice.
-            cards::Action::Menu(_) => None,
+            cards::Action::Menu(i) => {
+                let entry = &lib[i];
+                self.menu = Some(GameMenu {
+                    key: ebobo_art::Key { system: entry.system, crc32: entry.crc32 },
+                    path: entry.path.clone(),
+                    name: entry.name.clone(),
+                    sel: 0,
+                });
+                self.press = None;
+                None
+            }
         }
+    }
+
+    /// The open game menu's frame: up/down move with wrap, confirm does the row, back or
+    /// another options press closes it.
+    fn update_menu(&mut self, nav: &Nav) -> Option<UiAction> {
+        let menu = self.menu.as_mut()?;
+        if nav.up {
+            menu.sel = (menu.sel + GAME_MENU_ROWS - 1) % GAME_MENU_ROWS;
+        }
+        if nav.down {
+            menu.sel = (menu.sel + 1) % GAME_MENU_ROWS;
+        }
+        if nav.back || nav.options {
+            self.menu = None;
+            return None;
+        }
+        if !nav.confirm {
+            return None;
+        }
+        let menu = self.menu.take()?;
+        let name = cards::shown_name(menu.key, &menu.name, &self.shelf, &self.art);
+        match menu.sel {
+            0 => {
+                self.shelf.toggle_favourite(menu.key);
+                None
+            }
+            1 => {
+                self.open_field(Field::Rename(menu.key), name.chars().take(ebobo_art::shelf::NAME_MAX).collect());
+                None
+            }
+            2 => {
+                let hide = !self.shelf.is_hidden(menu.key);
+                self.shelf.set_hidden(menu.key, hide);
+                let text = self.t(if hide { S::ToastHidden } else { S::ToastUnhidden });
+                // The toast line holds 30 characters; the name gets what the words leave.
+                let room = 30 - (text.chars().count() - "{name}".len());
+                let msg = text.replace("{name}", &trunc(&name, room));
+                self.toast(&msg);
+                None
+            }
+            _ => {
+                let disposal = crate::trash::plan(&menu.path);
+                self.ask_delete(menu.path, &menu.name, disposal);
+                None
+            }
+        }
+    }
+
+    /// The question before a game's file goes: its name, what `disposal` will do, and the
+    /// answer that does it, with Cancel preselected. `name` stands in for a file name that is
+    /// not text.
+    fn ask_delete(&mut self, path: PathBuf, name: &str, disposal: Disposal) {
+        let file = path.file_name().and_then(|f| f.to_str()).unwrap_or(name);
+        let lines = delete_lines(self.lang, file, disposal);
+        let yes = match disposal {
+            Disposal::Trash => S::AnswerTrash,
+            Disposal::Permanent => S::AnswerForGood,
+        };
+        self.ask(S::DeleteTitle, lines, Confirm { action: UiAction::DeleteRom(path), yes, no: S::Cancel });
+    }
+
+    /// The rows of the menu of game `key`, in order: favourite, rename, hide, delete.
+    fn menu_rows(&self, key: ebobo_art::Key) -> [S; GAME_MENU_ROWS] {
+        [
+            if self.shelf.is_favourite(key) { S::MenuFavRemove } else { S::MenuFavAdd },
+            S::MenuRename,
+            if self.shelf.is_hidden(key) { S::MenuUnhide } else { S::MenuHide },
+            S::MenuDelete,
+        ]
     }
 
     fn put_code_char(&mut self, c: char) {
@@ -1206,6 +1325,7 @@ impl Ui {
         let max = match field {
             Field::Nick => NICK_MAX,
             Field::Search => 24,
+            Field::Rename(_) => ebobo_art::shelf::NAME_MAX,
             Field::Addr | Field::Server => 200,
         };
         for c in input.paste.iter().flat_map(|p| p.chars()).chain(input.text.chars()) {
@@ -1239,6 +1359,12 @@ impl Ui {
             // Back leaves the search as it was; an empty text clears it.
             Field::Search => {
                 self.cards.set_search(&value);
+                self.pop();
+                None
+            }
+            // Back leaves the name as it was; an empty text gives the game its own name back.
+            Field::Rename(key) => {
+                self.shelf.set_name(key, &value);
                 self.pop();
                 None
             }
@@ -1609,6 +1735,7 @@ impl Ui {
             Field::Nick => S::NickTitle,
             Field::Server => S::ServerTitle,
             Field::Search => S::Search,
+            Field::Rename(_) => S::RenameTitle,
         });
         f.draw_centered(c, 48, title, WHITE, 1);
         c.fill_rect(8, 70, 240, 20, PANEL);
@@ -1618,6 +1745,12 @@ impl Ui {
         let shown: String = chars[chars.len().saturating_sub(27)..].iter().collect();
         f.draw(c, 16, 76, &shown, WHITE, 1);
         f.draw(c, 16 + f.width(&shown, 1), 76, "_", ACCENT, 1);
+        // Under the box, above where the built-in keyboard starts.
+        const NOTE_Y: i32 = 98;
+        const _: () = assert!(NOTE_Y + 8 <= osk::TOP);
+        if matches!(field, Field::Rename(_)) {
+            f.draw_centered(c, NOTE_Y, self.t(S::RenameEmptyNote), SEC, 1);
+        }
     }
 
     fn draw_settings(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, h: &mut Vec<(Area, Hit)>) {
@@ -1945,6 +2078,29 @@ impl Ui {
         }
     }
 
+    /// A game's menu over the dimmed library: the game's name, where its file is, and the
+    /// four rows in the look of the modal's buttons.
+    fn draw_menu(&self, c: &mut Canvas, f: &mut Font, m: &GameMenu, hits: &mut Vec<(Area, Hit)>) {
+        let h = 8 + 10 + 16 + GAME_MENU_ROWS as i32 * 16 + 4;
+        let y0 = (232 - h) / 2;
+        hits.push((Area { x: 0, y: 0, w: 256, h: 240 }, Hit::MenuOutside));
+        hits.push((Area { x: 12, y: y0, w: 232, h }, Hit::MenuBox));
+        c.fill_rect(12, y0, 232, h, PANEL);
+        c.rect(12, y0, 232, h, SEC);
+        let name = cards::shown_name(m.key, &m.name, &self.shelf, &self.art);
+        f.draw_centered(c, y0 + 8, &trunc(&name, 27), WHITE, 1);
+        f.draw_centered(c, y0 + 18, &trunc_left(&crate::config::tilde(&m.path), 27), SEC, 1);
+        for (i, row) in self.menu_rows(m.key).into_iter().enumerate() {
+            let y = y0 + 38 + i as i32 * 16;
+            if i == m.sel {
+                c.fill_rect(16, y - 4, 224, 16, ACCENT);
+                f.draw(c, 20, y, ">", WHITE, 1);
+            }
+            f.draw(c, 32, y, self.t(row), WHITE, 1);
+            hits.push((Area { x: 16, y: y - 4, w: 224, h: 16 }, Hit::MenuRow(i)));
+        }
+    }
+
     fn draw_toasts(&self, c: &mut Canvas, f: &mut Font, base: i32) {
         for (i, (msg, _)) in self.toasts.iter().rev().enumerate() {
             let line = trunc(msg, 30);
@@ -1955,25 +2111,28 @@ impl Ui {
         }
     }
 
-    /// The library's hints: confirm (play, or host for the two hosting pickers), North with
-    /// a star (favourite), West search, the shoulders filter. No Back: it fits every pad.
+    /// The library's hints: confirm (play, or host for the two hosting pickers), the options
+    /// button for the game's menu, West with a magnifier (search), the shoulders filter. No
+    /// Back: it fits every pad.
     fn library_hints(purpose: Purpose) -> [(Glyph, Option<S>); 4] {
         let confirm = if matches!(purpose, Purpose::Solo) { S::HintPlay } else { S::HintHost };
-        [(Glyph::Confirm, Some(confirm)), (Glyph::North, None), (Glyph::West, Some(S::HintFind)), (Glyph::Shoulders, Some(S::Filter))]
+        [(Glyph::Confirm, Some(confirm)), (Glyph::Options, Some(S::HintMenu)), (Glyph::West, None), (Glyph::Shoulders, Some(S::Filter))]
     }
 
     fn draw_hints(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, top: Option<Screen>, h: &mut Vec<(Area, Hit)>) {
-        let library = self.modal.is_none() && matches!(top, Some(Screen::Picker(_)));
+        let library = self.modal.is_none() && self.menu.is_none() && matches!(top, Some(Screen::Picker(_)));
         let entries: Vec<(Glyph, Option<S>)> = if let Some(Screen::Picker(purpose)) = top.filter(|_| library) {
             Self::library_hints(purpose).to_vec()
         } else {
             let plain: Vec<(Glyph, S)> = if self.modal.is_some() {
                 vec![(Glyph::Confirm, S::Ok)]
+            } else if self.menu.is_some() {
+                vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)]
             } else {
                 match top {
                     None => return,
                     Some(Screen::Main) => vec![(Glyph::Confirm, S::Select)],
-                    Some(Screen::Picker(_)) => unreachable!("the library's hints are chosen above"),
+                    Some(Screen::Picker(_)) => unreachable!("the library's hints and its menu's are chosen above"),
                     Some(Screen::Code) => vec![(Glyph::Confirm, S::Join), (Glyph::Back, S::Back)],
                     Some(Screen::Field(_)) => vec![(Glyph::Confirm, S::Ok), (Glyph::Back, S::Back)],
                     Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 9 => {
@@ -2024,7 +2183,7 @@ impl Ui {
                 Glyph::Confirm => &[Key::Confirm],
                 Glyph::Back => &[Key::Back],
                 Glyph::LeftRight => &[Key::Left, Key::Right],
-                Glyph::North => &[Key::Fav],
+                Glyph::Options => &[Key::Options],
                 Glyph::West => &[Key::Search],
                 Glyph::Shoulders => &[Key::PrevTab, Key::NextTab],
             };
@@ -2040,7 +2199,7 @@ impl Ui {
             x += gw + space;
             match label {
                 Some(l) => f.draw(c, x, y, l, SEC, 1),
-                None => crate::cards::icon(c, x, y, &crate::cards::STAR, 7, (0, 240), WARN),
+                None => bitmap(c, x, y, &MAGNIFIER, 7, SEC),
             }
             x += lw + gap;
         }
@@ -2154,7 +2313,7 @@ fn glyph_label(kind: Option<PadKind>, glyph: Glyph) -> Option<&'static str> {
         (_, Glyph::LeftRight) => return None,
         (None, Glyph::Confirm) => "Enter",
         (None, Glyph::Back) => "Esc",
-        (None, Glyph::North) => "Space",
+        (None, Glyph::Options) => "Space",
         (None, Glyph::West) => "A-Z",
         (None, Glyph::Shoulders) => "Tab",
         (Some(PadKind::PlayStation | PadKind::SteamDeck), Glyph::Shoulders) => "L1 R1",
@@ -2163,6 +2322,12 @@ fn glyph_label(kind: Option<PadKind>, glyph: Glyph) -> Option<&'static str> {
         (Some(_), _) => return None,
     })
 }
+
+/// The options button of a pad, 7x7: three bars, and the plus Nintendo prints there.
+const OPTIONS_BARS: [u8; 7] = [0, 0b1111111, 0, 0b1111111, 0, 0b1111111, 0];
+const OPTIONS_PLUS: [u8; 7] = [0b0001000, 0b0001000, 0b0001000, 0b1111111, 0b0001000, 0b0001000, 0b0001000];
+/// The search entry's magnifier, 7x7.
+const MAGNIFIER: [u8; 7] = [0b0111000, 0b1000100, 0b1000100, 0b1000100, 0b0111000, 0b0000110, 0b0000011];
 
 /// Return arrow, space bar and tab arrow, 7x7, bit 6 = leftmost pixel.
 const KEY_ENTER: [u8; 7] = [0b0000001, 0b0000001, 0b0010001, 0b0110001, 0b1111111, 0b0110000, 0b0010000];
@@ -2173,7 +2338,7 @@ const KEY_TAB: [u8; 7] = [0b0000001, 0b0001001, 0b0001101, 0b1111111, 0b0001101,
 fn key_icon(kind: Option<PadKind>, glyph: Glyph, compact: bool) -> Option<&'static [u8; 7]> {
     match (compact, kind, glyph) {
         (true, None, Glyph::Confirm) => Some(&KEY_ENTER),
-        (true, None, Glyph::North) => Some(&KEY_SPACE),
+        (true, None, Glyph::Options) => Some(&KEY_SPACE),
         (true, None, Glyph::Shoulders) => Some(&KEY_TAB),
         _ => None,
     }
@@ -2186,6 +2351,7 @@ fn glyph_width(f: &Font, kind: Option<PadKind>, glyph: Glyph, compact: bool) -> 
     match (glyph_label(kind, glyph), kind, glyph) {
         (_, _, Glyph::LeftRight) => 12,
         (Some(label), _, _) => f.width(label, 1) + 4,
+        (None, Some(_), Glyph::Options) => 8,
         (None, Some(PadKind::PlayStation), _) => 8,
         (None, _, _) => 9,
     }
@@ -2203,6 +2369,10 @@ fn draw_glyph(c: &mut Canvas, f: &mut Font, x: i32, y: i32, kind: Option<PadKind
         return;
     }
     match (kind, glyph) {
+        (Some(kind), Glyph::Options) => {
+            let rows = if kind == PadKind::Nintendo { &OPTIONS_PLUS } else { &OPTIONS_BARS };
+            bitmap(c, x, y, rows, 7, WHITE);
+        }
         (_, Glyph::LeftRight) => {
             tri(c, x, y, SEC, false);
             tri(c, x + 7, y, SEC, true);
@@ -2211,19 +2381,18 @@ fn draw_glyph(c: &mut Canvas, f: &mut Font, x: i32, y: i32, kind: Option<PadKind
             let (shape, col) = match glyph {
                 Glyph::Confirm => (&PS_CROSS, PS_BLUE),
                 Glyph::Back => (&PS_CIRCLE, PS_RED),
-                Glyph::North => (&PS_TRIANGLE, PS_GREEN),
                 _ => (&PS_SQUARE, PS_PINK),
             };
             bitmap(c, x, y, shape, 8, col);
         }
         (kind, _) => {
-            // By position: south confirms, east goes back, north is the favourite, west the
-            // search. Nintendo prints B A X Y there, everyone else A B Y X.
+            // By position: south confirms, east goes back, west is the search. Nintendo
+            // prints B A Y there, everyone else A B X.
             let nintendo = kind == Some(PadKind::Nintendo);
             let (letter, col) = match (glyph, nintendo) {
                 (Glyph::Confirm, false) | (Glyph::Back, true) => (&LETTER_A, OK),
                 (Glyph::Confirm, true) | (Glyph::Back, false) => (&LETTER_B, ERR),
-                (Glyph::North, false) | (Glyph::West, true) => (&LETTER_Y, WARN),
+                (Glyph::West, true) => (&LETTER_Y, WARN),
                 _ => (&LETTER_X, PS_BLUE),
             };
             for dy in 0..9 {
@@ -2237,6 +2406,39 @@ fn draw_glyph(c: &mut Canvas, f: &mut Font, x: i32, y: i32, kind: Option<PadKind
             bitmap(c, x + 3, y + 1, letter, 3, BG);
         }
     }
+}
+
+/// Cuts `s` to its last `cols` characters, starting with ".." when cut (a path's end says
+/// more than its start).
+fn trunc_left(s: &str, cols: usize) -> String {
+    let n = s.chars().count();
+    if n <= cols {
+        s.to_string()
+    } else {
+        let mut out = String::from("..");
+        out.extend(s.chars().skip(n - cols.saturating_sub(2)));
+        out
+    }
+}
+
+/// What the delete question says: the file's name with its extension (wrapped at word
+/// boundaries, a word longer than a line split across lines, so all of it shows), what
+/// `disposal` does with it, and that the saves are not touched.
+fn delete_lines(lang: Lang, file: &str, disposal: Disposal) -> Vec<String> {
+    let fate = match disposal {
+        Disposal::Trash => S::DeleteToTrash,
+        Disposal::Permanent => S::DeleteForGood,
+    };
+    // A piece of a split word fills its line, so `wrap` never puts a space inside the word.
+    let pieces: Vec<String> = file
+        .split_whitespace()
+        .flat_map(|w| w.chars().collect::<Vec<_>>().chunks(27).map(|c| c.iter().collect()).collect::<Vec<String>>())
+        .collect();
+    let mut lines = wrap(&pieces.join(" "), 27);
+    lines.push(String::new());
+    lines.extend(wrap(lang.tr(fate), 27));
+    lines.extend(wrap(lang.tr(S::SavesStay), 27));
+    lines
 }
 
 fn unix_now() -> u64 {
@@ -3016,7 +3218,7 @@ mod tests {
         let lib = library_with_builds();
         let c = ctx(&mut cfg, &lib, None);
         redraw(&mut ui, &c);
-        assert!(ui.regions.iter().any(|(_, hit)| *hit == Hit::Key(Key::Fav)), "the library's hints");
+        assert!(ui.regions.iter().any(|(_, hit)| *hit == Hit::Key(Key::Options)), "the library's hints");
     }
 
     /// The library's hint bar keeps all four entries (no Back) and ends at x ≤ 252 with every
@@ -3050,7 +3252,7 @@ mod tests {
                             _ => None,
                         })
                         .collect();
-                    for want in [Key::Confirm, Key::Fav, Key::Search, Key::PrevTab, Key::NextTab] {
+                    for want in [Key::Confirm, Key::Options, Key::Search, Key::PrevTab, Key::NextTab] {
                         assert!(keys.iter().any(|(_, k)| *k == want), "{lang:?} {kind:?}: an entry dropped");
                     }
                     assert!(!keys.iter().any(|(_, k)| *k == Key::Back), "no Back hint in the library");
@@ -3059,6 +3261,258 @@ mod tests {
                     assert!(end <= 252, "{lang:?} {kind:?}: the last hint ends at {end}");
                 }
             }
+        }
+    }
+
+    fn key_of(e: &RomEntry) -> ebobo_art::Key {
+        ebobo_art::Key { system: e.system, crc32: e.crc32 }
+    }
+
+    /// The options press on the selected game, which must open its menu.
+    fn open_menu(ui: &mut Ui, c: &mut UiCtx) {
+        assert_eq!(ui.update(&nav(|n| n.options = true), c, DT), None);
+        assert!(ui.menu.is_some(), "options on a game opens its menu");
+    }
+
+    #[test]
+    fn ui_game_menu_takes_all_input_while_open() {
+        let mut cfg = Config::default();
+        let lib = games(3);
+        let mut ui = library(Purpose::Solo);
+        let mut c = ctx(&mut cfg, &lib, None);
+        open_menu(&mut ui, &mut c);
+        assert!(!ui.wants_text_input(), "typing does not search under the menu");
+        ui.update(&nav(|n| n.right = true), &mut c, DT);
+        ui.update(&InputFrame { text: "zz".into(), ..InputFrame::default() }, &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.back = true), &mut c, DT), None);
+        assert!(ui.menu.is_none());
+        assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)), "back closes the menu alone");
+        ui.update(&InputFrame::default(), &mut c, DT);
+        assert_eq!(ui.cards.selected(), Some(0), "right moved in the menu, not the library");
+        assert_eq!(ui.cards.search(), "");
+        // Up and down wrap; another options press closes the menu too.
+        open_menu(&mut ui, &mut c);
+        ui.update(&nav(|n| n.up = true), &mut c, DT);
+        assert_eq!(ui.menu.as_ref().map(|m| m.sel), Some(3));
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.menu.as_ref().map(|m| m.sel), Some(0));
+        ui.update(&nav(|n| n.options = true), &mut c, DT);
+        assert!(ui.menu.is_none());
+    }
+
+    #[test]
+    fn ui_game_menu_favourite_row() {
+        let mut cfg = Config::default();
+        let lib = games(2);
+        let key = key_of(&lib[0]);
+        let mut ui = library(Purpose::Solo);
+        let mut c = ctx(&mut cfg, &lib, None);
+        open_menu(&mut ui, &mut c);
+        assert_eq!(ui.menu_rows(key)[0], S::MenuFavAdd);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
+        assert!(ui.menu.is_none());
+        assert!(ui.shelf.is_favourite(key));
+        open_menu(&mut ui, &mut c);
+        assert_eq!(ui.menu_rows(key)[0], S::MenuFavRemove, "the next opening offers to remove it");
+        ui.update(&nav(|n| n.confirm = true), &mut c, DT);
+        assert!(!ui.shelf.is_favourite(key));
+    }
+
+    #[test]
+    fn ui_game_menu_hide_row() {
+        let mut cfg = Config::default();
+        let lib = games(2);
+        let mut ui = library(Purpose::Solo);
+        let mut c = ctx(&mut cfg, &lib, None);
+        open_menu(&mut ui, &mut c);
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
+        assert!(ui.menu.is_none());
+        assert!(ui.shelf.is_hidden(key_of(&lib[0])));
+        assert_eq!(ui.toasts.last().map(|t| t.0.as_str()), Some("Hidden: Game 00"));
+        // One game is left: it is selected, and the tile after it is Rescan.
+        ui.update(&InputFrame::default(), &mut c, DT);
+        assert_eq!(ui.cards.selected(), Some(1));
+        ui.update(&nav(|n| n.right = true), &mut c, DT);
+        assert_eq!(ui.cards.selected(), None);
+        // The hide row of a hidden game puts it back, and the toast says so.
+        ui.menu = Some(GameMenu { key: key_of(&lib[0]), path: lib[0].path.clone(), name: lib[0].name.clone(), sel: 2 });
+        assert_eq!(ui.menu_rows(key_of(&lib[0]))[2], S::MenuUnhide);
+        ui.update(&nav(|n| n.confirm = true), &mut c, DT);
+        assert!(!ui.shelf.is_hidden(key_of(&lib[0])));
+        assert_eq!(ui.toasts.last().map(|t| t.0.as_str()), Some("Back in the list: Game 00"));
+    }
+
+    #[test]
+    fn ui_game_menu_hide_toast_fits() {
+        let mut cfg = Config::default();
+        let lib = [build("Chip 'n Dale - Rescue Rangers 4P (Europe)", 7, 0, Region::Pal)];
+        for lang in [Lang::Ru, Lang::En] {
+            let mut ui = Ui::new(lang);
+            ui.stack = vec![Screen::Main, Screen::Picker(Purpose::Solo)];
+            let mut c = ctx(&mut cfg, &lib, None);
+            open_menu(&mut ui, &mut c);
+            ui.menu.as_mut().unwrap().sel = 2;
+            ui.update(&nav(|n| n.confirm = true), &mut c, DT);
+            let toast = &ui.toasts.last().expect("toast").0;
+            assert_eq!(toast.chars().count(), 30, "{lang:?}: {toast}");
+            assert!(toast.ends_with(".."), "{toast}");
+        }
+    }
+
+    #[test]
+    fn ui_game_menu_rename_row() {
+        let mut cfg = Config::default();
+        let lib = games(1);
+        let key = key_of(&lib[0]);
+        let mut ui = library(Purpose::Solo);
+        let mut c = ctx(&mut cfg, &lib, None);
+        let rename = |ui: &mut Ui, c: &mut UiCtx| {
+            open_menu(ui, c);
+            ui.update(&nav(|n| n.down = true), c, DT);
+            ui.update(&nav(|n| n.confirm = true), c, DT);
+            assert_eq!(ui.stack.last(), Some(&Screen::Field(Field::Rename(key))));
+            assert!(ui.menu.is_none());
+        };
+        let clear = |ui: &mut Ui, c: &mut UiCtx| {
+            while !ui.field.is_empty() {
+                ui.update(&InputFrame { backspace: true, ..InputFrame::default() }, c, DT);
+            }
+        };
+        rename(&mut ui, &mut c);
+        assert_eq!(ui.field, "Game 00", "prefilled with the shown name");
+        clear(&mut ui, &mut c);
+        ui.update(&InputFrame { text: "Mine".into(), ..InputFrame::default() }, &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
+        assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
+        assert_eq!(ui.shelf.name(key), Some("Mine"));
+        // Back leaves the name as it was.
+        rename(&mut ui, &mut c);
+        assert_eq!(ui.field, "Mine");
+        ui.update(&InputFrame { text: "zzz".into(), ..InputFrame::default() }, &mut c, DT);
+        ui.update(&nav(|n| n.back = true), &mut c, DT);
+        assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
+        assert_eq!(ui.shelf.name(key), Some("Mine"));
+        // An empty text gives the game its own name back.
+        rename(&mut ui, &mut c);
+        clear(&mut ui, &mut c);
+        ui.update(&nav(|n| n.confirm = true), &mut c, DT);
+        assert_eq!(ui.shelf.name(key), None);
+    }
+
+    #[test]
+    fn ui_game_menu_delete_row() {
+        let mut cfg = Config::default();
+        let lib = games(1);
+        let mut ui = library(Purpose::Solo);
+        let mut c = ctx(&mut cfg, &lib, None);
+        let ask = |ui: &mut Ui, c: &mut UiCtx| {
+            open_menu(ui, c);
+            ui.update(&nav(|n| n.up = true), c, DT);
+            assert_eq!(ui.update(&nav(|n| n.confirm = true), c, DT), None);
+            assert!(ui.menu.is_none());
+            let m = ui.modal.as_ref().expect("the question");
+            assert_eq!(m.title, Lang::En.tr(S::DeleteTitle));
+            assert_eq!(m.sel, 1, "Cancel is selected");
+            assert_eq!(m.confirm.as_ref().map(|q| q.no), Some(S::Cancel));
+        };
+        ask(&mut ui, &mut c);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "Cancel does nothing");
+        assert!(ui.modal.is_none());
+        ask(&mut ui, &mut c);
+        ui.update(&nav(|n| n.up = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::DeleteRom(lib[0].path.clone())));
+        // What the question says follows what will happen to the file.
+        for lang in [Lang::Ru, Lang::En] {
+            let trash = delete_lines(lang, "Game 00.nes", Disposal::Trash);
+            let gone = delete_lines(lang, "Game 00.nes", Disposal::Permanent);
+            assert_ne!(trash, gone);
+            assert_eq!(trash[0], "Game 00.nes");
+            assert!(trash.join(" ").contains(lang.tr(S::DeleteToTrash)) && gone.join(" ").contains(lang.tr(S::DeleteForGood)));
+            assert!(trash.iter().chain(&gone).all(|l| l.chars().count() <= 27));
+        }
+        // A long file name is shown whole.
+        let long = delete_lines(Lang::En, "Chip 'n Dale - Rescue Rangers 4P (Europe).nes", Disposal::Trash);
+        assert_eq!(long[..2], ["Chip 'n Dale - Rescue", "Rangers 4P (Europe).nes"], "broken between words");
+        let one_word = delete_lines(Lang::En, "Chip_n_Dale_Rescue_Rangers_4P_Europe.nes", Disposal::Trash);
+        assert_eq!(one_word[..2].concat(), "Chip_n_Dale_Rescue_Rangers_4P_Europe.nes", "split, not cut");
+    }
+
+    #[test]
+    fn ui_game_menu_pointer() {
+        let mut cfg = Config::default();
+        let lib = games(2);
+        let key = key_of(&lib[0]);
+        let mut ui = library(Purpose::Solo);
+        let mut c = ctx(&mut cfg, &lib, None);
+        let area = |ui: &Ui, want: Hit| ui.regions.iter().find(|(_, hit)| *hit == want).map(|(a, _)| *a).expect("region");
+        // A tap on a row does it.
+        open_menu(&mut ui, &mut c);
+        redraw(&mut ui, &c);
+        let row = area(&ui, Hit::MenuRow(0));
+        assert_eq!(ui.update(&tap(row.x + 20, row.y + 4), &mut c, DT), None);
+        assert!(ui.menu.is_none());
+        assert!(ui.shelf.is_favourite(key));
+        // A tap inside the box off the rows does nothing; one outside closes the menu.
+        open_menu(&mut ui, &mut c);
+        redraw(&mut ui, &c);
+        let b = area(&ui, Hit::MenuBox);
+        ui.update(&tap(b.x + 4, b.y + 4), &mut c, DT);
+        assert!(ui.menu.is_some());
+        ui.update(&tap(4, 4), &mut c, DT);
+        assert!(ui.menu.is_none());
+        assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
+        assert!(ui.shelf.is_favourite(key), "closing does nothing to the game");
+        // The hint bar says Select and Back while the menu is open.
+        open_menu(&mut ui, &mut c);
+        redraw(&mut ui, &c);
+        let keys: Vec<Hit> = ui.regions.iter().filter(|(a, _)| a.y == 224).map(|(_, h)| *h).collect();
+        assert_eq!(keys, vec![Hit::Key(Key::Confirm), Hit::Key(Key::Back)]);
+    }
+
+    /// The menu of a library game over the library (`/tmp/ebobo-gamemenu-<state>-<lang>.png`):
+    /// on a plain game, on a favourite hidden one, the rename field with the built-in keyboard,
+    /// and the delete question for the Trash and for good.
+    #[test]
+    #[ignore]
+    fn ui_render_game_menu_snapshots() {
+        let mut font = Font::new();
+        let mut cfg = Config::default();
+        let lib = library_with_builds();
+        for (tag, lang) in [("ru", Lang::Ru), ("en", Lang::En)] {
+            let mut ui = Ui::new(lang);
+            ui.now_pinned = true;
+            ui.now = 1_794_657_600 + 2 * 86_400;
+            ui.stack = vec![Screen::Main, Screen::Picker(Purpose::Solo)];
+            let mut c = ctx(&mut cfg, &lib, None);
+            let mut shot = |ui: &mut Ui, c: &UiCtx, state: &str| {
+                let mut canvas = Canvas::new();
+                canvas.clear(BG);
+                ui.draw(&mut canvas, &mut font, c, &InputFrame { hint_kind: Some(PadKind::PlayStation), ..InputFrame::default() });
+                write_png(&format!("/tmp/ebobo-gamemenu-{state}-{tag}.png"), &canvas.px, 256, 240);
+            };
+            ui.update(&nav(|n| n.right = true), &mut c, DT);
+            ui.update(&nav(|n| n.right = true), &mut c, DT);
+            open_menu(&mut ui, &mut c);
+            shot(&mut ui, &c, "plain");
+            let key = ui.menu.as_ref().unwrap().key;
+            ui.shelf.toggle_favourite(key);
+            ui.shelf.set_hidden(key, true);
+            ui.update(&nav(|n| n.down = true), &mut c, DT);
+            shot(&mut ui, &c, "favhidden");
+            ui.shelf.set_hidden(key, false);
+            let mut confirm = nav(|n| n.confirm = true);
+            confirm.pad.used = true;
+            ui.update(&confirm, &mut c, DT);
+            shot(&mut ui, &c, "rename");
+            ui.update(&nav(|n| n.back = true), &mut c, DT);
+            let path = lib[2].path.clone();
+            ui.ask_delete(path.clone(), &lib[2].name, Disposal::Trash);
+            shot(&mut ui, &c, "delete-trash");
+            ui.modal = None;
+            ui.ask_delete(path, &lib[2].name, Disposal::Permanent);
+            shot(&mut ui, &c, "delete-permanent");
         }
     }
 
