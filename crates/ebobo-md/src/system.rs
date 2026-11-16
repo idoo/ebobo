@@ -710,4 +710,65 @@ mod tests {
         md.load_battery_ram(&[1, 2, 3]);
         assert_eq!(md.state_hash(), hash);
     }
+
+    fn test_rom(name: &str) -> Md {
+        let path = format!("{}/tests/roms/{name}", env!("CARGO_MANIFEST_DIR"));
+        Md::new(&std::fs::read(&path).unwrap(), None).unwrap()
+    }
+
+    /// The middle of the plain picture, `rx` and `ry` taken off every side.
+    fn plain_middle(md: &Md) -> (Vec<u8>, Vec<u8>) {
+        let (mut rgba, mut layers) = (Vec::new(), Vec::new());
+        let (w, h) = md.frame_rgba(&mut rgba);
+        md.frame_layers(&mut layers);
+        let (rx, ry) = md.tilt_reach();
+        let (rx, ry) = (rx as usize, ry as usize);
+        let (mut c, mut l) = (Vec::new(), Vec::new());
+        for y in ry..h - ry {
+            c.extend_from_slice(&rgba[(y * w + rx) * 4..(y * w + w - rx) * 4]);
+            l.extend_from_slice(&layers[y * w + rx..y * w + w - rx]);
+        }
+        (c, l)
+    }
+
+    #[test]
+    fn tilt_without_shift_is_the_middle_of_the_picture() {
+        for name in ["sgdk-hilight-shadow.bin", "sgdk-platformer.bin", "sgdk-linescroll.bin"] {
+            let mut md = test_rom(name);
+            md.set_tilt(true);
+            let (mut rgba, mut layers) = (Vec::new(), Vec::new());
+            for (at, frames) in [(1, 1), (90, 89), (240, 150)] {
+                run(&mut md, frames);
+                let (w, h) = md.frame_tilted((0, 0), &mut rgba, &mut layers);
+                let (c, l) = plain_middle(&md);
+                assert_eq!((rgba.len(), layers.len()), (w * h * 4, w * h));
+                assert!(rgba == c, "{name} frame {at}: colours");
+                assert!(layers == l, "{name} frame {at}: layers");
+            }
+        }
+    }
+
+    #[test]
+    fn tilt_is_not_emulated_state() {
+        let (mut on, mut off) = (test_rom("sgdk-platformer.bin"), test_rom("sgdk-platformer.bin"));
+        on.set_tilt(true);
+        run(&mut on, 60);
+        run(&mut off, 60);
+        assert_eq!(on.state_hash(), off.state_hash());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        on.frame_rgba(&mut a);
+        off.frame_rgba(&mut b);
+        assert!(a == b);
+        // A loaded state leaves the flag on, and the planes of the next picture are kept.
+        let blob = off.save_state();
+        on.load_state(&blob).unwrap();
+        run(&mut on, 1);
+        assert!(on.m.screen.kept().is_some());
+        // Off forgets the kept planes: the tilted picture is the plain middle again.
+        on.set_tilt(false);
+        assert!(on.m.screen.kept().is_none());
+        let (mut rgba, mut layers) = (Vec::new(), Vec::new());
+        on.frame_tilted((8, 4), &mut rgba, &mut layers);
+        assert!((rgba, layers) == plain_middle(&on));
+    }
 }

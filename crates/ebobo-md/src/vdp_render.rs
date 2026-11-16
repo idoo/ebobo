@@ -937,4 +937,105 @@ mod tests {
         assert_eq!(parts(o[25]), (rgb(f.cram[0], 1), 0));
         assert_eq!(parts(o[26]), (rgb(f.cram[0], 1), 0));
     }
+
+    /// Every row `0..h` of `f` drawn with sprite row `s` (`None`: the sprites of its tables),
+    /// as plain output words and as kept rows.
+    fn kept_picture(f: &Fx, h: usize, s: Option<&SpriteRow>) -> (Vec<[u32; 320]>, Vec<KeptRow>) {
+        let m = f.mem();
+        let mut plain = vec![[UNTOUCHED; 320]; h];
+        let mut kept = vec![KeptRow::blank(&[0; 64], 0); h];
+        for (row, (out, k)) in plain.iter_mut().zip(kept.iter_mut()).enumerate() {
+            match s {
+                Some(s) => draw_row(&m, row as u32, s, out, Some(k)),
+                None => {
+                    render_row_kept(&m, row as u32, Some(out), Some(k));
+                }
+            }
+        }
+        (plain, kept)
+    }
+
+    /// [`compose_tilted`] of a 320 x `h` picture with crop (8, 4), as output words.
+    fn tilted(kept: &[KeptRow], h: usize, shift: (i32, i32)) -> Vec<Vec<u32>> {
+        let (w, h) = (320 - 16, h - 8);
+        let (mut rgba, mut layers) = (vec![0; w * h * 4], vec![0; w * h]);
+        compose_tilted(kept, w, (8, 4), shift, &mut rgba, &mut layers);
+        rgba.chunks_exact(w * 4)
+            .zip(layers.chunks_exact(w))
+            .map(|(c, l)| {
+                c.chunks_exact(4).zip(l).map(|(c, &l)| u32::from(l) << 24 | u32::from(c[0]) << 16 | u32::from(c[1]) << 8 | u32::from(c[2])).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tilt_without_shift_is_the_plain_middle() {
+        let mut f = Fx::new();
+        // Shadow and highlight, a window on the left 32 columns, planes at both priorities.
+        f.regs[12] = 0x89;
+        f.regs[17] = 2;
+        f.regs[7] = 0x2B;
+        for col in 0..64 {
+            f.cell(B, col, 0, if col % 3 == 0 { 0x8001 } else { 0x0001 });
+            f.cell(A, col, 0, if col % 4 == 0 { 0xA003 } else if col % 4 == 1 { 0x2002 } else { 0 });
+            f.cell(W, col, 0, if col % 2 == 0 { 0x4004 } else { 0xC001 });
+        }
+        let mut s: SpriteRow = [0; 320];
+        for (x, p) in s.iter_mut().enumerate() {
+            *p = [0, 0x3E, 0x3F, 0xBE, 0xBF, 0x15, 0x95, 0x2E][x % 8];
+        }
+        let (plain, kept) = kept_picture(&f, 24, Some(&s));
+        let t = tilted(&kept, 24, (0, 0));
+        for (y, line) in t.iter().enumerate() {
+            assert_eq!(&line[..], &plain[y + 4][8..312], "row {y}");
+        }
+    }
+
+    #[test]
+    fn tilt_moves_plane_b_and_half_plane_a_but_not_the_sprites() {
+        let mut f = Fx::new();
+        // Plane B: ramps of four palette lines, so screen rows and columns within a cell differ.
+        for row in 0..32 {
+            for col in 0..64 {
+                f.cell(B, col, row, 0x0001 + ((col as u16 % 4) << 13));
+            }
+        }
+        // Plane A: a block of solid colour 3 on palette line 1 over pixels 80..96 x 40..56.
+        for row in 5..7 {
+            for col in 10..12 {
+                f.cell(A, col, row, 0x2003);
+            }
+        }
+        // An 8x8 sprite of solid colour 2 on palette line 2 at (200, 100).
+        f.regs[5] = 0x78;
+        f.poke(0xF000, 128 + 100);
+        f.poke(0xF002, 0);
+        f.poke(0xF004, 0x4002);
+        f.poke(0xF006, 128 + 200);
+        let h = 224;
+        let (_, kept) = kept_picture(&f, h, None);
+        let mut only_b = Fx::new();
+        only_b.vram.clone_from(&f.vram);
+        only_b.vram[A..A + 0x1000].fill(0);
+        only_b.vram[0xF000..0xF008].fill(0);
+        let (plain_b, _) = kept_picture(&only_b, h, None);
+
+        let t = tilted(&kept, h, (4, 2));
+        for (y, line) in t.iter().enumerate() {
+            for (x, &px) in line.iter().enumerate() {
+                let (sx, sy) = (x + 8, y + 4);
+                let want = if (200..208).contains(&sx) && (100..108).contains(&sy) {
+                    f.col(0x22) | 3 << 24
+                } else if (82..98).contains(&sx) && (41..57).contains(&sy) {
+                    f.col(0x13) | 2 << 24
+                } else {
+                    plain_b[sy - 2][sx - 4]
+                };
+                assert_eq!(px, want, "pixel ({x}, {y})");
+            }
+        }
+        // The top-left corner plane A's block used to cover shows plane B now.
+        assert_eq!(parts(t[40 - 4][80 - 8]), parts(plain_b[38][76]));
+        assert_eq!(parts(t[40 - 4][80 - 8]).1, 1);
+    }
 }
