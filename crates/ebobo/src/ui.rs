@@ -21,7 +21,6 @@ use crate::i18n::{Lang, S};
 use crate::input::{InputFrame, Nav, PadEvent, PadInfo, PadKind, PointerEvent};
 use crate::osk::{self, Charset, Osk, OskNav, OskOutput};
 use crate::library::{RomEntry, RomFileError};
-use crate::trash::Disposal;
 
 /// Why a game did not open: the file could not be read as a ROM, or the console rejected it.
 #[derive(Clone, Copy, Debug)]
@@ -57,9 +56,8 @@ pub enum UiAction {
     /// `UiCtx::config` was edited; the app saves it and applies scale/volume/fullscreen.
     ConfigChanged,
     Rescan,
-    /// Get rid of a game's file (`crate::trash::dispose`) the way the question said it would
-    /// go; asked for and confirmed in the game's menu.
-    DeleteRom(PathBuf, Disposal),
+    /// Delete a game's file for good; asked for and confirmed in the game's menu.
+    DeleteRom(PathBuf),
     /// Run `ebobo_net::diagnose` in the background and hand the result to `Ui::set_net_diag`.
     RunNetCheck,
     Quit,
@@ -132,8 +130,7 @@ pub enum Text {
     /// A netplay game started from the last moment / from the save.
     ResumedLast,
     ResumedSave,
-    /// A game's file went to the system Trash / was deleted for good / could not be removed.
-    MovedToTrash,
+    /// A game's file was deleted / could not be deleted.
     FileDeleted,
     CantDelete,
     /// The room code went to the clipboard.
@@ -694,7 +691,6 @@ impl Ui {
             Text::NetLoaded => S::NetLoaded,
             Text::ResumedLast => S::ResumedLast,
             Text::ResumedSave => S::ResumedSave,
-            Text::MovedToTrash => S::MovedToTrash,
             Text::FileDeleted => S::FileDeleted,
             Text::CantDelete => S::CantDelete,
             Text::CodeCopied => S::CodeCopied,
@@ -1294,24 +1290,19 @@ impl Ui {
                 None
             }
             _ => {
-                let disposal = crate::trash::plan(&menu.path);
-                self.ask_delete(menu.path, &menu.name, disposal);
+                self.ask_delete(menu.path, &menu.name);
                 None
             }
         }
     }
 
-    /// The question before a game's file goes: its name, what `disposal` will do, and the
+    /// The question before a game's file is deleted: its name, that it goes for good, and the
     /// answer that does it, with Cancel preselected. `name` stands in for a file name that is
     /// not text.
-    fn ask_delete(&mut self, path: PathBuf, name: &str, disposal: Disposal) {
+    fn ask_delete(&mut self, path: PathBuf, name: &str) {
         let file = path.file_name().and_then(|f| f.to_str()).unwrap_or(name);
-        let lines = delete_lines(self.lang, file, disposal);
-        let yes = match disposal {
-            Disposal::Trash => S::AnswerTrash,
-            Disposal::Permanent => S::AnswerForGood,
-        };
-        self.ask(S::DeleteTitle, lines, Confirm { action: UiAction::DeleteRom(path, disposal), yes, no: S::Cancel });
+        let lines = delete_lines(self.lang, file);
+        self.ask(S::DeleteTitle, lines, Confirm { action: UiAction::DeleteRom(path), yes: S::AnswerForGood, no: S::Cancel });
     }
 
     /// The rows of the menu of game `key`, in order: favourite, rename, hide, delete.
@@ -2515,13 +2506,9 @@ fn trunc_left(s: &str, cols: usize) -> String {
 }
 
 /// What the delete question says: the file's name with its extension (wrapped at word
-/// boundaries, a word longer than a line split across lines, so all of it shows), what
-/// `disposal` does with it, and that the saves are not touched.
-fn delete_lines(lang: Lang, file: &str, disposal: Disposal) -> Vec<String> {
-    let fate = match disposal {
-        Disposal::Trash => S::DeleteToTrash,
-        Disposal::Permanent => S::DeleteForGood,
-    };
+/// boundaries, a word longer than a line split across lines, so all of it shows), that it is
+/// deleted for good, and that the saves are not touched.
+fn delete_lines(lang: Lang, file: &str) -> Vec<String> {
     // A piece of a split word fills its line, so `wrap` never puts a space inside the word.
     let pieces: Vec<String> = file
         .split_whitespace()
@@ -2529,7 +2516,7 @@ fn delete_lines(lang: Lang, file: &str, disposal: Disposal) -> Vec<String> {
         .collect();
     let mut lines = wrap(&pieces.join(" "), 27);
     lines.push(String::new());
-    lines.extend(wrap(lang.tr(fate), 27));
+    lines.extend(wrap(lang.tr(S::DeleteForGood), 27));
     lines.extend(wrap(lang.tr(S::SavesStay), 27));
     lines
 }
@@ -3571,21 +3558,17 @@ mod tests {
         assert!(ui.modal.is_none());
         ask(&mut ui, &mut c);
         ui.update(&nav(|n| n.up = true), &mut c, DT);
-        let asked = crate::trash::plan(&lib[0].path);
-        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::DeleteRom(lib[0].path.clone(), asked)));
-        // What the question says follows what will happen to the file.
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::DeleteRom(lib[0].path.clone())));
         for lang in [Lang::Ru, Lang::En] {
-            let trash = delete_lines(lang, "Game 00.nes", Disposal::Trash);
-            let gone = delete_lines(lang, "Game 00.nes", Disposal::Permanent);
-            assert_ne!(trash, gone);
-            assert_eq!(trash[0], "Game 00.nes");
-            assert!(trash.join(" ").contains(lang.tr(S::DeleteToTrash)) && gone.join(" ").contains(lang.tr(S::DeleteForGood)));
-            assert!(trash.iter().chain(&gone).all(|l| l.chars().count() <= 27));
+            let lines = delete_lines(lang, "Game 00.nes");
+            assert_eq!(lines[0], "Game 00.nes");
+            assert!(lines.join(" ").contains(lang.tr(S::DeleteForGood)));
+            assert!(lines.iter().all(|l| l.chars().count() <= 27));
         }
         // A long file name is shown whole.
-        let long = delete_lines(Lang::En, "Chip 'n Dale - Rescue Rangers 4P (Europe).nes", Disposal::Trash);
+        let long = delete_lines(Lang::En, "Chip 'n Dale - Rescue Rangers 4P (Europe).nes");
         assert_eq!(long[..2], ["Chip 'n Dale - Rescue", "Rangers 4P (Europe).nes"], "broken between words");
-        let one_word = delete_lines(Lang::En, "Chip_n_Dale_Rescue_Rangers_4P_Europe.nes", Disposal::Trash);
+        let one_word = delete_lines(Lang::En, "Chip_n_Dale_Rescue_Rangers_4P_Europe.nes");
         assert_eq!(one_word[..2].concat(), "Chip_n_Dale_Rescue_Rangers_4P_Europe.nes", "split, not cut");
     }
 
@@ -3623,7 +3606,7 @@ mod tests {
 
     /// The menu of a library game over the library (`/tmp/ebobo-gamemenu-<state>-<lang>.png`):
     /// on a plain game, on a favourite hidden one, the rename field with the built-in keyboard,
-    /// and the delete question for the Trash and for good.
+    /// and the delete question.
     #[test]
     #[ignore]
     fn ui_render_game_menu_snapshots() {
@@ -3657,12 +3640,8 @@ mod tests {
             ui.update(&confirm, &mut c, DT);
             shot(&mut ui, &c, "rename");
             ui.update(&nav(|n| n.back = true), &mut c, DT);
-            let path = lib[2].path.clone();
-            ui.ask_delete(path.clone(), &lib[2].name, Disposal::Trash);
-            shot(&mut ui, &c, "delete-trash");
-            ui.modal = None;
-            ui.ask_delete(path, &lib[2].name, Disposal::Permanent);
-            shot(&mut ui, &c, "delete-permanent");
+            ui.ask_delete(lib[2].path.clone(), &lib[2].name);
+            shot(&mut ui, &c, "delete");
         }
     }
 

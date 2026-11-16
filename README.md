@@ -32,7 +32,7 @@ ROMs (`.nes`, `.md`, `.gen`, `.smd`, `.bin`, or any of them in a `.zip`) are fou
 
 The library shows games as cards with their box art, which ebobo looks up by the ROM's checksum, so file names don't matter. A hack or homebrew gets its own title screen instead. Filter by console, recently played or favourites, or just start typing to search. Settings > Advanced turns the downloads off.
 
-Start on a gamepad opens a game's menu (Space, a right click or a long press do the same): add it to favourites, give it your own name, hide it from the list, or delete its file. A deleted file goes to the Trash; a game on a Steam Deck's SD card goes to the trash folder on that card (the standard `.Trash-1000` that Linux file managers read). Hidden games wait under the crossed-out eye, where the same menu puts them back.
+Start on a gamepad opens a game's menu (Space, a right click or a long press do the same): add it to favourites, give it your own name, hide it from the list, or delete its file for good (your saves stay). Hidden games wait under the crossed-out eye, where the same menu puts them back.
 
 On the Steam Deck everything works by touch, and text fields bring up ebobo's own keyboard (Steam's keyboard can't type into it in Game Mode). Your Steam name is the default nickname. In Desktop Mode Steam makes the Deck's buttons type keys; ebobo switches them to a gamepad while its window is in front and back when you leave.
 
