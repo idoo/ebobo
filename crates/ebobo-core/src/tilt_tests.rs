@@ -1,6 +1,6 @@
 //! `Nes::set_tilt` / `Nes::frame_tilted` on a test ROM picture with background and sprites.
 
-use crate::{pad, Nes, HEIGHT, TILT_REACH, WIDTH};
+use crate::{pad, Nes, HEIGHT, TILT_LEFT_BLANK, TILT_REACH, WIDTH};
 
 /// Test ROM (fetched by scripts/fetch-test-roms.sh) that shows a background and sprites.
 const ROM: &str = "scrolltest/scroll.nes";
@@ -22,17 +22,24 @@ fn run(nes: &mut Nes, from: u32, to: u32) {
     }
 }
 
-/// The middle of the plain picture, cropped as `frame_tilted` crops it.
+/// Left edge and size of the part of the picture `frame_tilted` hands out.
+fn crop() -> (usize, usize, usize) {
+    let (rx, ry) = TILT_REACH;
+    let left = TILT_LEFT_BLANK + rx;
+    (left, WIDTH - left - rx, HEIGHT - 2 * ry)
+}
+
+/// The plain picture, cropped as `frame_tilted` crops it.
 fn plain_middle(nes: &Nes) -> (Vec<u8>, Vec<u8>) {
     let (mut rgba, mut layers) = (vec![0u8; WIDTH * HEIGHT * 4], vec![0u8; WIDTH * HEIGHT]);
     nes.frame_rgba(&mut rgba);
     nes.frame_layers(&mut layers);
-    let (rx, ry) = TILT_REACH;
-    let w = WIDTH - 2 * rx;
+    let ry = TILT_REACH.1;
+    let (left, w, _) = crop();
     let (mut mr, mut ml) = (Vec::new(), Vec::new());
     for y in ry..HEIGHT - ry {
-        mr.extend_from_slice(&rgba[(y * WIDTH + rx) * 4..][..w * 4]);
-        ml.extend_from_slice(&layers[y * WIDTH + rx..][..w]);
+        mr.extend_from_slice(&rgba[(y * WIDTH + left) * 4..][..w * 4]);
+        ml.extend_from_slice(&layers[y * WIDTH + left..][..w]);
     }
     (mr, ml)
 }
@@ -40,7 +47,8 @@ fn plain_middle(nes: &Nes) -> (Vec<u8>, Vec<u8>) {
 fn tilted(nes: &Nes, shift: (i32, i32)) -> (Vec<u8>, Vec<u8>) {
     let (mut rgba, mut layers) = (Vec::new(), Vec::new());
     let (w, h) = nes.frame_tilted(shift, &mut rgba, &mut layers);
-    assert_eq!((w, h), (WIDTH - 2 * TILT_REACH.0, HEIGHT - 2 * TILT_REACH.1));
+    let (_, cw, ch) = crop();
+    assert_eq!((w, h), (cw, ch));
     (rgba, layers)
 }
 
@@ -70,7 +78,7 @@ fn tilt_moves_background_not_sprites() {
     nes.set_tilt(true);
     run(&mut nes, 0, 100);
     let (rx, ry) = TILT_REACH;
-    let (w, h) = (WIDTH - 2 * rx, HEIGHT - 2 * ry);
+    let (left, w, h) = crop();
     let shift = (3i32, -2i32);
     let (still_rgba, still_layers) = tilted(&nes, (0, 0));
     let (moved_rgba, moved_layers) = tilted(&nes, shift);
@@ -84,7 +92,7 @@ fn tilt_moves_background_not_sprites() {
     for y in 0..h {
         for x in 0..w {
             let o = y * w + x;
-            let (px, py) = ((x + rx) as i32 - shift.0, (y + ry) as i32 - shift.1);
+            let (px, py) = ((x + left) as i32 - shift.0, (y + ry) as i32 - shift.1);
             let src = py as usize * WIDTH + px as usize;
             if !sprite(still_layers[o]) && !sprite(moved_layers[o]) && !sprite(layers[src]) {
                 background += 1;
@@ -101,6 +109,32 @@ fn tilt_moves_background_not_sprites() {
     assert!(background > w * h / 2, "{background} background pixels checked");
     assert!(front > 0, "front sprite pixels checked");
     assert!(moved_rgba != still_rgba, "the shift moved something");
+}
+
+/// A game may hide the background in its 8 leftmost columns (PPUMASK bit 1 off, as most
+/// scrolling games do). Even at the farthest shift to the right the picture starts at the
+/// background's column 8, so that blank strip never slides into view.
+#[test]
+fn tilt_never_shows_the_columns_a_game_may_blank() {
+    let Some(mut nes) = nes() else { return };
+    nes.set_tilt(true);
+    run(&mut nes, 0, 100);
+    let (rx, ry) = TILT_REACH;
+    let (_, w, h) = crop();
+    let (moved_rgba, moved_layers) = tilted(&nes, (rx as i32, 0));
+    let (mut rgba, mut layers) = (vec![0u8; WIDTH * HEIGHT * 4], vec![0u8; WIDTH * HEIGHT]);
+    nes.frame_rgba(&mut rgba);
+    nes.frame_layers(&mut layers);
+    let sprite = |l: u8| l == 1 || l == 3;
+    let mut checked = 0;
+    for y in 0..h {
+        let src = (y + ry) * WIDTH + 8;
+        if !sprite(moved_layers[y * w]) && !sprite(layers[src]) {
+            checked += 1;
+            assert_eq!(moved_rgba[y * w * 4..][..4], rgba[src * 4..][..4], "first column of row {y}");
+        }
+    }
+    assert!(checked > h / 2, "{checked} rows checked");
 }
 
 /// Tilt is not emulated state: hash and plain picture match a run without it, a restore keeps

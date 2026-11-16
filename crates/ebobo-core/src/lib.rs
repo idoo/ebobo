@@ -30,9 +30,12 @@ pub use mapper::SUPPORTED_MAPPERS;
 
 pub const WIDTH: usize = 256;
 pub const HEIGHT: usize = 240;
-/// Farthest the background moves in [`Nes::frame_tilted`], in pixels across and down; the
-/// tilted picture is this much smaller on every side.
+/// Farthest the background moves in [`Nes::frame_tilted`], in pixels across and down.
 pub const TILT_REACH: (usize, usize) = (4, 4);
+/// Columns at the left edge where a game may hide the background and the sprites (PPUMASK
+/// bits 1 and 2). The tilted picture leaves them out, or the blank strip would slide into
+/// view with the background.
+const TILT_LEFT_BLANK: usize = 8;
 
 /// Controller bits in the order the game shifts them out of $4016/$4017 (bit 0 first).
 pub mod pad {
@@ -169,26 +172,28 @@ impl Nes {
 
     /// The last completed picture with its background moved `shift` pixels (right, down;
     /// each taken within ±[`TILT_REACH`]) under the sprites, which stay where they are. The
-    /// picture loses `TILT_REACH` pixels on every side, so no shift shows past an edge; its
-    /// size is returned. `rgba` gets RGBA8888 and `layers` one byte per pixel as
+    /// picture loses `TILT_REACH` pixels on every side and the 8 columns a game may blank
+    /// at the left, so no shift shows past an edge or brings that blank strip in; its size
+    /// is returned. `rgba` gets RGBA8888 and `layers` one byte per pixel as
     /// [`Nes::frame_layers`] gives them (both resized). With no shift, and until a picture
-    /// was completed with [`Nes::set_tilt`] on, it is the middle of the plain picture, byte
+    /// was completed with [`Nes::set_tilt`] on, it is that part of the plain picture, byte
     /// for byte.
     pub fn frame_tilted(&self, shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
         let (rx, ry) = TILT_REACH;
-        let (w, h) = (WIDTH - 2 * rx, HEIGHT - 2 * ry);
+        let left = TILT_LEFT_BLANK + rx;
+        let (w, h) = (WIDTH - left - rx, HEIGHT - 2 * ry);
         rgba.resize(w * h * 4, 0);
         layers.resize(w * h, 0);
         let planes = self.bus.tilt_planes();
         // Where the background of output pixel (0, 0) is read: never outside the picture.
-        let bx = (rx as i32 - shift.0.clamp(-(rx as i32), rx as i32)) as usize;
+        let bx = (left as i32 - shift.0.clamp(-(rx as i32), rx as i32)) as usize;
         let by = (ry as i32 - shift.1.clamp(-(ry as i32), ry as i32)) as usize;
         let frame = self.bus.frame();
         let mut line = [0u16; WIDTH];
         for y in 0..h {
             let row = match planes {
                 Some((background, sprites)) => {
-                    let sp = &sprites[(y + ry) * WIDTH + rx..][..w];
+                    let sp = &sprites[(y + ry) * WIDTH + left..][..w];
                     let bg = &background[(y + by) * WIDTH + bx..][..w];
                     for ((o, &s), &b) in line.iter_mut().zip(sp).zip(bg) {
                         let sprite_wins = s & ppu::PLANE_OPAQUE != 0
@@ -197,7 +202,7 @@ impl Nes {
                     }
                     &line[..w]
                 }
-                None => &frame[(y + ry) * WIDTH + rx..][..w],
+                None => &frame[(y + ry) * WIDTH + left..][..w],
             };
             palette::write_rgba(row, self.info.region, &mut rgba[y * w * 4..][..w * 4]);
             for (o, px) in layers[y * w..][..w].iter_mut().zip(row) {

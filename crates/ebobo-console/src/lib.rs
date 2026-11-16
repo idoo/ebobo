@@ -359,7 +359,8 @@ impl Console {
     }
 
     /// Farthest the far plane moves in [`Console::frame_tilted`], in pixels across and down,
-    /// for the last finished picture. The tilted picture is this much smaller on every side.
+    /// for the last finished picture. The tilted picture is at least this much smaller on
+    /// every side.
     pub fn tilt_reach(&self) -> (i32, i32) {
         match self {
             Console::Nes(_) => (nes::TILT_REACH.0 as i32, nes::TILT_REACH.1 as i32),
@@ -369,8 +370,9 @@ impl Console {
 
     /// The last finished picture with its far plane moved `shift` pixels (right, down; each
     /// taken within ±[`Console::tilt_reach`]) and the planes between it and the sprites
-    /// less; the sprites stay. Cropped by the reach on every side; returns the size. `rgba`
-    /// and `layers` are filled as by [`Console::frame_rgba`] and [`Console::frame_layers`].
+    /// less; the sprites stay. Cropped so that no shift shows past an edge; returns the
+    /// size. `rgba` and `layers` are filled as by [`Console::frame_rgba`] and
+    /// [`Console::frame_layers`].
     pub fn frame_tilted(&self, shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
         match self {
             Console::Nes(nes) => nes.frame_tilted(shift, rgba, layers),
