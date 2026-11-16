@@ -32,6 +32,8 @@ ROMs (`.nes`, `.md`, `.gen`, `.smd`, `.bin`, or any of them in a `.zip`) are fou
 
 The library shows games as cards with their box art, which ebobo looks up by the ROM's checksum, so file names don't matter. A hack or homebrew gets its own title screen instead. Filter by console, recently played or favourites, or just start typing to search. Settings > Advanced turns the downloads off.
 
+Start on a gamepad opens a game's menu (Space, a right click or a long press do the same): add it to favourites, give it your own name, hide it from the list, or delete its file. A deleted file goes to the Trash; on a Steam Deck a game on the SD card is deleted for good, and the question says so first. Hidden games wait under the crossed-out eye, where the same menu puts them back.
+
 On the Steam Deck everything works by touch, and text fields bring up ebobo's own keyboard (Steam's keyboard can't type into it in Game Mode). Your Steam name is the default nickname. In Desktop Mode Steam makes the Deck's buttons type keys; ebobo switches them to a gamepad while its window is in front and back when you leave.
 
 Settings > Enhance redraws the pixels of NES and Mega Drive games in HD: smooth outlines instead of squares, with sprites kept apart from the background, and optionally soft shadows that characters, platforms and scenery cast on what is behind them. Settings > Effect turns the picture into an old CRT TV (curved glass, scanlines, glow), a flat studio monitor, or a handheld LCD. The two combine. When the picture leaves bars at the sides, they glow in its colours.

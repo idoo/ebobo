@@ -14,8 +14,9 @@ use crate::{Key, System, slot, system_name};
 /// The first line of the shelf file.
 const HEADER: &str = "ebobo shelf 1";
 
-/// The longest name `Shelf::set_name` keeps, in characters.
-pub const NAME_MAX: usize = 40;
+/// The longest name `Shelf::set_name` keeps, in characters: room for the longest proper names
+/// of the art database, which the rename box starts from.
+pub const NAME_MAX: usize = 64;
 
 /// Which cards the library shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -428,6 +428,10 @@ pub struct Ui {
     code: [Option<u8>; CODE_LEN],
     code_cur: usize,
     field: String,
+    /// The field's prefilled text is selected as a whole (a game's name being changed): the
+    /// first character typed or deleted replaces all of it, as in any rename box. An arrow
+    /// key or a tap on the box keeps the text to add to.
+    field_all: bool,
     /// Last room code sent to join; pre-filled on the next code entry (kept after a failure).
     last_code: Option<String>,
     modal: Option<Modal>,
@@ -486,6 +490,7 @@ impl Ui {
             code: [None; CODE_LEN],
             code_cur: 0,
             field: String::new(),
+            field_all: false,
             last_code: None,
             modal: None,
             menu: None,
@@ -1045,6 +1050,7 @@ impl Ui {
     }
 
     fn open_field(&mut self, field: Field, prefill: String) {
+        self.field_all = matches!(field, Field::Rename(_)) && !prefill.is_empty();
         self.field = prefill;
         self.push(Screen::Field(field));
         self.open_osk(match field {
@@ -1316,8 +1322,17 @@ impl Ui {
 
     fn update_field(&mut self, field: Field, input: &InputFrame, ctx: &mut UiCtx) -> Option<UiAction> {
         let nav = input.nav;
+        // The box as `draw_field` draws it.
+        let on_box = |e: &PointerEvent| matches!(e, PointerEvent::Down(Some((x, y))) if (8..248).contains(x) && (70..90).contains(y));
+        if nav.left || nav.right || input.pointer.iter().any(on_box) {
+            self.field_all = false;
+        }
         if input.backspace {
-            self.field.pop();
+            if std::mem::take(&mut self.field_all) {
+                self.field.clear();
+            } else {
+                self.field.pop();
+            }
         } else if nav.back {
             self.pop();
             return None;
@@ -1329,7 +1344,13 @@ impl Ui {
             Field::Addr | Field::Server => 200,
         };
         for c in input.paste.iter().flat_map(|p| p.chars()).chain(input.text.chars()) {
-            if !c.is_control() && self.field.chars().count() < max {
+            if c.is_control() {
+                continue;
+            }
+            if std::mem::take(&mut self.field_all) {
+                self.field.clear();
+            }
+            if self.field.chars().count() < max {
                 self.field.push(c);
             }
         }
@@ -1743,6 +1764,9 @@ impl Ui {
         // Show the tail when the text is longer than the box (28 columns incl. the caret).
         let chars: Vec<char> = self.field.chars().collect();
         let shown: String = chars[chars.len().saturating_sub(27)..].iter().collect();
+        if self.field_all {
+            c.fill_rect(14, 74, f.width(&shown, 1) + 4, 12, ACCENT);
+        }
         f.draw(c, 16, 76, &shown, WHITE, 1);
         f.draw(c, 16 + f.width(&shown, 1), 76, "_", ACCENT, 1);
         // Under the box, above where the built-in keyboard starts.
@@ -2116,7 +2140,7 @@ impl Ui {
     /// Back: it fits every pad.
     fn library_hints(purpose: Purpose) -> [(Glyph, Option<S>); 4] {
         let confirm = if matches!(purpose, Purpose::Solo) { S::HintPlay } else { S::HintHost };
-        [(Glyph::Confirm, Some(confirm)), (Glyph::Options, Some(S::HintMenu)), (Glyph::West, None), (Glyph::Shoulders, Some(S::Filter))]
+        [(Glyph::Confirm, Some(confirm)), (Glyph::Options, Some(S::Menu)), (Glyph::West, None), (Glyph::Shoulders, Some(S::Filter))]
     }
 
     fn draw_hints(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, top: Option<Screen>, h: &mut Vec<(Area, Hit)>) {
@@ -3375,28 +3399,29 @@ mod tests {
             assert_eq!(ui.stack.last(), Some(&Screen::Field(Field::Rename(key))));
             assert!(ui.menu.is_none());
         };
-        let clear = |ui: &mut Ui, c: &mut UiCtx| {
-            while !ui.field.is_empty() {
-                ui.update(&InputFrame { backspace: true, ..InputFrame::default() }, c, DT);
-            }
-        };
         rename(&mut ui, &mut c);
         assert_eq!(ui.field, "Game 00", "prefilled with the shown name");
-        clear(&mut ui, &mut c);
+        // The prefilled name is selected: typing replaces it.
         ui.update(&InputFrame { text: "Mine".into(), ..InputFrame::default() }, &mut c, DT);
+        assert_eq!(ui.field, "Mine");
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
         assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
         assert_eq!(ui.shelf.name(key), Some("Mine"));
-        // Back leaves the name as it was.
+        // A tap on the box keeps the name to add to; one delete then takes one character.
         rename(&mut ui, &mut c);
-        assert_eq!(ui.field, "Mine");
-        ui.update(&InputFrame { text: "zzz".into(), ..InputFrame::default() }, &mut c, DT);
+        ui.update(&pointer(&[PointerEvent::Down(Some((100, 80))), PointerEvent::Up(Some((100, 80)))]), &mut c, DT);
+        ui.update(&InputFrame { text: " 2".into(), ..InputFrame::default() }, &mut c, DT);
+        assert_eq!(ui.field, "Mine 2");
+        ui.update(&InputFrame { backspace: true, ..InputFrame::default() }, &mut c, DT);
+        assert_eq!(ui.field, "Mine ");
+        // Back leaves the name as it was.
         ui.update(&nav(|n| n.back = true), &mut c, DT);
         assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
         assert_eq!(ui.shelf.name(key), Some("Mine"));
-        // An empty text gives the game its own name back.
+        // One delete empties a selected name, and an empty text gives the game its own back.
         rename(&mut ui, &mut c);
-        clear(&mut ui, &mut c);
+        ui.update(&InputFrame { backspace: true, ..InputFrame::default() }, &mut c, DT);
+        assert_eq!(ui.field, "");
         ui.update(&nav(|n| n.confirm = true), &mut c, DT);
         assert_eq!(ui.shelf.name(key), None);
     }
