@@ -23,7 +23,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::vdp_mem::{Mem, SpriteFlags};
-use crate::vdp_render::KeptRow;
 use crate::vdp_timing::{self as timing, DmaKind, DmaStart, LINE_CLOCKS};
 use crate::{MAX_H, MAX_W};
 
@@ -35,45 +34,11 @@ pub struct Screen {
     pub h: usize,
     /// `MAX_W * MAX_H` entries; the picture is the top-left `w`×`h`, rows `MAX_W` apart.
     pub px: Vec<u32>,
-    /// Tilt is on: every drawn row also keeps its layers apart in `kept`.
-    tilt: bool,
-    /// One entry per screen row while tilt is on (`MAX_H`), else empty.
-    kept: Vec<KeptRow>,
-    /// Row 0 of the picture being drawn was kept.
-    kept_open: bool,
-    /// `kept` holds a whole picture, drawn from its first row to its last with tilt on.
-    kept_whole: bool,
 }
 
 impl Screen {
     pub fn new() -> Screen {
-        Screen { w: 320, h: 224, px: vec![0; MAX_W * MAX_H], tilt: false, kept: Vec::new(), kept_open: false, kept_whole: false }
-    }
-
-    /// Keeps the layers of every drawn row apart (`on`), or stops and forgets them.
-    pub fn set_tilt(&mut self, on: bool) {
-        if on == self.tilt {
-            return;
-        }
-        self.tilt = on;
-        self.kept_open = false;
-        self.kept_whole = false;
-        self.kept = if on { vec![KeptRow::blank(&[0; 64], 0); MAX_H] } else { Vec::new() };
-    }
-
-    /// The kept rows of the last finished picture, once a whole one was drawn with tilt on.
-    pub fn kept(&self) -> Option<&[KeptRow]> {
-        if self.kept_whole { Some(&self.kept) } else { None }
-    }
-
-    /// Notes that screen row `row` was kept, `h` being the picture's height.
-    fn row_kept(&mut self, row: usize, h: usize) {
-        if row == 0 {
-            self.kept_open = true;
-        }
-        if row + 1 >= h && self.kept_open {
-            self.kept_whole = true;
-        }
+        Screen { w: 320, h: 224, px: vec![0; MAX_W * MAX_H] }
     }
 }
 
@@ -332,7 +297,6 @@ impl Vdp {
     fn draw_row(&mut self, screen: Option<&mut Screen>) {
         let w = if self.h40() { 320 } else { 256 };
         let double = self.interlace() == 3;
-        let h = self.active_lines() as usize * if double { 2 } else { 1 };
         let rows = if double { [self.line * 2, self.line * 2 + 1] } else { [self.line, self.line] };
         let rows = &rows[..if double { 2 } else { 1 }];
         let mut flags = SpriteFlags::default();
@@ -345,37 +309,25 @@ impl Vdp {
             };
             let mut screen = screen;
             for &r in rows {
-                let f = match screen.as_deref_mut() {
-                    Some(s) => {
-                        let o = r as usize * MAX_W;
-                        let keep = s.kept.get_mut(r as usize);
-                        let kept = keep.is_some();
-                        let f = crate::vdp_render::render_row_kept(&m, r, Some(&mut s.px[o..o + w]), keep);
-                        if kept {
-                            s.row_kept(r as usize, h);
-                        }
-                        f
-                    }
-                    None => crate::vdp_render::render_row(&m, r, None),
-                };
+                let out = screen.as_deref_mut().map(|s| {
+                    let o = r as usize * MAX_W;
+                    &mut s.px[o..o + w]
+                });
+                let f = crate::vdp_render::render_row(&m, r, out);
                 flags.overflow |= f.overflow;
                 flags.collision |= f.collision;
             }
             if let Some(s) = screen {
                 s.w = w;
-                s.h = h;
+                s.h = self.active_lines() as usize * if double { 2 } else { 1 };
             }
         } else if let Some(s) = screen {
             s.w = w;
-            s.h = h;
+            s.h = self.active_lines() as usize * if double { 2 } else { 1 };
             let bg = crate::vdp_render::rgb(self.cram[(self.regs[7] & 0x3F) as usize], 0);
             for &r in rows {
                 let o = r as usize * MAX_W;
                 s.px[o..o + w].fill(bg);
-                if let Some(k) = s.kept.get_mut(r as usize) {
-                    *k = KeptRow::blank(self.cram.as_slice().try_into().expect("64 colours"), self.regs[7]);
-                    s.row_kept(r as usize, h);
-                }
             }
         }
         self.sprite_overflow |= flags.overflow;

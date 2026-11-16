@@ -4,9 +4,7 @@ use std::path::Path;
 
 /// What changed in the version this build is, one short line per change: (Russian, English).
 pub const NOTES: &[(&str, &str)] = &[
-    ("Наклон: фон сдвигается, когда наклоняешь Deck", "Tilt the Deck and the background slides"),
-    ("Геймпад с гироскопом тоже", "Works with gyro gamepads"),
-    ("Включается в Настройках", "Turn it on in Settings"),
+    ("Наклон из 0.6.0 убран: на Deck не работал", "Tilt from 0.6.0 is removed: it did not work on the Deck"),
 ];
 
 /// Files only an install that already ran writes: their presence without `seen-version`

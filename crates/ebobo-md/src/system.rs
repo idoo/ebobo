@@ -272,57 +272,6 @@ impl Md {
         (w, h)
     }
 
-    /// Display only: while on, every finished picture also keeps its planes apart (what a
-    /// nearer plane covers), which [`Md::frame_tilted`] needs to move them against each
-    /// other. Not emulated state: no snapshot, hash or saved state holds it, and loading one
-    /// leaves it as it was.
-    pub fn set_tilt(&mut self, on: bool) {
-        self.m.screen.set_tilt(on);
-    }
-
-    /// Farthest plane B moves in [`Md::frame_tilted`], in pixels across and down, for the
-    /// last finished picture (rows count double in interlace mode 2). The tilted picture is
-    /// this much smaller on every side.
-    pub fn tilt_reach(&self) -> (i32, i32) {
-        let (_, h) = self.frame_size();
-        (8, if h > 240 { 8 } else { 4 })
-    }
-
-    /// The last finished picture with plane B moved `shift` pixels (right, down; each taken
-    /// within ±[`Md::tilt_reach`]), plane A and the window half as far, and the sprites
-    /// where they are. The picture loses the reach on every side, so no shift shows past an
-    /// edge; its size is returned. `rgba` gets RGBA8888 and `layers` one byte per pixel as
-    /// [`Md::frame_layers`] gives them (both resized). With no shift, and until a picture
-    /// was finished with [`Md::set_tilt`] on, it is the middle of the plain picture, byte
-    /// for byte.
-    pub fn frame_tilted(&self, shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
-        let (fw, fh) = self.frame_size();
-        let (rx, ry) = self.tilt_reach();
-        let shift = (shift.0.clamp(-rx, rx), shift.1.clamp(-ry, ry));
-        let (rx, ry) = (rx as usize, ry as usize);
-        if fw <= 2 * rx || fh <= 2 * ry {
-            rgba.clear();
-            layers.clear();
-            return (0, 0);
-        }
-        let (w, h) = (fw - 2 * rx, fh - 2 * ry);
-        rgba.resize(w * h * 4, 0);
-        layers.resize(w * h, 0);
-        if let Some(rows) = self.m.screen.kept() {
-            crate::vdp_render::compose_tilted(rows, w, (rx, ry), shift, rgba, layers);
-            return (w, h);
-        }
-        for y in 0..h {
-            let line = &self.m.screen.px[(y + ry) * MAX_W + rx..][..w];
-            let out = rgba[y * w * 4..][..w * 4].chunks_exact_mut(4).zip(&mut layers[y * w..][..w]);
-            for ((rgba, layer), &px) in out.zip(line) {
-                rgba.copy_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, px as u8, 255]);
-                *layer = (px >> 24) as u8;
-            }
-        }
-        (w, h)
-    }
-
     /// Output sample rate in Hz. May be nudged every frame to keep the audio queue level.
     pub fn set_sample_rate(&mut self, hz: f64) {
         self.m.audio.set_sample_rate(hz);
@@ -709,66 +658,5 @@ mod tests {
         let hash = md.state_hash();
         md.load_battery_ram(&[1, 2, 3]);
         assert_eq!(md.state_hash(), hash);
-    }
-
-    fn test_rom(name: &str) -> Md {
-        let path = format!("{}/tests/roms/{name}", env!("CARGO_MANIFEST_DIR"));
-        Md::new(&std::fs::read(&path).unwrap(), None).unwrap()
-    }
-
-    /// The middle of the plain picture, `rx` and `ry` taken off every side.
-    fn plain_middle(md: &Md) -> (Vec<u8>, Vec<u8>) {
-        let (mut rgba, mut layers) = (Vec::new(), Vec::new());
-        let (w, h) = md.frame_rgba(&mut rgba);
-        md.frame_layers(&mut layers);
-        let (rx, ry) = md.tilt_reach();
-        let (rx, ry) = (rx as usize, ry as usize);
-        let (mut c, mut l) = (Vec::new(), Vec::new());
-        for y in ry..h - ry {
-            c.extend_from_slice(&rgba[(y * w + rx) * 4..(y * w + w - rx) * 4]);
-            l.extend_from_slice(&layers[y * w + rx..y * w + w - rx]);
-        }
-        (c, l)
-    }
-
-    #[test]
-    fn tilt_without_shift_is_the_middle_of_the_picture() {
-        for name in ["sgdk-hilight-shadow.bin", "sgdk-platformer.bin", "sgdk-linescroll.bin"] {
-            let mut md = test_rom(name);
-            md.set_tilt(true);
-            let (mut rgba, mut layers) = (Vec::new(), Vec::new());
-            for (at, frames) in [(1, 1), (90, 89), (240, 150)] {
-                run(&mut md, frames);
-                let (w, h) = md.frame_tilted((0, 0), &mut rgba, &mut layers);
-                let (c, l) = plain_middle(&md);
-                assert_eq!((rgba.len(), layers.len()), (w * h * 4, w * h));
-                assert!(rgba == c, "{name} frame {at}: colours");
-                assert!(layers == l, "{name} frame {at}: layers");
-            }
-        }
-    }
-
-    #[test]
-    fn tilt_is_not_emulated_state() {
-        let (mut on, mut off) = (test_rom("sgdk-platformer.bin"), test_rom("sgdk-platformer.bin"));
-        on.set_tilt(true);
-        run(&mut on, 60);
-        run(&mut off, 60);
-        assert_eq!(on.state_hash(), off.state_hash());
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        on.frame_rgba(&mut a);
-        off.frame_rgba(&mut b);
-        assert!(a == b);
-        // A loaded state leaves the flag on, and the planes of the next picture are kept.
-        let blob = off.save_state();
-        on.load_state(&blob).unwrap();
-        run(&mut on, 1);
-        assert!(on.m.screen.kept().is_some());
-        // Off forgets the kept planes: the tilted picture is the plain middle again.
-        on.set_tilt(false);
-        assert!(on.m.screen.kept().is_none());
-        let (mut rgba, mut layers) = (Vec::new(), Vec::new());
-        on.frame_tilted((8, 4), &mut rgba, &mut layers);
-        assert!((rgba, layers) == plain_middle(&on));
     }
 }

@@ -26,10 +26,6 @@ usage: ebobo [ROM] [options]
   --effect NAME        picture effect: off, crt, pvm, lcd
   --enhance MODE       picture enhancement: off, hd, depth (HD smoothing plus depth shadows)
   --ambient on|off     ambient light in the bars around the game's picture
-  --tilt on|off        tilt: the planes behind the sprites move as the device is tilted
-  --tilt-at X,Y        pin the tilt (each -1..1, right and down) and turn it on for this
-                       run, no motion sensor needed (for screenshots and checks)
-  --tilt-probe SECS    print what the motion sensor reads for SECS seconds and exit
   --screen MODE        screen mode: stretch, fit (aspect kept), pixel (integer scale)
   --library            start in the library of games (for screenshots and checks)
   --exit-after SECONDS quit after this many seconds
@@ -92,11 +88,6 @@ pub struct Cli {
     pub effect: Option<Effect>,
     pub enhance: Option<Mode>,
     pub ambient: Option<bool>,
-    pub tilt: Option<bool>,
-    /// `--tilt-at X,Y`: a pinned tilt that turns the effect on for this run.
-    pub tilt_at: Option<(f32, f32)>,
-    /// `--tilt-probe SECS`: print the motion sensor's readings and exit.
-    pub tilt_probe: Option<u32>,
     pub screen: Option<ScreenMode>,
     /// `--library`: open the library over the main menu (only without a game to start).
     pub library: bool,
@@ -146,9 +137,6 @@ impl Cli {
         }
         if let Some(ambient) = self.ambient {
             config.ambient = ambient;
-        }
-        if let Some(tilt) = self.tilt {
-            config.tilt = tilt;
         }
         if let Some(screen) = self.screen {
             config.screen = screen;
@@ -220,28 +208,6 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                     "off" => false,
                     _ => return Err(format!("bad --ambient: {raw} (on, off)")),
                 });
-            }
-            "--tilt" => {
-                let raw = value(flag)?;
-                cli.tilt = Some(match raw.trim().to_ascii_lowercase().as_str() {
-                    "on" => true,
-                    "off" => false,
-                    _ => return Err(format!("bad --tilt: {raw} (on, off)")),
-                });
-            }
-            "--tilt-at" => {
-                let raw = value(flag)?;
-                let unit = |s: &str| s.trim().parse::<f32>().ok().filter(|v| (-1.0..=1.0).contains(v));
-                let at = raw
-                    .split_once(',')
-                    .and_then(|(x, y)| Some((unit(x)?, unit(y)?)))
-                    .ok_or_else(|| format!("bad --tilt-at: {raw} (X,Y, each -1..1)"))?;
-                cli.tilt_at = Some(at);
-            }
-            "--tilt-probe" => {
-                let raw = value(flag)?;
-                let secs = raw.parse::<u32>().ok().filter(|s| *s > 0).ok_or_else(|| format!("bad --tilt-probe: {raw} (seconds)"))?;
-                cli.tilt_probe = Some(secs);
             }
             "--screen" => {
                 let raw = value(flag)?;
@@ -450,43 +416,6 @@ mod tests {
             assert!(p(bad).is_err(), "{bad:?}");
         }
         for flag in ["--enhance", "--ambient", "--screen", "--library"] {
-            assert!(USAGE.contains(flag), "{flag}");
-        }
-    }
-
-    #[test]
-    fn tilt_options() {
-        let none = run(&[]);
-        assert_eq!((none.tilt, none.tilt_at, none.tilt_probe), (None, None, None));
-        assert_eq!(run(&["--tilt", "on"]).tilt, Some(true));
-        assert_eq!(run(&["--tilt=OFF"]).tilt, Some(false));
-        assert_eq!(run(&["--tilt-at", "0.5,-1"]).tilt_at, Some((0.5, -1.0)));
-        assert_eq!(run(&["--tilt-at=-0.25, 1"]).tilt_at, Some((-0.25, 1.0)));
-        assert_eq!(run(&["--tilt-probe", "5"]).tilt_probe, Some(5));
-        assert_eq!(run(&["--tilt-probe=1"]).tilt_probe, Some(1));
-        let mut config = Config::default();
-        run(&["--tilt", "on"]).apply(&mut config);
-        assert!(config.tilt);
-        let mut kept = Config { tilt: true, ..Config::default() };
-        run(&["--tilt-at", "0,0"]).apply(&mut kept);
-        assert!(kept.tilt, "a pinned tilt leaves the setting as it is");
-        for bad in [
-            &["--tilt", "yes"][..],
-            &["--tilt"],
-            &["--tilt-at", "1.5,0"],
-            &["--tilt-at", "0,-2"],
-            &["--tilt-at", "0.5"],
-            &["--tilt-at", "a,b"],
-            &["--tilt-at", "NaN,0"],
-            &["--tilt-at"],
-            &["--tilt-probe", "0"],
-            &["--tilt-probe", "soon"],
-            &["--tilt-probe", "-3"],
-            &["--tilt-probe"],
-        ] {
-            assert!(p(bad).is_err(), "{bad:?}");
-        }
-        for flag in ["--tilt ", "--tilt-at", "--tilt-probe"] {
             assert!(USAGE.contains(flag), "{flag}");
         }
     }

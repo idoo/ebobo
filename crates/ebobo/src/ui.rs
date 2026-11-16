@@ -144,9 +144,6 @@ pub enum Text {
     DeckKeys,
     /// How to switch the Deck to its gamepad layout.
     DeckKeysFix,
-    /// Tilt was switched on and nothing measures motion (two toasts: one line holds 30 characters).
-    TiltNeedsGyro,
-    TiltNeedsGyroPad,
     /// How to open the menu from a game, for a gamepad and for the keyboard.
     MenuHintPad,
     MenuHintKeys,
@@ -194,8 +191,6 @@ const SLOT: [Color; 4] = [rgb(0x3B, 0x7B, 0xE4), rgb(0xE4, 0x3B, 0x2C), rgb(0x4C
 
 /// Smallest tap target height, canvas px (≈ 44 pt on the Deck).
 const MIN_TAP: i32 = 14;
-/// Pitch of the Settings rows: eleven of them end above the gamepads list.
-const SETTINGS_STEP: i32 = 11;
 const TOAST_SECS: f32 = 2.5;
 const NICK_MAX: usize = 16;
 
@@ -801,8 +796,6 @@ impl Ui {
             Text::UpdateDownloadAgain => S::UpdateDownloadAgain,
             Text::DeckKeys => S::DeckKeys,
             Text::DeckKeysFix => S::DeckKeysFix,
-            Text::TiltNeedsGyro => S::TiltNeedsGyro,
-            Text::TiltNeedsGyroPad => S::TiltNeedsGyroPad,
             Text::MenuHintPad => S::MenuHintPad,
             Text::MenuHintKeys => S::MenuHintKeys,
             Text::NetSaved => S::NetSaved,
@@ -1667,7 +1660,6 @@ impl Ui {
                 true,
             ),
             Item::value(self.t(S::Ambient), onoff(cfg.ambient), true),
-            Item::value(self.t(S::Tilt), onoff(cfg.tilt), true),
             Item::value(self.t(S::Volume), format!("{}%", (cfg.volume * 100.0).round() as u32), true),
             Item::value(self.t(S::Language), if self.lang == Lang::Ru { "Русский" } else { "English" }.to_string(), true),
             Item::new(self.t(S::Advanced)),
@@ -1716,7 +1708,7 @@ impl Ui {
             self.pop();
             return None;
         }
-        let confirm = self.menu_step(Screen::Settings, 11, nav);
+        let confirm = self.menu_step(Screen::Settings, 10, nav);
         let row = self.sel[Screen::Settings.slot()];
         let delta: i32 = if nav.right || confirm.is_some() { 1 } else if nav.left { -1 } else { 0 };
         let cfg = &mut *ctx.config;
@@ -1726,12 +1718,12 @@ impl Ui {
                 self.open_field(Field::Nick, nick);
                 None
             }
-            10 if confirm.is_some() => {
+            9 if confirm.is_some() => {
                 self.sel[Screen::Advanced.slot()] = 0;
                 self.push(Screen::Advanced);
                 None
             }
-            0 | 10 => None,
+            0 | 9 => None,
             _ if delta == 0 => None,
             1 => {
                 cfg.fullscreen = !cfg.fullscreen;
@@ -1762,10 +1754,6 @@ impl Ui {
                 Some(UiAction::ConfigChanged)
             }
             7 => {
-                cfg.tilt = !cfg.tilt;
-                Some(UiAction::ConfigChanged)
-            }
-            8 => {
                 let steps = ((cfg.volume * 10.0).round() as i32 + delta).clamp(0, 10);
                 let volume = steps as f32 / 10.0;
                 let changed = volume != cfg.volume;
@@ -2064,8 +2052,8 @@ impl Ui {
     fn draw_settings(&self, c: &mut Canvas, f: &mut Font, ctx: &UiCtx, kind: Option<PadKind>, h: &mut Vec<(Area, Hit)>) {
         f.draw_centered(c, 8, self.t(S::Settings), WHITE, 1);
         let items = self.settings_items(ctx.config);
-        // Eleven rows end at y 142, above the gamepads list (taps stay MIN_TAP tall).
-        Self::draw_rows(c, f, &items, self.sel[Screen::Settings.slot()], 24, SETTINGS_STEP, h);
+        // Ten rows 12 px apart end at y 140, above the gamepads list (taps stay MIN_TAP tall).
+        Self::draw_rows(c, f, &items, self.sel[Screen::Settings.slot()], 24, 12, h);
         f.draw(c, 16, 146, self.t(S::Gamepads), SEC, 1);
         if ctx.pads.is_empty() {
             f.draw(c, 24, 157, self.t(S::NoPads), DIS, 1);
@@ -2515,7 +2503,7 @@ impl Ui {
                     Some(Screen::Picker(_)) => unreachable!("the library's hints and its menu's are chosen above"),
                     Some(Screen::Code) => vec![(Glyph::Confirm, S::Join), (Glyph::Back, S::Back)],
                     Some(Screen::Field(_)) => vec![(Glyph::Confirm, S::Ok), (Glyph::Back, S::Back)],
-                    Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 10 => {
+                    Some(Screen::Settings) if self.sel[Screen::Settings.slot()] == 9 => {
                         vec![(Glyph::Confirm, S::Select), (Glyph::Back, S::Back)]
                     }
                     Some(Screen::Advanced) if self.sel[Screen::Advanced.slot()] == 2 => {
@@ -3091,12 +3079,12 @@ mod tests {
         cfg.volume = 0.5;
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Main, Screen::Settings];
-        let volume_y = 24 + 8 * SETTINGS_STEP;
+        let volume_y = 24 + 7 * 12;
         let back = |ui: &Ui| {
             ui.regions
                 .iter()
                 .find_map(|(_, hit)| match hit {
-                    Hit::Row { i: 8, back, .. } => *back,
+                    Hit::Row { i: 7, back, .. } => *back,
                     _ => None,
                 })
                 .expect("volume row cycles")
@@ -3106,7 +3094,7 @@ mod tests {
         let (from, to) = back(&ui);
         assert_eq!(ui.update(&tap(from, volume_y), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(c.config.volume, 0.4);
-        assert_eq!(ui.sel[Screen::Settings.slot()], 8);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 7);
         redraw(&mut ui, &c);
         let (_, to2) = back(&ui);
         assert_eq!(ui.update(&tap(to2, volume_y), &mut c, DT), Some(UiAction::ConfigChanged));
@@ -3186,7 +3174,7 @@ mod tests {
                 ui.update(&nav(|n| n.down = true), &mut c, DT);
             }
             ui.update(&nav(|n| n.confirm = true), &mut c, DT);
-            for _ in 0..8 {
+            for _ in 0..7 {
                 ui.update(&nav(|n| n.down = true), &mut c, DT);
             }
             assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
@@ -3199,7 +3187,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 9;
+        ui.sel[Screen::Settings.slot()] = 8;
         let mut c = ctx(&mut cfg, &[], None);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(ui.lang, Lang::En);
@@ -3551,11 +3539,11 @@ mod tests {
     fn ui_settings_top_level_fits() {
         let cfg = Config::default();
         let ui = Ui::new(Lang::Ru);
-        assert_eq!(ui.settings_items(&cfg).len(), 11);
+        assert_eq!(ui.settings_items(&cfg).len(), 10);
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
-        ui.sel[Screen::Settings.slot()] = 10;
+        ui.sel[Screen::Settings.slot()] = 9;
         let mut c = ctx(&mut cfg, &[], None);
         ui.update(&nav(|n| n.confirm = true), &mut c, DT);
         assert_eq!(ui.stack.last(), Some(&Screen::Advanced));
@@ -3573,24 +3561,24 @@ mod tests {
         let mut ui = Ui::new(Lang::Ru);
         ui.stack = vec![Screen::Settings];
         let mut c = ctx(&mut cfg, &[], None);
-        for _ in 0..9 {
+        for _ in 0..8 {
             assert_eq!(ui.update(&nav(|n| n.down = true), &mut c, DT), None);
         }
-        assert_eq!(ui.sel[Screen::Settings.slot()], 9);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 8);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
-        assert_eq!(ui.lang, Lang::En, "row 9 is Language");
+        assert_eq!(ui.lang, Lang::En, "row 8 is Language");
         ui.update(&nav(|n| n.down = true), &mut c, DT);
-        assert_eq!(ui.sel[Screen::Settings.slot()], 10);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 9);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
         assert_eq!(ui.stack.last(), Some(&Screen::Advanced));
         ui.pop();
         ui.update(&nav(|n| n.down = true), &mut c, DT);
-        assert_eq!(ui.sel[Screen::Settings.slot()], 0, "11 rows wrap");
+        assert_eq!(ui.sel[Screen::Settings.slot()], 0, "10 rows wrap");
     }
 
     #[test]
     fn ui_deck_keys_toasts_fit() {
-        for s in [S::DeckKeys, S::DeckKeysFix, S::TiltNeedsGyro, S::TiltNeedsGyroPad] {
+        for s in [S::DeckKeys, S::DeckKeysFix] {
             for lang in [Lang::Ru, Lang::En] {
                 assert!(lang.tr(s).chars().count() <= 30, "toasts are cut at 30");
             }
@@ -3666,7 +3654,7 @@ mod tests {
         }
         // Taps: the left part of the value steps back, the label area forward.
         redraw(&mut ui, &c);
-        let y = 24 + 4 * SETTINGS_STEP;
+        let y = 24 + 4 * 12;
         let (from, _) = ui
             .regions
             .iter()
@@ -3682,9 +3670,8 @@ mod tests {
         assert_eq!(c.config.effect, Effect::Off);
     }
 
-    /// The rows after Effect: Enhance cycles both ways, by confirm and by taps; Ambient and
-    /// Tilt toggle by button and tap, and Tilt says when nothing measures motion; the rows
-    /// below (Volume, Language) still do their job by tap.
+    /// The rows after Effect: Enhance cycles both ways, by confirm and by taps; Ambient
+    /// toggles by button and tap; the rows below (Volume, Language) still do their job by tap.
     #[test]
     fn ui_enhance_and_ambient_rows() {
         let mut cfg = Config::default();
@@ -3693,7 +3680,7 @@ mod tests {
         ui.stack = vec![Screen::Main, Screen::Settings];
         let mut c = ctx(&mut cfg, &[], None);
         let items = ui.settings_items(c.config);
-        for (row, s) in [(4, S::Effect), (5, S::Enhance), (6, S::Ambient), (7, S::Tilt), (8, S::Volume), (9, S::Language), (10, S::Advanced)] {
+        for (row, s) in [(4, S::Effect), (5, S::Enhance), (6, S::Ambient), (7, S::Volume), (8, S::Language), (9, S::Advanced)] {
             assert_eq!(items[row].label, Lang::En.tr(s), "row {row}");
         }
         ui.sel[Screen::Settings.slot()] = 5;
@@ -3709,7 +3696,7 @@ mod tests {
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(c.config.enhance, Mode::Hd);
         // Taps: the left part of the value steps back, the label area forward.
-        let y = |row: i32| 24 + row * SETTINGS_STEP;
+        let y = |row: i32| 24 + row * 12;
         redraw(&mut ui, &c);
         let (from, _) = ui
             .regions
@@ -3734,24 +3721,13 @@ mod tests {
         redraw(&mut ui, &c);
         assert_eq!(ui.update(&tap(30, y(6)), &mut c, DT), Some(UiAction::ConfigChanged));
         assert!(!c.config.ambient);
-        // Tilt: off by default; buttons and a tap toggle it.
-        assert!(!c.config.tilt);
-        ui.sel[Screen::Settings.slot()] = 7;
-        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
-        assert!(c.config.tilt);
-        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::ConfigChanged));
-        assert!(!c.config.tilt);
-        redraw(&mut ui, &c);
-        assert_eq!(ui.update(&tap(30, y(7)), &mut c, DT), Some(UiAction::ConfigChanged));
-        assert!(c.config.tilt);
-        assert!(!c.config.ambient, "the row above is untouched");
         // The rows below follow: Volume steps up, Language switches.
         redraw(&mut ui, &c);
-        assert_eq!(ui.update(&tap(30, y(8)), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(ui.update(&tap(30, y(7)), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(c.config.volume, 0.6);
-        assert_eq!(ui.sel[Screen::Settings.slot()], 8);
+        assert_eq!(ui.sel[Screen::Settings.slot()], 7);
         redraw(&mut ui, &c);
-        assert_eq!(ui.update(&tap(30, y(9)), &mut c, DT), Some(UiAction::ConfigChanged));
+        assert_eq!(ui.update(&tap(30, y(8)), &mut c, DT), Some(UiAction::ConfigChanged));
         assert_eq!(ui.lang, Lang::Ru);
         assert_eq!((c.config.enhance, c.config.ambient), (Mode::Hd, false), "untouched by the rows below");
     }

@@ -13,7 +13,6 @@ use ebobo_console::System;
 use ebobo_console::md::pad as md_pad;
 use ebobo_console::nes::pad;
 use sdl2::controller::{Axis, Button, GameController};
-use sdl2::sensor::SensorType;
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::{Mod, Scancode};
 use sdl2::mouse::MouseButton;
@@ -751,8 +750,6 @@ struct Pad {
     key: String,
     /// Steam's slot number when this is a Steam virtual gamepad.
     steam_slot: Option<u32>,
-    /// It has a gyroscope and the sensor is switched on.
-    gyro: bool,
 }
 
 impl Pad {
@@ -960,14 +957,11 @@ impl Input {
         let (vid, pid) = sdl_ids(&ctrl);
         let mut ctrl = ctrl;
         show_seat(&mut ctrl, slot);
-        let gyro = ctrl.has_sensor(SensorType::Gyroscope)
-            && ctrl.sensor_set_enabled(SensorType::Gyroscope, true).is_ok();
         self.pads.push(Pad {
             ctrl,
             info: PadInfo { name, kind, slot },
             key,
             steam_slot,
-            gyro,
             hold: Hold::default(),
             shot: false,
         });
@@ -975,11 +969,10 @@ impl Input {
         self.refresh_steam_pads();
         let info = self.pads[self.pads.len() - 1].info.clone();
         let slot_text = steam_slot.map_or("-".to_owned(), |n| n.to_string());
-        let gyro_text = if gyro { " gyro" } else { "" };
         let mut out = std::io::stdout().lock();
         let _ = writeln!(
             out,
-            "ebobo: gamepad \"{}\" kind={:?} steam_slot={slot_text} vid={vid:04x} pid={pid:04x}{gyro_text}",
+            "ebobo: gamepad \"{}\" kind={:?} steam_slot={slot_text} vid={vid:04x} pid={pid:04x}",
             info.name, info.kind
         );
         let _ = out.flush();
@@ -1300,21 +1293,6 @@ impl Input {
         let mut v: Vec<PadInfo> = self.pads.iter().map(|p| p.info.clone()).collect();
         v.sort_by_key(|p| p.slot.unwrap_or(usize::MAX));
         v
-    }
-
-    /// Turn rate of a connected gamepad that has a gyroscope, in rad/s on SDL's controller
-    /// axes (x: pitch, y: yaw, z: roll); the pad used last when several have one. `None`
-    /// without such a pad.
-    pub fn gyro(&self) -> Option<[f32; 3]> {
-        let used = self.hint.map(|(id, _)| id);
-        let pad = self
-            .pads
-            .iter()
-            .find(|p| p.gyro && Some(p.id()) == used)
-            .or_else(|| self.pads.iter().find(|p| p.gyro))?;
-        let mut rate = [0.0f32; 3];
-        pad.ctrl.sensor_get_data(SensorType::Gyroscope, &mut rate).ok()?;
-        Some(rate)
     }
 }
 

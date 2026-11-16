@@ -38,84 +38,12 @@ const TAG_SPRITE: u16 = 3 << 8;
 /// The caller handles a blanked display (register 1 bit 6 off: the whole row is the
 /// background colour, no sprite flags); this function draws an enabled display.
 pub fn render_row(m: &Mem, row: u32, out: Option<&mut [u32]>) -> SpriteFlags {
-    render_row_kept(m, row, out, None)
-}
-
-/// [`render_row`] that also leaves the row's layers apart in `keep`, for
-/// [`compose_tilted`]. `keep` is filled only when the row is drawn (`out` is `Some`).
-pub fn render_row_kept(m: &Mem, row: u32, out: Option<&mut [u32]>, keep: Option<&mut KeptRow>) -> SpriteFlags {
     let mut sprites: SpriteRow = [0; 320];
     let flags = sprite_row(m, row, &mut sprites);
     if let Some(out) = out {
-        draw_row(m, row, &sprites, out, keep);
+        draw_row(m, row, &sprites, out);
     }
     flags
-}
-
-/// The layers of one drawn row before compositing, and what compositing them needs: the
-/// picture can be put together again with the planes moved against each other.
-#[derive(Clone)]
-pub struct KeptRow {
-    /// Line buffers of plane B, of plane A with the window, and of the sprites.
-    b: [u8; 320],
-    a: [u8; 320],
-    s: [u8; 320],
-    /// The colour entries as the row was drawn.
-    cram: [u16; 64],
-    /// Index of the backdrop colour (register 7).
-    bg: u8,
-    /// Shadow and highlight mode (register 12 bit 3).
-    sh: bool,
-}
-
-impl KeptRow {
-    /// A row of a blanked display: nothing but the backdrop colour `bg` of `cram`.
-    pub fn blank(cram: &[u16; 64], bg: u8) -> KeptRow {
-        KeptRow { b: [0; 320], a: [0; 320], s: [0; 320], cram: *cram, bg: bg & 0x3F, sh: false }
-    }
-}
-
-/// Composites a picture from kept rows with the planes moved: plane B by `shift` pixels
-/// (right, down), plane A and the window by half of it (towards zero), the sprites not at
-/// all. Output pixel (x, y) is screen pixel (x + `crop.0`, y + `crop.1`); the picture is
-/// `w` wide and as high as `layers.len() / w`. `rgba` gets four bytes per pixel, `layers`
-/// the layer of each pixel as in the top byte of [`render_row`]'s output. The caller keeps
-/// `shift` within `crop` and `crop` plus the picture inside `rows`, so no moved plane is
-/// read past an edge.
-///
-/// A pixel is mixed as [`render_row`] mixes it, in the shadow and highlight mode of its
-/// screen row; its colour comes from the colour entries of the row the winning layer was
-/// drawn on, and where nothing is drawn it is the backdrop of plane B's row.
-///
-/// The blanked left column (register 0 bit 5) is not redrawn: its 8 columns lie inside the
-/// 8 columns the crop takes off the left edge.
-pub fn compose_tilted(rows: &[KeptRow], w: usize, crop: (usize, usize), shift: (i32, i32), rgba: &mut [u8], layers: &mut [u8]) {
-    if w == 0 {
-        return;
-    }
-    let (rx, ry) = crop;
-    let moved = |at: usize, by: i32| (at as i32 - by) as usize;
-    let xa = moved(rx, shift.0 / 2);
-    let xb = moved(rx, shift.0);
-    for (y, (rgba, layers)) in rgba.chunks_exact_mut(w * 4).zip(layers.chunks_exact_mut(w)).enumerate() {
-        let row_s = &rows[y + ry];
-        let row_a = &rows[moved(y + ry, shift.1 / 2)];
-        let row_b = &rows[moved(y + ry, shift.1)];
-        let (s, a, b) = (&row_s.s[rx..rx + w], &row_a.a[xa..xa + w], &row_b.b[xb..xb + w]);
-        for (x, (rgba, layer)) in rgba.chunks_exact_mut(4).zip(layers.iter_mut()).enumerate() {
-            let (c, shade) = mix(b[x], a[x], s[x], row_s.sh);
-            let index = usize::from(c & 0x3F);
-            let entry = match c & 0x300 {
-                TAG_SPRITE => row_s.cram[index],
-                TAG_A => row_a.cram[index],
-                TAG_B => row_b.cram[index],
-                _ => row_b.cram[usize::from(row_b.bg)],
-            };
-            let px = rgb(entry, shade);
-            rgba.copy_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, px as u8, 255]);
-            *layer = (c >> 8) as u8;
-        }
-    }
 }
 
 /// A 9-bit colour entry (`0000BBB0GGG0RRR0`) as `0x00RRGGBB`, through the console's
@@ -229,35 +157,6 @@ fn plane_front(b: u8, a: u8) -> u16 {
     }
 }
 
-/// The pixel in front where plane B's pixel is `b`, plane A's (or the window's) `a` and the
-/// sprites' `s` (line buffer bytes), tagged with its layer (0 = nothing drawn: the
-/// backdrop), and its shade: 0 normal, 1 shadow, 2 highlight. `sh`: shadow and highlight
-/// mode is on; without it the shade is always 0.
-#[inline]
-pub fn mix(b: u8, a: u8, s: u8, sh: bool) -> (u16, u8) {
-    let p = plane_front(b, a);
-    let sprite = s & 15 != 0 && (s >= 0x80 || p & 0x80 == 0);
-    if !sh {
-        return (if sprite { u16::from(s) | TAG_SPRITE } else { p }, 0);
-    }
-    // Shadowed unless a high-priority cell of either plane is here, whatever its pixel.
-    let mut shade = u8::from((a | b) & 0x80 == 0);
-    let mut c = p;
-    if sprite {
-        match s & 0x3F {
-            0x3E => shade = if shade == 1 { 0 } else { 2 },
-            0x3F => shade = 1,
-            _ => {
-                c = u16::from(s) | TAG_SPRITE;
-                if s >= 0x80 || s & 15 == 14 {
-                    shade = 0;
-                }
-            }
-        }
-    }
-    (c, shade)
-}
-
 /// The output word of the composited pixel `c` (a tagged line buffer byte): its colour from
 /// `pal`, or the backdrop colour `bg` if it is transparent, under its layer. A transparent
 /// pixel is only ever the 0 of [`plane_front`], so the backdrop comes out as layer 0.
@@ -267,7 +166,7 @@ fn output(pal: &[u32; 64], bg: usize, c: u16) -> u32 {
 }
 
 /// Planes and compositing of [`render_row`], given the row's sprite pixels.
-fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32], keep: Option<&mut KeptRow>) {
+fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32]) {
     let r = m.regs;
     let h40 = r[12] & 0x81 != 0;
     let width = if h40 { 320 } else { 256 };
@@ -314,9 +213,6 @@ fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32], keep: Optio
     plane_span(m, table_w, cell_shift, 0, row, w0, w1, &mut buf_a);
 
     let bg = usize::from(r[7] & 0x3F);
-    if let Some(k) = keep {
-        *k = KeptRow { b: buf_b, a: buf_a, s: *sprites, cram: *m.cram, bg: bg as u8, sh: r[12] & 8 != 0 };
-    }
     let out = &mut out[..width];
     let layers = out.iter_mut().zip(&buf_b[..width]).zip(&buf_a[..width]).zip(&sprites[..width]);
     if r[12] & 8 == 0 {
@@ -325,7 +221,9 @@ fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32], keep: Optio
             *p = rgb(c, 0);
         }
         for (((o, &b), &a), &s) in layers {
-            *o = output(&pal, bg, mix(b, a, s, false).0);
+            let p = plane_front(b, a);
+            let c = if s & 15 != 0 && (s >= 0x80 || p & 0x80 == 0) { u16::from(s) | TAG_SPRITE } else { p };
+            *o = output(&pal, bg, c);
         }
     } else {
         let mut pal = [[0u32; 64]; 3];
@@ -335,8 +233,22 @@ fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32], keep: Optio
             }
         }
         for (((o, &b), &a), &s) in layers {
-            let (c, shade) = mix(b, a, s, true);
-            *o = output(&pal[usize::from(shade)], bg, c);
+            // Shadowed unless a high-priority cell of either plane is here, whatever its pixel.
+            let mut shade = usize::from((a | b) & 0x80 == 0);
+            let mut c = plane_front(b, a);
+            if s & 15 != 0 && (s >= 0x80 || c & 0x80 == 0) {
+                match s & 0x3F {
+                    0x3E => shade = if shade == 1 { 0 } else { 2 },
+                    0x3F => shade = 1,
+                    _ => {
+                        c = u16::from(s) | TAG_SPRITE;
+                        if s >= 0x80 || s & 15 == 14 {
+                            shade = 0;
+                        }
+                    }
+                }
+            }
+            *o = output(&pal[shade], bg, c);
         }
     }
     if r[0] & 0x20 != 0 {
@@ -405,7 +317,7 @@ mod tests {
         /// The row as drawn: colour and layer of every column.
         fn raw_with(&self, row: u32, sprites: &SpriteRow) -> [u32; 320] {
             let mut out = [UNTOUCHED; 320];
-            draw_row(&self.mem(), row, sprites, &mut out, None);
+            draw_row(&self.mem(), row, sprites, &mut out);
             out
         }
 
@@ -936,106 +848,5 @@ mod tests {
         assert_eq!(parts(o[24]), (rgb(f.cram[0], 0), 0));
         assert_eq!(parts(o[25]), (rgb(f.cram[0], 1), 0));
         assert_eq!(parts(o[26]), (rgb(f.cram[0], 1), 0));
-    }
-
-    /// Every row `0..h` of `f` drawn with sprite row `s` (`None`: the sprites of its tables),
-    /// as plain output words and as kept rows.
-    fn kept_picture(f: &Fx, h: usize, s: Option<&SpriteRow>) -> (Vec<[u32; 320]>, Vec<KeptRow>) {
-        let m = f.mem();
-        let mut plain = vec![[UNTOUCHED; 320]; h];
-        let mut kept = vec![KeptRow::blank(&[0; 64], 0); h];
-        for (row, (out, k)) in plain.iter_mut().zip(kept.iter_mut()).enumerate() {
-            match s {
-                Some(s) => draw_row(&m, row as u32, s, out, Some(k)),
-                None => {
-                    render_row_kept(&m, row as u32, Some(out), Some(k));
-                }
-            }
-        }
-        (plain, kept)
-    }
-
-    /// [`compose_tilted`] of a 320 x `h` picture with crop (8, 4), as output words.
-    fn tilted(kept: &[KeptRow], h: usize, shift: (i32, i32)) -> Vec<Vec<u32>> {
-        let (w, h) = (320 - 16, h - 8);
-        let (mut rgba, mut layers) = (vec![0; w * h * 4], vec![0; w * h]);
-        compose_tilted(kept, w, (8, 4), shift, &mut rgba, &mut layers);
-        rgba.chunks_exact(w * 4)
-            .zip(layers.chunks_exact(w))
-            .map(|(c, l)| {
-                c.chunks_exact(4).zip(l).map(|(c, &l)| u32::from(l) << 24 | u32::from(c[0]) << 16 | u32::from(c[1]) << 8 | u32::from(c[2])).collect()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn tilt_without_shift_is_the_plain_middle() {
-        let mut f = Fx::new();
-        // Shadow and highlight, a window on the left 32 columns, planes at both priorities.
-        f.regs[12] = 0x89;
-        f.regs[17] = 2;
-        f.regs[7] = 0x2B;
-        for col in 0..64 {
-            f.cell(B, col, 0, if col % 3 == 0 { 0x8001 } else { 0x0001 });
-            f.cell(A, col, 0, if col % 4 == 0 { 0xA003 } else if col % 4 == 1 { 0x2002 } else { 0 });
-            f.cell(W, col, 0, if col % 2 == 0 { 0x4004 } else { 0xC001 });
-        }
-        let mut s: SpriteRow = [0; 320];
-        for (x, p) in s.iter_mut().enumerate() {
-            *p = [0, 0x3E, 0x3F, 0xBE, 0xBF, 0x15, 0x95, 0x2E][x % 8];
-        }
-        let (plain, kept) = kept_picture(&f, 24, Some(&s));
-        let t = tilted(&kept, 24, (0, 0));
-        for (y, line) in t.iter().enumerate() {
-            assert_eq!(&line[..], &plain[y + 4][8..312], "row {y}");
-        }
-    }
-
-    #[test]
-    fn tilt_moves_plane_b_and_half_plane_a_but_not_the_sprites() {
-        let mut f = Fx::new();
-        // Plane B: ramps of four palette lines, so screen rows and columns within a cell differ.
-        for row in 0..32 {
-            for col in 0..64 {
-                f.cell(B, col, row, 0x0001 + ((col as u16 % 4) << 13));
-            }
-        }
-        // Plane A: a block of solid colour 3 on palette line 1 over pixels 80..96 x 40..56.
-        for row in 5..7 {
-            for col in 10..12 {
-                f.cell(A, col, row, 0x2003);
-            }
-        }
-        // An 8x8 sprite of solid colour 2 on palette line 2 at (200, 100).
-        f.regs[5] = 0x78;
-        f.poke(0xF000, 128 + 100);
-        f.poke(0xF002, 0);
-        f.poke(0xF004, 0x4002);
-        f.poke(0xF006, 128 + 200);
-        let h = 224;
-        let (_, kept) = kept_picture(&f, h, None);
-        let mut only_b = Fx::new();
-        only_b.vram.clone_from(&f.vram);
-        only_b.vram[A..A + 0x1000].fill(0);
-        only_b.vram[0xF000..0xF008].fill(0);
-        let (plain_b, _) = kept_picture(&only_b, h, None);
-
-        let t = tilted(&kept, h, (4, 2));
-        for (y, line) in t.iter().enumerate() {
-            for (x, &px) in line.iter().enumerate() {
-                let (sx, sy) = (x + 8, y + 4);
-                let want = if (200..208).contains(&sx) && (100..108).contains(&sy) {
-                    f.col(0x22) | 3 << 24
-                } else if (82..98).contains(&sx) && (41..57).contains(&sy) {
-                    f.col(0x13) | 2 << 24
-                } else {
-                    plain_b[sy - 2][sx - 4]
-                };
-                assert_eq!(px, want, "pixel ({x}, {y})");
-            }
-        }
-        // The top-left corner plane A's block used to cover shows plane B now.
-        assert_eq!(parts(t[40 - 4][80 - 8]), parts(plain_b[38][76]));
-        assert_eq!(parts(t[40 - 4][80 - 8]).1, 1);
     }
 }
