@@ -1040,7 +1040,7 @@ impl Input {
                 Event::ControllerButtonDown { which, button, .. } => {
                     f.pad.used = true;
                     match button {
-                        Button::A | Button::B | Button::X | Button::Y | Button::LeftShoulder | Button::RightShoulder => {
+                        Button::A | Button::B | Button::X | Button::Y | Button::LeftShoulder | Button::RightShoulder | Button::Start => {
                             let back_held = self.pads.iter().any(|p| p.id() == which && p.ctrl.button(Button::Back));
                             nav_button(&mut f.nav, button, back_held);
                         }
@@ -1657,6 +1657,7 @@ mod tests {
             (Button::X, Nav { search: true, ..Default::default() }),
             (Button::LeftShoulder, Nav { prev_tab: true, ..Default::default() }),
             (Button::RightShoulder, Nav { next_tab: true, ..Default::default() }),
+            (Button::Start, Nav { options: true, ..Default::default() }),
         ] {
             press(button, true);
             let f = poll(&mut input);
@@ -1673,6 +1674,10 @@ mod tests {
         let f = poll(&mut input);
         assert!(f.screenshot && !f.nav.fav);
         press(Button::Y, false);
+        // Back+Start is the menu hold: no options press.
+        press(Button::Start, true);
+        assert!(!poll(&mut input).nav.options);
+        press(Button::Start, false);
         press(Button::Back, false);
         poll(&mut input);
 
