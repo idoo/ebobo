@@ -28,7 +28,7 @@ ebobo opens on your games. Pick one to play alone: it continues where you left i
 
 To play online, open a game's menu (Start on a gamepad, Space, a right click) and pick Play online, or pick Create room in the main menu. You get a five-letter code (Cmd+C or Ctrl+C copies it). Friends pick Join by code and type or paste it in. They don't need the ROM. The host sends it over and it stays in their library.
 
-Two to four people can share one device in a room: set Players here to how many of you sit at it, and each takes a gamepad (the keyboard is the first player). A room holds four players in all. The host can move players to other controller numbers: select a player in the room and press Left or Right.
+Two to four people can share one device in a room: set Players here to how many of you sit at it. Each takes a gamepad, and one of you can take the keyboard; whoever presses a button first after the game starts is that device's first player. A room holds four players in all. The host can move players to other controller numbers: select a player in the room and press Left or Right.
 
 The room stays open while you play. A friend who joins late, or comes back after dropping out, brings everyone back to the room for a few seconds, and the game goes on from the same moment with them in it. The host can also go back to the room from the menu, for example to change the seats.
 

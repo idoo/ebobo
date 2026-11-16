@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Rooms end to end, without windows: ebobo processes play through the real room server.
 
-    scripts/netroom-e2e.py target/debug/ebobo game.nes [--phases SJRHO] [--base DIR]
+    scripts/netroom-e2e.py target/debug/ebobo game.nes [--phases SJRKHO] [--base DIR]
 
 Phases (each a fresh set of processes):
   S  two devices with two players each: the game starts with controllers [0,0,1,1]
   J  a third device joins a running two-player game: everyone goes back to the room and the
      game continues, from the host's state, with three players
   R  a guest quits a running game and joins again with the same code: the game continues
+  K  a guest's ebobo is killed mid-game (no goodbye) and another device joins seconds later:
+     the host does not wait for the dead one and plays on with the newcomer
   H  saves for the host only: the host's save counts, the guest's does not
   O  saves off: nobody's save counts and no file is written
 A phase passes when every process ran its games, exited with 0, and the processes of the last
@@ -76,6 +78,8 @@ def finish(procs, secs):
     for pr in procs:
         if pr.p.returncode != 0 or "panicked" in pr.text():
             problems.append(f"{pr.tag} exit code {pr.p.returncode}")
+        with open(os.path.join(os.path.dirname(pr.shot), f"{pr.tag}-{pr.p.pid}.log"), "w") as f:
+            f.write(pr.text())
         other = [l.strip() for l in pr.lines if not re.search(r"frame \d+ hash|input delay|update:|gamepad", l)]
         print(f"  {pr.tag}: rc={pr.p.returncode} games={[(g['slots'], len(g['frames']), g['saves']) for g in pr.games()]}")
         for l in other[:14]:
@@ -122,7 +126,7 @@ def phase_join(binary, base, rom):
         return finish([h], 5) + ["no room code"]
     g1 = Proc(binary, base, "g1", ["--join", code, "--name", "G1"], 68)
     if not h.wait_for(r"frame 300 hash", 40):
-        return finish([h, g1], 5) + ["the two-player game did not run"]
+        return finish([h, g1], 100) + ["the two-player game did not run"]
     g2 = Proc(binary, base, "g2", ["--join", code, "--name", "G2"], 45)
     problems = finish([h, g1, g2], 140)
     for pr in (h, g1):
@@ -146,7 +150,7 @@ def phase_return(binary, base, rom):
         return finish([h], 5) + ["no room code"]
     g1 = Proc(binary, base, "g1", ["--join", code, "--name", "G1"], 16)
     if not h.wait_for(r"frame 300 hash", 40):
-        return finish([h, g1], 5) + ["the two-player game did not run"]
+        return finish([h, g1], 100) + ["the two-player game did not run"]
     g1.p.wait(timeout=60)
     time.sleep(3)
     back = Proc(binary, base, "g1", ["--join", code, "--name", "G1"], 40)
@@ -157,6 +161,29 @@ def phase_return(binary, base, rom):
     if not last or not last["resumed"]:
         problems.append(f"the returning player did not continue the host's game (its last frame: {back.shot})")
     same_hashes([h, back], problems)
+    return problems
+
+
+def phase_killed(binary, base, rom):
+    h, code = host(binary, base, rom, ["--autostart", "2"], 85)
+    if not code:
+        return finish([h], 5) + ["no room code"]
+    g1 = Proc(binary, base, "g1", ["--join", code, "--name", "G1"], 80)
+    if not h.wait_for(r"frame 300 hash", 40):
+        return finish([h, g1], 100) + ["the two-player game did not run"]
+    g1.p.kill()
+    time.sleep(5)
+    g2 = Proc(binary, base, "g2", ["--join", code, "--name", "G2"], 45)
+    problems = finish([h, g2], 140)
+    if len(h.games()) != 2:
+        problems.append(f"host played {len(h.games())} games, expected 2 (its last frame: {h.shot})")
+    for pr in (h, g2):
+        last = pr.games()[-1] if pr.games() else None
+        if not last or sorted(set(last["slots"])) != [0, 2]:
+            problems.append(f"{pr.tag}: the last game has controllers {last and last['slots']}, expected the host and the newcomer")
+        elif not last["resumed"]:
+            problems.append(f"{pr.tag}: the game did not continue from the host's state")
+    same_hashes([h, g2], problems)
     return problems
 
 
@@ -181,13 +208,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
     ap.add_argument("rom")
-    ap.add_argument("--phases", default="SJRHO")
+    ap.add_argument("--phases", default="SJRKHO")
     ap.add_argument("--base", default="/tmp/ebobo-netroom")
     a = ap.parse_args()
     phases = {
         "S": ("two players on each of two devices", lambda b: phase_seats(a.binary, b, a.rom)),
         "J": ("a third device joins a running game", lambda b: phase_join(a.binary, b, a.rom)),
         "R": ("a guest quits and comes back", lambda b: phase_return(a.binary, b, a.rom)),
+        "K": ("a guest is killed and another device joins", lambda b: phase_killed(a.binary, b, a.rom)),
         "H": ("saves for the host only", lambda b: phase_saves(a.binary, b, a.rom, "host")),
         "O": ("saves off", lambda b: phase_saves(a.binary, b, a.rom, "off")),
     }

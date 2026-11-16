@@ -529,7 +529,9 @@ impl Mesh {
         self.events.push(MeshEvent::PeerLeft { id });
     }
 
-    fn forget_route(&mut self, id: PeerId) {
+    /// Stops sending to `id` (it said BYE or stopped answering); a device that joins under
+    /// this id later gets a new route.
+    pub(crate) fn forget_route(&mut self, id: PeerId) {
         if self.routes.remove(&id).is_some() {
             self.transport.remove_route(id);
         }
@@ -902,6 +904,12 @@ impl Link {
     /// The host called everyone back to the room (`{"t":"regroup"}`) since the last call.
     pub fn take_regroup(&mut self) -> bool {
         std::mem::take(&mut self.regroup)
+    }
+
+    /// Stops sending to a player who stopped answering. A device that joins the room under
+    /// that id later gets a new route and counts as a newcomer (`take_knocks`).
+    pub fn forget(&mut self, peer: PeerId) {
+        self.mesh.forget_route(peer);
     }
 
     /// Gives the mesh back to the lobby (the game returns to the room on the same routes).

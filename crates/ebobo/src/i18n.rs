@@ -107,10 +107,10 @@ static SYSTEM_LANG: LazyLock<Lang> = LazyLock::new(|| {
             if v.is_empty() || v == "C" || v == "POSIX" {
                 continue;
             }
-            return if v.to_ascii_lowercase().starts_with("ru") { Lang::Ru } else { mac_lang().unwrap_or(Lang::En) };
+            return if v.to_ascii_lowercase().starts_with("ru") { Lang::Ru } else { os_lang().unwrap_or(Lang::En) };
         }
     }
-    mac_lang().unwrap_or(Lang::En)
+    os_lang().unwrap_or(Lang::En)
 });
 
 fn system_lang() -> Lang {
@@ -120,7 +120,7 @@ fn system_lang() -> Lang {
 /// macOS preferred languages (`defaults read -g AppleLanguages`): Russian when the first
 /// listed language is Russian or any listed one is when no env var decides.
 #[cfg(target_os = "macos")]
-fn mac_lang() -> Option<Lang> {
+fn os_lang() -> Option<Lang> {
     let out = std::process::Command::new("defaults").args(["read", "-g", "AppleLanguages"]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
     if text.contains("ru") {
@@ -130,8 +130,15 @@ fn mac_lang() -> Option<Lang> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn mac_lang() -> Option<Lang> {
+/// Windows sets no language variable: Russian when it is among the user's preferred languages
+/// (asked through SDL).
+#[cfg(windows)]
+fn os_lang() -> Option<Lang> {
+    sdl2::locale::get_preferred_locales().any(|l| l.lang.eq_ignore_ascii_case("ru")).then_some(Lang::Ru)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn os_lang() -> Option<Lang> {
     None
 }
 
@@ -314,6 +321,9 @@ pub(crate) enum S {
     NetLoaded,
     ResumedLast,
     ResumedSave,
+    GameGoesOn,
+    BackInRoomJoining,
+    BackInRoomByHost,
     FilterAll,
     FilterRecent,
     SystemNes,
@@ -563,6 +573,9 @@ impl S {
             NetLoaded => ("{name} загрузил сохранение", "{name} loaded the save"),
             ResumedLast => ("Продолжаем прошлую игру", "Back to the last moment"),
             ResumedSave => ("Продолжаем с сохранения", "Continuing from the save"),
+            GameGoesOn => ("Игра продолжается", "The game goes on"),
+            BackInRoomJoining => ("К игре подключаются", "Someone is joining"),
+            BackInRoomByHost => ("Хост вернул всех в комнату", "The host called everyone back"),
             FilterAll => ("Все", "All"),
             FilterRecent => ("Недавние", "Recent"),
             SystemNes => ("NES", "NES"),

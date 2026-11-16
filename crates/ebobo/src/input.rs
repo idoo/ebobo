@@ -576,6 +576,24 @@ impl Seats {
     }
 }
 
+/// The seat owner id of the keyboard (gamepads have SDL's instance ids, counted from 0).
+const KEYBOARD: u32 = u32::MAX;
+
+/// The seat the keyboard's keys play on. Alone at a device (`sits` false) it is seat 1,
+/// together with whatever gamepad sits there, so either works for one player. Where two or
+/// more play at this device online (`sits`), the keyboard is a device like a gamepad: its
+/// first game key (`pressed`, while `seating`) takes the lowest free seat, and it has none
+/// before that.
+fn keyboard_seat(seats: &mut Seats, sits: bool, seat: &mut Option<usize>, seating: bool, pressed: bool) -> Option<usize> {
+    if !sits {
+        return Some(0);
+    }
+    if seat.is_none() && seating && pressed {
+        *seat = seats.sit(KEYBOARD, "keyboard");
+    }
+    *seat
+}
+
 /// Controller family from what SDL reports: the controller name and SDL's controller type.
 /// A Deck's own controls, and on a Deck every Steam virtual gamepad, are `SteamDeck`. This is
 /// the answer when Steam publishes nothing about the real controller behind a virtual pad;
@@ -832,6 +850,9 @@ pub struct Input {
     seats: Seats,
     /// Pads may take seats (a game runs, menu hidden).
     seating: bool,
+    /// The keyboard takes a seat of its own (`keyboard_seat`), and the one it has.
+    keyboard_sits: bool,
+    keyboard_at: Option<usize>,
     /// Gamepad used last (instance id, kind); `None` after a keyboard key.
     hint: Option<(u32, PadKind)>,
     turbo: Turbo,
@@ -886,6 +907,8 @@ impl Input {
             pads: Vec::new(),
             seats: Seats::default(),
             seating: false,
+            keyboard_sits: false,
+            keyboard_at: None,
             hint: None,
             turbo: Turbo::default(),
             repeat: Default::default(),
@@ -1014,13 +1037,24 @@ impl Input {
         self.seating = on;
     }
 
-    /// Every gamepad loses its seat (a game starts); the next one to press a button is player 1.
+    /// Every gamepad and the keyboard lose their seats (a game starts); the next one to press
+    /// a button is player 1.
     pub fn reset_seats(&mut self) {
         self.seats.clear();
+        self.keyboard_at = None;
         for p in &mut self.pads {
             p.info.slot = None;
             show_seat(&mut p.ctrl, None);
         }
+    }
+
+    /// Whether the keyboard is a player's device of its own (two or more play at this device
+    /// online) or plays seat 1 together with a gamepad (`keyboard_seat`).
+    pub fn set_keyboard_sits(&mut self, sits: bool) {
+        if !sits && self.keyboard_at.take().is_some() {
+            self.seats.release(KEYBOARD);
+        }
+        self.keyboard_sits = sits;
     }
 
     /// Drains SDL events. `dt` = time since the previous call (auto-repeat, hold timers);
@@ -1171,7 +1205,11 @@ impl Input {
 
         f.turbo_on = self.turbo.tick();
         let ks = events.keyboard_state();
-        (f.pads[0], f.turbo[0]) = key_bits(self.system, |sc| ks.is_scancode_pressed(sc));
+        let (keys, key_turbo) = key_bits(self.system, |sc| ks.is_scancode_pressed(sc));
+        let pressed = keys != 0 || key_turbo != 0;
+        if let Some(seat) = keyboard_seat(&mut self.seats, self.keyboard_sits, &mut self.keyboard_at, self.seating, pressed) {
+            (f.pads[seat], f.turbo[seat]) = (keys, key_turbo);
+        }
         f.rewind = ks.is_scancode_pressed(Scancode::Backspace) && !self.text_on;
         f.fast_forward = ks.is_scancode_pressed(Scancode::Tab);
         let mut dirs = [
@@ -1407,6 +1445,33 @@ mod tests {
         assert_eq!(mask_combo(u16::from(pad::START)), u16::from(pad::START));
         let b = PadButtons { back: true, start: true, south: true, ..Default::default() };
         assert_eq!(mask_combo(u16::from(pad_bits(&b, PadKind::Xbox).0)), u16::from(pad::A));
+    }
+
+    #[test]
+    fn input_keyboard_takes_its_own_seat_only_where_several_play() {
+        // One player at the device: the keyboard is seat 1 whoever else sits there.
+        let mut s = Seats::default();
+        let mut at = None;
+        assert_eq!(s.sit(10, "pad"), Some(0));
+        assert_eq!(keyboard_seat(&mut s, false, &mut at, true, true), Some(0));
+        assert_eq!(s.sit(11, "pad2"), Some(1), "it took no seat");
+
+        // Several players: no seat before its first game key, and none taken with the menu up.
+        let mut s = Seats::default();
+        let mut at = None;
+        assert_eq!(keyboard_seat(&mut s, true, &mut at, true, false), None);
+        assert_eq!(keyboard_seat(&mut s, true, &mut at, false, true), None);
+        // A gamepad pressed first is player 1, the keyboard player 2, and it keeps that seat.
+        assert_eq!(s.sit(10, "pad"), Some(0));
+        assert_eq!(keyboard_seat(&mut s, true, &mut at, true, true), Some(1));
+        assert_eq!(keyboard_seat(&mut s, true, &mut at, true, false), Some(1));
+        assert_eq!(s.sit(11, "pad2"), Some(2));
+
+        // The keyboard pressed first is player 1 and the gamepad after it player 2.
+        let mut s = Seats::default();
+        let mut at = None;
+        assert_eq!(keyboard_seat(&mut s, true, &mut at, true, true), Some(0));
+        assert_eq!(s.sit(10, "pad"), Some(1));
     }
 
     #[test]

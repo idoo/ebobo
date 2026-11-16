@@ -284,7 +284,7 @@ estimator steady samples for the input delay.
 Host → every guest whenever anything changes (lobby UI):
 
 ```json
-{"t":"players","list":[{"id":0,"name":"Ivan","route":"self","rtt":0,"ready":true,"seats":1},{"id":1,"name":"Sasha","route":"direct","rtt":34,"ready":true,"seats":2}],"resume":{"kind":"last","saved_at":1794690000},"order":[0,1,1],"saves":"all"}
+{"t":"players","list":[{"id":0,"name":"Ivan","route":"self","rtt":0,"ready":true,"seats":1},{"id":1,"name":"Sasha","route":"direct","rtt":34,"ready":true,"seats":2}],"resume":{"kind":"last","saved_at":1794690000},"order":[0,1,1],"saves":"all","regrouped":false}
 ```
 
 `resume` is what the host will start from: `null` for a new game, or its saved game: `kind`
@@ -293,7 +293,9 @@ for everyone", section 5) and when it was saved in Unix seconds. Guests only sho
 `seats` = the local players that device brings (seats the host gave it). `order[i]` = peer id on
 seat i (controller i+1), one entry per seat; `254` is an empty seat (only in a regrouped room).
 `saves` = who may save in the game: `all` (every
-player, the default when missing), `host` (only the host) or `off` (nobody).
+player, the default when missing), `host` (only the host) or `off` (nobody). `regrouped` = the
+room came back from a running game, which Start continues (a device that joined during the
+game learns it from this; missing means false).
 
 The host may start when ≥ 2 peers are present and every guest is ready with links to all other
 present peers (empty seats are nobody). It sends to every guest:

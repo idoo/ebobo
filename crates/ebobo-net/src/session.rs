@@ -499,7 +499,11 @@ impl NetSession {
         }
         let (knocks, regroup) =
             self.link.borrow_mut().as_mut().map(|l| (l.take_knocks(), l.take_regroup())).unwrap_or_default();
-        self.pending.extend(knocks.into_iter().map(|peer| NetEvent::Knock { peer }));
+        // A route that comes up for a device still in the game is not a newcomer.
+        let playing = |peer: PeerId| self.slots.iter().zip(&self.gone).any(|(p, gone)| *p == peer && !gone);
+        let knocks: Vec<NetEvent> =
+            knocks.into_iter().filter(|p| !playing(*p)).map(|peer| NetEvent::Knock { peer }).collect();
+        self.pending.extend(knocks);
         if regroup {
             self.pending.push(NetEvent::Regroup);
         }
@@ -700,6 +704,11 @@ impl NetSession {
                 GgrsEvent::NetworkResumed { addr } => NetEvent::Resumed { peer: addr },
                 GgrsEvent::Disconnected { addr } => {
                     self.mark_gone(addr);
+                    // Timed out: nothing more goes to it, and its id may come back as a new
+                    // device.
+                    if let Some(link) = self.link.borrow_mut().as_mut() {
+                        link.forget(addr);
+                    }
                     NetEvent::Disconnected { peer: addr }
                 }
                 GgrsEvent::DesyncDetected { frame, .. } => NetEvent::Desync { frame },

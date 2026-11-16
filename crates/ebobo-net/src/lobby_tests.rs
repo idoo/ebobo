@@ -769,6 +769,34 @@ fn regrouped_newcomer_takes_empty_seat_and_leaving_keeps_gaps() {
     assert_eq!(h.order, [PeerId(0), PeerId(3)]);
 }
 
+/// A player who stopped answering was forgotten by the game's link: back in the room nobody
+/// waits for it and its seat stays free. One whose id is routed again (it joined anew during
+/// the game) is taken in like a newcomer and gets its old seat.
+#[test]
+fn regroup_tells_a_silent_player_from_one_who_came_back() {
+    let addr = |port| std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let link = || {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        Link::udp(udp, PeerId(0), &[(PeerId(1), addr(9)), (PeerId(2), addr(10))])
+    };
+    let mut h = host_worker(&[1, 2]);
+    h.launch(None);
+    let mut silent = link();
+    silent.forget(PeerId(1));
+    h.regroup(silent, vec![PeerId(1)], None);
+    assert_eq!(h.order, [PeerId(0), E, PeerId(2)]);
+    assert!(!h.peers.contains_key(&PeerId(1)));
+    h.on_ctrl(PeerId(2), &json!({"t": "ready", "links": [0]}));
+    assert!(h.can_start(), "nobody waits for the silent player");
+
+    let mut h = host_worker(&[1, 2]);
+    h.launch(None);
+    h.regroup(link(), vec![PeerId(1)], None);
+    assert_eq!(h.order, [PeerId(0), PeerId(1), PeerId(2)]);
+    assert!(!h.peers[&PeerId(1)].ready, "it joins like any guest: ROM check, then ready");
+    assert!(!h.can_start());
+}
+
 /// Two real lobbies play, come back to the room on the game's routes and start again from the
 /// host's state.
 #[test]

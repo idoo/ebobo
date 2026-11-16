@@ -183,6 +183,9 @@ struct App {
     /// Host: the game went back to the room for a newcomer, so it starts again by itself as
     /// soon as the room can start.
     auto_continue: bool,
+    /// This device played the game the room came back from (cleared when the room is left):
+    /// when the game goes on, its players keep their seats and are not told the menu key again.
+    played_before: bool,
     /// Running network check (Settings ▸ Advanced ▸ Network check).
     net_check: Option<mpsc::Receiver<NetDiag>>,
     /// Self-update from GitHub releases (checked on start unless `config.auto_update` is off).
@@ -386,6 +389,7 @@ impl App {
             autostart: cli.autostart,
             room_printed: false,
             auto_continue: false,
+            played_before: false,
             net_check: None,
             updater,
             mouse_at: None,
@@ -727,7 +731,7 @@ impl App {
             self.lobby_status = None;
             // The room handle moves into the game: the room is not left.
             if let State::Lobby(lobby) = std::mem::replace(&mut self.state, State::Menu) {
-                self.start_net(start, lobby);
+                self.start_net(start, lobby, status.regrouped);
             }
             return;
         }
@@ -1024,6 +1028,7 @@ impl App {
         }
         self.game_started(solo.console.system(), solo.console.crc32());
         self.input.reset_seats();
+        self.input.set_keyboard_sits(false);
         self.pads = self.input.pads();
         self.state = State::Solo(Box::new(solo));
         self.ui.hide();
@@ -1099,9 +1104,11 @@ impl App {
 
     /// Starts the netplay game, from `start.state` when the host continues a saved game.
     /// `lobby` is the room it starts from; when the game cannot start, the room is left.
-    fn start_net(&mut self, start: GameStart, lobby: Lobby) {
+    /// `regrouped`: the room came back from this very game, which now goes on.
+    fn start_net(&mut self, start: GameStart, lobby: Lobby, regrouped: bool) {
         let resume = start.resume.map(|r| r.kind);
         self.auto_continue = false;
+        let played_before = std::mem::take(&mut self.played_before);
         if let Some(audio) = &mut self.audio {
             audio.clear();
         }
@@ -1135,7 +1142,11 @@ impl App {
                     let kind = resume.unwrap_or(ResumeKind::Save);
                     println!("ebobo: resumed {} sha {}", netsave::kind_name(kind), netsave::sha16(state));
                     let _ = std::io::Write::flush(&mut std::io::stdout());
-                    let text = if kind == ResumeKind::Last { Text::ResumedLast } else { Text::ResumedSave };
+                    let text = match kind {
+                        _ if regrouped => Text::GameGoesOn,
+                        ResumeKind::Last => Text::ResumedLast,
+                        ResumeKind::Save => Text::ResumedSave,
+                    };
                     self.ui.toast_secs(self.ui.text(text), MENU_HINT_SECS);
                     Some(console.snapshot())
                 }
@@ -1156,7 +1167,12 @@ impl App {
             }
         };
         self.game_started(console.system(), console.crc32());
-        self.input.reset_seats();
+        // A game that goes on after the room keeps who sits where at this device.
+        if !played_before {
+            self.input.reset_seats();
+        }
+        let here = start.slots.iter().enumerate().filter(|(i, p)| **p == start.me && !start.idle.contains(i)).count();
+        self.input.set_keyboard_sits(here >= 2);
         self.pads = self.input.pads();
         self.state = State::Net(Box::new(Net {
             console,
@@ -1183,7 +1199,8 @@ impl App {
             last_advance: Instant::now(),
         }));
         self.ui.hide();
-        self.menu_hint = true;
+        // Players of a game that goes on were told how to open the menu when it began.
+        self.menu_hint = !played_before;
         self.video.power_on();
     }
 
@@ -1229,6 +1246,7 @@ impl App {
         }
         self.lobby_status = None;
         self.auto_continue = false;
+        self.played_before = false;
         if let Some(audio) = &mut self.audio {
             audio.clear();
         }
@@ -1243,7 +1261,19 @@ impl App {
             return;
         }
         let State::Net(net) = std::mem::replace(&mut self.state, State::Menu) else { return };
-        let Net { console, session, lobby, me, gone, saves, .. } = *net;
+        let Net { console, session, lobby, me, mut gone, interrupted, saves, .. } = *net;
+        let mut link = session.into_link();
+        // The host does not wait in the room for a player who has stopped answering (a crash,
+        // a dead connection): the room would stay closed to the game until the server gives
+        // that player up. Its seat is kept free, and it gets it back when it joins again.
+        if me == PeerId(0) {
+            for (peer, _) in interrupted {
+                link.forget(peer);
+                if !gone.contains(&peer) {
+                    gone.push(peer);
+                }
+            }
+        }
         let resume = (me == PeerId(0)).then(|| {
             let state = console.save_state();
             if saves != SavePolicy::Off {
@@ -1257,10 +1287,17 @@ impl App {
             Resume { kind: ResumeKind::Last, saved_at, state }
         });
         self.auto_continue = auto && resume.is_some();
-        lobby.regroup(session.into_link(), gone, resume);
+        self.played_before = true;
+        lobby.regroup(link, gone, resume);
         self.lobby_status = Some(lobby.status());
         self.state = State::Lobby(lobby);
         self.ui.show_lobby();
+        // Nobody here asked for the room: say why the game stopped.
+        if me != PeerId(0) {
+            self.ui.toast(self.ui.text(Text::BackInRoomByHost));
+        } else if auto {
+            self.ui.toast(self.ui.text(Text::BackInRoomJoining));
+        }
         if let Some(audio) = &mut self.audio {
             audio.clear();
         }

@@ -150,9 +150,15 @@ pub enum Text {
     /// "{name} saved for everyone" / "{name} loaded the save" (netplay, `{name}` = the player).
     NetSaved,
     NetLoaded,
-    /// A netplay game started from the last moment / from the save.
+    /// A netplay game started from the last moment / from the save / went on after everyone
+    /// was back in the room.
     ResumedLast,
     ResumedSave,
+    GameGoesOn,
+    /// A running game went back to its room: a device is joining (the host sees this) / the
+    /// host took everyone back (a guest sees this).
+    BackInRoomJoining,
+    BackInRoomByHost,
     /// A game's file was deleted / could not be deleted.
     FileDeleted,
     CantDelete,
@@ -796,6 +802,9 @@ impl Ui {
             Text::NetLoaded => S::NetLoaded,
             Text::ResumedLast => S::ResumedLast,
             Text::ResumedSave => S::ResumedSave,
+            Text::GameGoesOn => S::GameGoesOn,
+            Text::BackInRoomJoining => S::BackInRoomJoining,
+            Text::BackInRoomByHost => S::BackInRoomByHost,
             Text::FileDeleted => S::FileDeleted,
             Text::CantDelete => S::CantDelete,
             Text::CodeCopied => S::CodeCopied,
@@ -1022,7 +1031,9 @@ impl Ui {
         let visible = self.is_visible();
         if visible {
             if ctx.game.is_some() {
-                canvas.dim(0.65);
+                // Dark enough that grey lines (the game's name, rows that cannot be chosen)
+                // read over a white picture too.
+                canvas.dim(0.8);
             } else {
                 canvas.clear(BG);
             }

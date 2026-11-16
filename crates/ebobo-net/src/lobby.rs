@@ -1225,6 +1225,9 @@ impl Worker {
                     self.order = order.iter().filter_map(Value::as_u64).map(|x| PeerId(x as u8)).collect();
                 }
                 self.saves = SavePolicy::parse(v["saves"].as_str());
+                // A device that joined a running game learns it here; the players of that
+                // game know already.
+                self.regrouped |= v["regrouped"].as_bool().unwrap_or(false);
             }
             // The host calls the players of a running game back to the room. The game's link
             // acts on it; a copy that reaches this lobby means the lobby is already back.
@@ -1540,7 +1543,7 @@ impl Worker {
         let order: Vec<u8> = self.order.iter().map(|p| p.0).collect();
         let text = json!({
             "t": "players", "list": list, "resume": resume_json(self.resume_info()),
-            "order": order, "saves": self.saves.as_str(),
+            "order": order, "saves": self.saves.as_str(), "regrouped": self.regrouped,
         });
         let key = text.to_string();
         let targets: Vec<PeerId> = self
@@ -1750,6 +1753,8 @@ impl Worker {
         }
         veterans.retain(|id| !gone.contains(id));
         self.veterans = veterans;
+        // A gone player's id that is routed again is a device that joined during the game
+        // (the same player back, as a new process): it is welcomed below like any newcomer.
         let mesh = link.into_mesh();
         let routes = mesh.routed();
         self.mesh = Some(mesh);
