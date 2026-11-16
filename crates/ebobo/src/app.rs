@@ -203,6 +203,8 @@ struct App {
     host_resume: Vec<Resume>,
     /// Players at this device in an online room (1-4): `--seats`, then the room's row.
     seats_here: u8,
+    /// This run is the first of a new version over an older install: `begin` says what is new.
+    whats_new: bool,
 }
 
 /// Runs the app; returns the process exit code.
@@ -311,6 +313,9 @@ fn format_text(template: &str, name: &str, secs: u64) -> String {
 
 impl App {
     fn new(cli: &cli::Cli) -> Result<App, String> {
+        // Asked first, once per run in every kind of start: the library and the shelf below
+        // write the files a brand-new install is told apart by.
+        let whats_new = crate::whatsnew::due(&config::data_dir(), VERSION);
         let config_saved = Config::load();
         let mut config = config_saved.clone();
         cli.apply(&mut config);
@@ -391,6 +396,7 @@ impl App {
             script: cli.script.clone(),
             host_resume: Vec::new(),
             seats_here: cli.seats.unwrap_or(1),
+            whats_new,
         })
     }
 
@@ -410,11 +416,9 @@ impl App {
                 None
             }
         };
-        // Once per run in every kind of start, so the version counts as seen either way.
-        let whats_new = crate::whatsnew::due(&config::data_dir(), VERSION);
         match start {
             Start::Menu => {
-                if whats_new {
+                if self.whats_new {
                     self.ui.whats_new(VERSION);
                 }
             }
@@ -1378,7 +1382,9 @@ impl App {
                     self.regroup(auto);
                     return;
                 }
-                if n.slots.iter().all(|p| *p == n.me || n.gone.contains(p)) {
+                // A guest left alone has nobody to play with. The host plays on: the room is
+                // open, and whoever left can join again with the same code.
+                if n.me != PeerId(0) && n.slots.iter().all(|p| *p == n.me || n.gone.contains(p)) {
                     let text = format_text(self.ui.text(Text::PeerLeft), &n.others(), 0);
                     self.end_game();
                     self.ui.show_main();

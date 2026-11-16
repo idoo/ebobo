@@ -2133,7 +2133,7 @@ impl Ui {
             f.draw(c, 12, y, &(i + 1).to_string(), if on { WHITE } else { SLOT[i] }, 1);
             let Some(&peer) = lobby.order.get(i) else {
                 if i == lobby.order.len() {
-                    f.draw(c, 28, y, self.t(S::Waiting), DIS, 1);
+                    f.draw(c, 32, y, self.t(S::Waiting), DIS, 1);
                 }
                 continue;
             };
@@ -2141,11 +2141,11 @@ impl Ui {
                 h.push((row_area(y, 16), Hit::Row { i: RoomRow::Seat(i).id(), back: None, enabled: true }));
             }
             if on {
-                tri(c, 21, y, WHITE, false);
+                tri(c, 23, y, WHITE, false);
                 tri(c, 228, y, WHITE, true);
             }
             if peer == EMPTY_SEAT {
-                f.draw(c, 28, y, self.t(S::SeatFree), if on { SEC } else { DIS }, 1);
+                f.draw(c, 32, y, self.t(S::SeatFree), if on { WHITE } else { DIS }, 1);
                 continue;
             }
             let Some(p) = lobby.players.iter().find(|p| p.id == peer) else { continue };
@@ -2173,8 +2173,9 @@ impl Ui {
             }
             let width: i32 = right.iter().map(|(s, _)| f.width(s, 1) + 8).sum();
             let mut x = 224 + 8 - width;
+            // On the accent bar only white reads.
             for (s, col) in &right {
-                f.draw(c, x, y, s, *col, 1);
+                f.draw(c, x, y, s, if on { WHITE } else { *col }, 1);
                 x += f.width(s, 1) + 8;
             }
             let suffix = match nth {
@@ -2182,11 +2183,11 @@ impl Ui {
                 0 => String::new(),
                 n => format!(" {}", n + 1),
             };
-            let cols = ((224 - width - 28) / 8 - 1).max(4) as usize;
+            let cols = ((224 - width - 32) / 8 - 1).max(4) as usize;
             let name = format!("{}{suffix}", trunc(&p.name, cols.saturating_sub(suffix.chars().count()).max(3)));
-            f.draw(c, 28, y, &name, if p.away { SEC } else { WHITE }, 1);
+            f.draw(c, 32, y, &name, if p.away && !on { SEC } else { WHITE }, 1);
             if p.ready && nth == 0 {
-                tick(c, 236, y, OK);
+                tick(c, 236, y, if on { WHITE } else { OK });
             }
         }
         if let Some(rom) = &lobby.rom_name {
@@ -4372,6 +4373,7 @@ mod tests {
             let rooms = [
                 ("room-alone", &alone, None),
                 ("room-seats", &seats, Some(RoomRow::Seat(1))),
+                ("room-seat3", &seats, Some(RoomRow::Seat(2))),
                 ("room-guest", &guest_view, None),
                 ("room-regroup", &regroup, Some(RoomRow::Seat(1))),
                 ("room-rom", &receiving, None),
