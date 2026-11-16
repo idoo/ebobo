@@ -366,10 +366,18 @@ impl Mesh {
         self.transport.send_text(json!({"t": "lock"}).to_string());
     }
 
+    /// Every peer with a decided route.
+    pub(crate) fn routed(&self) -> Vec<(PeerId, RouteKind)> {
+        let mut list: Vec<(PeerId, RouteKind)> =
+            self.routes.keys().filter_map(|&id| Some((id, self.transport.route_kind(id)?))).collect();
+        list.sort_by_key(|(id, _)| *id);
+        list
+    }
+
     /// Hands the live mesh (routes, relay WebSocket, route health) to the game.
     pub(crate) fn into_link(mut self) -> Link {
         self.in_game = true;
-        Link { mesh: self, departed: Vec::new() }
+        Link { mesh: self, departed: Vec::new(), knocks: Vec::new(), regroup: false }
     }
 
     /// Leaves: BYE to peers, closes the WebSocket.
@@ -857,9 +865,13 @@ impl Mesh {
 /// The mesh as the game sees it (`GameStart::link`): `NetSession` drives it on every poll, so
 /// signaling (`route`), route health, re-punching, relay mirroring and roaming keep running in
 /// game; only GGRS and BYE packets reach GGRS. `Send`, so the lobby thread can hand it over.
+/// The room stays open while the game runs: a device that joins it gets its routes as usual
+/// and shows up in `take_knocks`.
 pub struct Link {
     mesh: Mesh,
     departed: Vec<PeerId>,
+    knocks: Vec<PeerId>,
+    regroup: bool,
 }
 
 impl Link {
@@ -886,6 +898,23 @@ impl Link {
         std::mem::take(&mut self.departed)
     }
 
+    /// Devices that joined the room since the last call: the route to each is decided, so the
+    /// room screen can take them in.
+    pub fn take_knocks(&mut self) -> Vec<PeerId> {
+        std::mem::take(&mut self.knocks)
+    }
+
+    /// The host called everyone back to the room (`{"t":"regroup"}`) since the last call.
+    pub fn take_regroup(&mut self) -> bool {
+        std::mem::take(&mut self.regroup)
+    }
+
+    /// Gives the mesh back to the lobby (the game returns to the room on the same routes).
+    pub(crate) fn into_mesh(mut self) -> Mesh {
+        self.mesh.in_game = false;
+        self.mesh
+    }
+
     /// BYE to every routed peer, closes the relay WebSocket.
     pub fn close(self) {
         self.mesh.close();
@@ -903,11 +932,23 @@ impl ggrs::NonBlockingSocket<PeerId> for Link {
     }
 
     /// Polls the mesh (signaling, punches, keepalives, health), decodes GGRS packets, records
-    /// BYE senders for `take_departed`, ignores the rest (late CTRL etc.).
+    /// BYE senders for `take_departed`, newcomers for `take_knocks` and the host's call back to
+    /// the room, ignores the rest (late CTRL etc.).
     fn receive_all_messages(&mut self) -> Vec<(PeerId, ggrs::Message)> {
         let mut out = Vec::new();
         for ev in self.mesh.poll() {
-            let MeshEvent::Packet { from, data } = ev else { continue };
+            let (from, data) = match ev {
+                MeshEvent::Packet { from, data } => (from, data),
+                // Every pair of players was routed before the start, so a route that comes up
+                // now belongs to a device that joined the room during the game.
+                MeshEvent::RouteUp { id, .. } => {
+                    if !self.knocks.contains(&id) {
+                        self.knocks.push(id);
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
             match Packet::parse(&data) {
                 Some(Packet::Ggrs(body)) => {
                     if let Ok(m) = bincode::deserialize::<ggrs::Message>(body) {
@@ -919,6 +960,12 @@ impl ggrs::NonBlockingSocket<PeerId> for Link {
                         self.departed.push(from);
                     }
                     self.mesh.forget_route(from);
+                }
+                // Not acked here: the host repeats it until the lobby, which owns the CTRL
+                // sequence numbers, has the mesh again and acks it.
+                Some(Packet::Ctrl { json, .. }) if from == PeerId(0) => {
+                    let called = serde_json::from_slice::<Value>(json).is_ok_and(|v| v["t"] == "regroup");
+                    self.regroup |= called;
                 }
                 _ => {}
             }
