@@ -325,11 +325,17 @@ fn bare_worker(is_host: bool, me: u8) -> Worker {
     w
 }
 
-/// Host with `guests` routed, ready and linked to everyone: startable.
-fn host_worker(guests: &[u8]) -> Worker {
+/// Host with a ROM and no guests yet.
+fn host_alone() -> Worker {
     let mut w = bare_worker(true, 0);
     w.host_rom =
         Some(HostRom { bytes: vec![0; 16], name: "t.nes".into(), crc: 0, region: Region::Ntsc, four_score: false });
+    w
+}
+
+/// Host with `guests` routed, ready and linked to everyone: startable.
+fn host_worker(guests: &[u8]) -> Worker {
+    let mut w = host_alone();
     for &g in guests {
         add_guest(&mut w, g, guests);
     }
@@ -615,6 +621,123 @@ fn guests_see_the_hosts_resume_choice() {
 
     h.set_resume(None);
     assert_eq!(deliver(&mut h, &mut g, 1), None);
+}
+
+/// The host's `players` message as guest `g` (peer `to`) receives it.
+fn deliver_players(h: &mut Worker, g: &mut Worker, to: u8) -> LobbyStatus {
+    h.broadcast_players();
+    let text = h.peers[&PeerId(to)].sent_players.clone().expect("players sent");
+    g.on_ctrl(PeerId(0), &serde_json::from_str::<Value>(&text).unwrap());
+    g.snapshot()
+}
+
+fn seats_msg(n: u64) -> Value {
+    json!({"t": "seats", "n": n})
+}
+
+/// A guest asking for more seats gets them while seats are free, and gives its last ones back
+/// when it asks for fewer; its own status shows the same seats.
+#[test]
+fn guest_seats_grow_shrink_and_stop_at_four() {
+    let mut h = host_worker(&[1]);
+    let mut g = guest_worker();
+    h.on_ctrl(PeerId(1), &seats_msg(2));
+    assert_eq!(h.order, vec![PeerId(0), PeerId(1), PeerId(1)]);
+    let st = deliver_players(&mut h, &mut g, 1);
+    assert_eq!(st.order, h.order);
+    assert_eq!(st.players.iter().map(|p| p.seats).collect::<Vec<_>>(), vec![1, 2]);
+    h.on_ctrl(PeerId(1), &seats_msg(1));
+    assert_eq!(h.order, vec![PeerId(0), PeerId(1)]);
+    h.on_ctrl(PeerId(1), &seats_msg(4));
+    assert_eq!(h.order, vec![PeerId(0), PeerId(1), PeerId(1), PeerId(1)], "only 3 seats were free");
+    assert!(h.can_start());
+}
+
+/// Every seat taken: a further guest is told `room_full` and fails, the room still starts
+/// without it, each device's players sit together and the extra ones are named "<name> 2".
+#[test]
+fn full_room_refuses_guest_and_starts_with_repeated_slots() {
+    // The host takes its second seat before the guest arrives, so its players sit together.
+    let mut h = host_alone();
+    h.nickname = "H".into();
+    h.set_seats(2);
+    add_guest(&mut h, 1, &[1]);
+    h.peers.get_mut(&PeerId(1)).unwrap().name = "G".into();
+    h.on_ctrl(PeerId(1), &seats_msg(2));
+    assert_eq!(h.order, vec![PeerId(0), PeerId(0), PeerId(1), PeerId(1)]);
+    h.on_event(MeshEvent::PeerJoined { id: PeerId(2), name: "Late".into() });
+    h.on_event(MeshEvent::RouteUp { id: PeerId(2), kind: RouteKind::Direct });
+    assert!(h.peers[&PeerId(2)].full);
+    assert_eq!(h.order.len(), 4);
+    assert!(h.can_start(), "the refused guest is not waited for");
+    assert_eq!(h.snapshot().players.len(), 2);
+
+    let mut late = bare_worker(false, 2);
+    late.on_ctrl(PeerId(0), &json!({"t": "error", "msg": "room_full"}));
+    assert_eq!((late.stage, late.error.clone()), (Stage::Failed, Some(NetError::RoomFull)));
+
+    h.start_game();
+    let ps = h.pending_start.as_ref().expect("start sent");
+    assert_eq!(ps.slots, vec![PeerId(0), PeerId(0), PeerId(1), PeerId(1)]);
+    assert!(ps.four_score);
+    assert_eq!(ps.acks.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![PeerId(1)]);
+    assert_eq!(h.slot_names(&ps.slots), ["H", "H 2", "G", "G 2"]);
+}
+
+/// The host reorders seats; the guest's status shows the same order. A guest cannot reorder.
+#[test]
+fn moved_seat_reaches_the_guest() {
+    let mut h = host_worker(&[1]);
+    let mut g = guest_worker();
+    h.on_ctrl(PeerId(1), &seats_msg(2));
+    h.move_seat(0, false);
+    assert_eq!(h.order, vec![PeerId(1), PeerId(0), PeerId(1)]);
+    h.move_seat(2, true);
+    assert_eq!(h.order, vec![PeerId(1), PeerId(1), PeerId(0)]);
+    h.move_seat(2, false);
+    h.move_seat(0, true);
+    assert_eq!(h.order, vec![PeerId(1), PeerId(1), PeerId(0)], "out of range does nothing");
+    assert_eq!(deliver_players(&mut h, &mut g, 1).order, h.order);
+    g.move_seat(0, false);
+    assert_eq!(g.order, h.order);
+    h.start_game();
+    assert_eq!(h.pending_start.as_ref().unwrap().slots, vec![PeerId(1), PeerId(1), PeerId(0)]);
+}
+
+/// The host's save policy reaches the guest's room screen and both games.
+#[test]
+fn lobby_direct_saves_policy_reaches_guest() {
+    let Some(rom) = nestest() else { return };
+    let port = free_port();
+    let mut host = Lobby::start(cfg(
+        "Host",
+        LobbyMode::HostDirect { port, rom: rom.clone(), rom_name: "nestest.nes".into() },
+        Box::new(|_| None),
+    ));
+    host.set_saves(SavePolicy::Host);
+    let mut guest = Lobby::start(cfg(
+        "Guest",
+        LobbyMode::JoinDirect { addr: format!("127.0.0.1:{port}") },
+        Box::new(move |_| Some(rom.clone())),
+    ));
+    guest.set_saves(SavePolicy::Off);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (h, g) = (host.status(), guest.status());
+        assert!(h.error.is_none() && g.error.is_none(), "{h:#?} {g:#?}");
+        if h.can_start && g.saves == SavePolicy::Host {
+            assert_eq!(h.saves, SavePolicy::Host);
+            break;
+        }
+        assert!(Instant::now() < deadline, "policy never arrived: {h:#?} {g:#?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    host.start_game();
+    for g in take_all(&mut [&mut host, &mut guest], 10) {
+        assert_eq!(g.saves, SavePolicy::Host);
+    }
+    host.leave();
+    guest.leave();
 }
 
 /// Direct mode (no server): a guest on another ebobo version refuses the host's `game`
