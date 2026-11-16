@@ -450,6 +450,12 @@ impl Ppu {
         self.scanline
     }
 
+    /// No pixel of a picture is being drawn: the lines after the last visible one, up to
+    /// the next picture's first.
+    pub fn between_pictures(&self) -> bool {
+        !(0..240).contains(&self.scanline)
+    }
+
     /// Current dot within the scanline, 0-340.
     #[cfg(test)]
     pub fn dot(&self) -> u16 {

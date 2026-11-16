@@ -152,10 +152,9 @@ impl Bus {
 
     pub fn set_fast_forward(&mut self, on: bool) {
         if on != self.fast_forward {
-            // A picture drawn partly leaves the planes mixed.
-            self.planes_whole = false;
+            self.fast_forward = on;
+            self.planes_restart();
         }
-        self.fast_forward = on;
         self.audio.set_muted(on);
     }
 
@@ -166,8 +165,16 @@ impl Bus {
             return;
         }
         self.tilt = on;
-        self.planes_whole = false;
         self.planes_valid = false;
+        self.planes_restart();
+    }
+
+    /// After a setting changed: the picture being drawn gets whole planes only if they are
+    /// written from here on and the change fell between two pictures. That is where the
+    /// frontend makes it, and rollback switches fast-forward before nearly every picture it
+    /// shows, so such a change must not cost the picture its planes.
+    fn planes_restart(&mut self) {
+        self.planes_whole = self.tilt && !self.fast_forward && self.s.ppu.between_pictures();
     }
 
     /// Background and sprite plane of the picture in [`Bus::frame`], once tilt is on and a
@@ -283,8 +290,9 @@ impl Bus {
                 s.frame_done = true;
                 // The picture ended; the next one starts with the settings as they are now.
                 let on = draw && self.tilt;
-                if on && self.planes_whole {
-                    self.planes_valid = true;
+                if on {
+                    // Planes written for only part of the picture are a mix of two.
+                    self.planes_valid = self.planes_whole;
                 }
                 self.planes_whole = on;
             }

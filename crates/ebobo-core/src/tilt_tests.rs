@@ -131,3 +131,19 @@ fn tilt_is_not_emulated_state() {
     on.set_tilt(false);
     assert!(on.bus.tilt_planes().is_none(), "off forgets the planes");
 }
+
+/// Rollback re-simulates with fast-forward and switches it off for the one picture it shows,
+/// frame after frame: every shown picture still gets its planes.
+#[test]
+fn tilt_planes_follow_pictures_between_skipped_frames() {
+    let Some(mut nes) = nes() else { return };
+    nes.set_tilt(true);
+    for n in 0..40 {
+        nes.set_fast_forward(true);
+        run(&mut nes, 2 * n, 2 * n + 1);
+        nes.set_fast_forward(false);
+        run(&mut nes, 2 * n + 1, 2 * n + 2);
+    }
+    assert!(nes.bus.tilt_planes().is_some(), "a picture between skipped frames has planes");
+    assert!(tilted(&nes, (0, 0)) == plain_middle(&nes), "and they are that picture's");
+}
