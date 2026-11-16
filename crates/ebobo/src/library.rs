@@ -402,6 +402,24 @@ impl Shared {
     }
 }
 
+/// The games the cache file remembers whose files are still as it saw them, in list order:
+/// what the library knows at once, before the first scan has looked into the folders.
+fn cached_entries(cache_path: &Path) -> Vec<RomEntry> {
+    let mut rows: Vec<(PathBuf, CacheRow)> = load_cache(cache_path).into_iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut list = Vec::new();
+    let mut crcs = HashSet::new();
+    for (path, row) in rows {
+        let Some(CachedRom { name, system, crc32, mapper, region }) = row.rom else { continue };
+        let same = fs::metadata(&path).is_ok_and(|m| m.len() == row.size && mtime_nanos(&m) == row.mtime);
+        if same && crcs.insert(crc32) {
+            let supported = supported(system, mapper);
+            insert_sorted(&mut list, RomEntry { path, name, system, crc32, mapper, supported, region, mtime: mtime_secs(row.mtime) });
+        }
+    }
+    list
+}
+
 /// Collects files with a ROM extension (`ROM_EXTS`) or `.zip`, ≤ 8 MiB, under `dir` in name
 /// order, depth-first.
 fn collect_files(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, u64, u128)>, budget: &mut usize) {
@@ -442,7 +460,7 @@ pub struct Library {
 }
 
 impl Library {
-    /// Starts scanning `dirs` on a background thread.
+    /// Starts with the games the cache file remembers and scans `dirs` on a background thread.
     pub fn new(dirs: Vec<PathBuf>) -> Library {
         Library::with_cache(dirs, crate::config::data_dir().join("library-cache.tsv"))
     }
@@ -451,8 +469,8 @@ impl Library {
         let lib = Library {
             shared: Arc::new(Shared {
                 dirs,
+                entries: Mutex::new(cached_entries(&cache_path)),
                 cache_path,
-                entries: Mutex::new(Vec::new()),
                 extra: Mutex::new(Vec::new()),
                 state: Mutex::new(ScanState::default()),
                 reads: AtomicUsize::new(0),

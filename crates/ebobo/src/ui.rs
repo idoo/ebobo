@@ -309,11 +309,19 @@ struct GameMenu {
     path: PathBuf,
     /// The name the game's file gave it (the last resort of `cards::shown_name`).
     name: String,
+    /// The game a room is created with: set in the solo library only, where the menu starts
+    /// with "Play online".
+    online: Option<RomEntry>,
     sel: usize,
 }
 
-/// The rows of a game's menu: favourite, rename, hide, delete.
-const GAME_MENU_ROWS: usize = 4;
+impl GameMenu {
+    /// How many rows the menu has: favourite, rename, hide, delete, and "Play online" first
+    /// in the solo library.
+    fn rows(&self) -> usize {
+        4 + usize::from(self.online.is_some())
+    }
+}
 
 /// The two answers of a confirmation box: the first performs `action`, the second (the safe
 /// one, preselected) closes the box.
@@ -568,9 +576,14 @@ impl Ui {
         self.press = None;
     }
 
-    /// Main menu on top (no game, lobby or submenu): the self-updater may relaunch now.
-    pub fn on_main(&self) -> bool {
-        self.stack == [Screen::Main]
+    /// The user is idle at a start screen (the main menu, or the solo library with no box,
+    /// game menu or search on it): the self-updater may relaunch now.
+    pub fn idle_at_home(&self) -> bool {
+        match self.stack.as_slice() {
+            [Screen::Main] => true,
+            [Screen::Main, Screen::Picker(Purpose::Solo)] => self.modal.is_none() && self.menu.is_none() && self.cards.search().is_empty(),
+            _ => false,
+        }
     }
 
     /// Version the self-updater installs ("v0.2.3"), shown under the version in the main menu.
@@ -1266,6 +1279,7 @@ impl Ui {
                     key: ebobo_art::Key { system: entry.system, crc32: entry.crc32 },
                     path: entry.path.clone(),
                     name: entry.name.clone(),
+                    online: (purpose == Purpose::Solo).then(|| entry.clone()),
                     sel: 0,
                 });
                 self.press = None;
@@ -1278,11 +1292,12 @@ impl Ui {
     /// another options press closes it.
     fn update_menu(&mut self, nav: &Nav) -> Option<UiAction> {
         let menu = self.menu.as_mut()?;
+        let rows = menu.rows();
         if nav.up {
-            menu.sel = (menu.sel + GAME_MENU_ROWS - 1) % GAME_MENU_ROWS;
+            menu.sel = (menu.sel + rows - 1) % rows;
         }
         if nav.down {
-            menu.sel = (menu.sel + 1) % GAME_MENU_ROWS;
+            menu.sel = (menu.sel + 1) % rows;
         }
         if nav.back || nav.options {
             self.menu = None;
@@ -1293,16 +1308,17 @@ impl Ui {
         }
         let menu = self.menu.take()?;
         let name = cards::shown_name(menu.key, &menu.name, &self.shelf, &self.art);
-        match menu.sel {
-            0 => {
+        match self.menu_rows(&menu)[menu.sel] {
+            S::MenuPlayOnline => menu.online.map(UiAction::HostRoom),
+            S::MenuFavAdd | S::MenuFavRemove => {
                 self.shelf.toggle_favourite(menu.key);
                 None
             }
-            1 => {
+            S::MenuRename => {
                 self.open_field(Field::Rename(menu.key), name.chars().take(ebobo_art::shelf::NAME_MAX).collect());
                 None
             }
-            2 => {
+            S::MenuHide | S::MenuUnhide => {
                 let hide = !self.shelf.is_hidden(menu.key);
                 self.shelf.set_hidden(menu.key, hide);
                 let text = self.t(if hide { S::ToastHidden } else { S::ToastUnhidden });
@@ -1328,14 +1344,18 @@ impl Ui {
         self.ask(S::DeleteTitle, lines, Confirm { action: UiAction::DeleteRom(path), yes: S::AnswerForGood, no: S::Cancel });
     }
 
-    /// The rows of the menu of game `key`, in order: favourite, rename, hide, delete.
-    fn menu_rows(&self, key: ebobo_art::Key) -> [S; GAME_MENU_ROWS] {
-        [
-            if self.shelf.is_favourite(key) { S::MenuFavRemove } else { S::MenuFavAdd },
-            S::MenuRename,
-            if self.shelf.is_hidden(key) { S::MenuUnhide } else { S::MenuHide },
-            S::MenuDelete,
-        ]
+    /// The rows of game menu `m`, in order: "Play online" (solo library only), favourite,
+    /// rename, hide, delete.
+    fn menu_rows(&self, m: &GameMenu) -> Vec<S> {
+        let mut rows = Vec::with_capacity(m.rows());
+        if m.online.is_some() {
+            rows.push(S::MenuPlayOnline);
+        }
+        rows.push(if self.shelf.is_favourite(m.key) { S::MenuFavRemove } else { S::MenuFavAdd });
+        rows.push(S::MenuRename);
+        rows.push(if self.shelf.is_hidden(m.key) { S::MenuUnhide } else { S::MenuHide });
+        rows.push(S::MenuDelete);
+        rows
     }
 
     fn put_code_char(&mut self, c: char) {
@@ -2194,10 +2214,10 @@ impl Ui {
         }
     }
 
-    /// A game's menu over the dimmed library: the game's name, where its file is, and the
-    /// four rows in the look of the modal's buttons.
+    /// A game's menu over the dimmed library: the game's name, where its file is, and its
+    /// rows in the look of the modal's buttons.
     fn draw_menu(&self, c: &mut Canvas, f: &mut Font, m: &GameMenu, hits: &mut Vec<(Area, Hit)>) {
-        let h = 8 + 10 + 16 + GAME_MENU_ROWS as i32 * 16 + 4;
+        let h = 8 + 10 + 16 + m.rows() as i32 * 16 + 4;
         let y0 = (232 - h) / 2;
         hits.push((Area { x: 0, y: 0, w: 256, h: 240 }, Hit::MenuOutside));
         hits.push((Area { x: 12, y: y0, w: 232, h }, Hit::MenuBox));
@@ -2206,7 +2226,7 @@ impl Ui {
         let name = cards::shown_name(m.key, &m.name, &self.shelf, &self.art);
         f.draw_centered(c, y0 + 8, &trunc(&name, 27), WHITE, 1);
         f.draw_centered(c, y0 + 18, &trunc_left(&crate::config::tilde(&m.path), 27), SEC, 1);
-        for (i, row) in self.menu_rows(m.key).into_iter().enumerate() {
+        for (i, row) in self.menu_rows(m).into_iter().enumerate() {
             let y = y0 + 38 + i as i32 * 16;
             if i == m.sel {
                 c.fill_rect(16, y - 4, 224, 16, ACCENT);
@@ -3452,7 +3472,7 @@ mod tests {
         // Up and down wrap; another options press closes the menu too.
         open_menu(&mut ui, &mut c);
         ui.update(&nav(|n| n.up = true), &mut c, DT);
-        assert_eq!(ui.menu.as_ref().map(|m| m.sel), Some(3));
+        assert_eq!(ui.menu.as_ref().map(|m| m.sel), Some(4));
         ui.update(&nav(|n| n.down = true), &mut c, DT);
         assert_eq!(ui.menu.as_ref().map(|m| m.sel), Some(0));
         ui.update(&nav(|n| n.options = true), &mut c, DT);
@@ -3467,12 +3487,14 @@ mod tests {
         let mut ui = library(Purpose::Solo);
         let mut c = ctx(&mut cfg, &lib, None);
         open_menu(&mut ui, &mut c);
-        assert_eq!(ui.menu_rows(key)[0], S::MenuFavAdd);
+        assert_eq!(ui.menu_rows(ui.menu.as_ref().unwrap())[1], S::MenuFavAdd);
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
         assert!(ui.menu.is_none());
         assert!(ui.shelf.is_favourite(key));
         open_menu(&mut ui, &mut c);
-        assert_eq!(ui.menu_rows(key)[0], S::MenuFavRemove, "the next opening offers to remove it");
+        assert_eq!(ui.menu_rows(ui.menu.as_ref().unwrap())[1], S::MenuFavRemove, "the next opening offers to remove it");
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
         ui.update(&nav(|n| n.confirm = true), &mut c, DT);
         assert!(!ui.shelf.is_favourite(key));
     }
@@ -3486,6 +3508,7 @@ mod tests {
         open_menu(&mut ui, &mut c);
         ui.update(&nav(|n| n.down = true), &mut c, DT);
         ui.update(&nav(|n| n.down = true), &mut c, DT);
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
         assert!(ui.menu.is_none());
         assert!(ui.shelf.is_hidden(key_of(&lib[0])));
@@ -3496,8 +3519,8 @@ mod tests {
         ui.update(&nav(|n| n.right = true), &mut c, DT);
         assert_eq!(ui.cards.selected(), None);
         // The hide row of a hidden game puts it back, and the toast says so.
-        ui.menu = Some(GameMenu { key: key_of(&lib[0]), path: lib[0].path.clone(), name: lib[0].name.clone(), sel: 2 });
-        assert_eq!(ui.menu_rows(key_of(&lib[0]))[2], S::MenuUnhide);
+        ui.menu = Some(GameMenu { key: key_of(&lib[0]), path: lib[0].path.clone(), name: lib[0].name.clone(), online: Some(lib[0].clone()), sel: 3 });
+        assert_eq!(ui.menu_rows(ui.menu.as_ref().unwrap())[3], S::MenuUnhide);
         ui.update(&nav(|n| n.confirm = true), &mut c, DT);
         assert!(!ui.shelf.is_hidden(key_of(&lib[0])));
         assert_eq!(ui.toasts.last().map(|t| t.0.as_str()), Some("Back in the list: Game 00"));
@@ -3512,7 +3535,7 @@ mod tests {
             ui.stack = vec![Screen::Main, Screen::Picker(Purpose::Solo)];
             let mut c = ctx(&mut cfg, &lib, None);
             open_menu(&mut ui, &mut c);
-            ui.menu.as_mut().unwrap().sel = 2;
+            ui.menu.as_mut().unwrap().sel = 3;
             ui.update(&nav(|n| n.confirm = true), &mut c, DT);
             let toast = &ui.toasts.last().expect("toast").0;
             assert_eq!(toast.chars().count(), 30, "{lang:?}: {toast}");
@@ -3530,6 +3553,7 @@ mod tests {
         let rename = |ui: &mut Ui, c: &mut UiCtx| {
             open_menu(ui, c);
             ui.update(&nav(|n| n.down = true), c, DT);
+            ui.update(&nav(|n| n.down = true), c, DT);
             ui.update(&nav(|n| n.confirm = true), c, DT);
             assert_eq!(ui.stack.last(), Some(&Screen::Field(Field::Rename(key))));
             assert!(ui.menu.is_none());
@@ -3544,6 +3568,7 @@ mod tests {
         assert_eq!(ui.shelf.name(key), Some("Mine"));
         // A shoulder press of a pad keeps the name too (the built-in keyboard has the d-pad).
         open_menu(&mut ui, &mut c);
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
         ui.update(&nav(|n| n.down = true), &mut c, DT);
         ui.update(&pad(|n| n.confirm = true), &mut c, DT);
         assert!(ui.osk.is_some(), "opened by a pad: the built-in keyboard shows");
@@ -3613,10 +3638,10 @@ mod tests {
         let mut ui = library(Purpose::Solo);
         let mut c = ctx(&mut cfg, &lib, None);
         let area = |ui: &Ui, want: Hit| ui.regions.iter().find(|(_, hit)| *hit == want).map(|(a, _)| *a).expect("region");
-        // A tap on a row does it.
+        // A tap on a row does it (row 0 is "Play online", row 1 the favourite).
         open_menu(&mut ui, &mut c);
         redraw(&mut ui, &c);
-        let row = area(&ui, Hit::MenuRow(0));
+        let row = area(&ui, Hit::MenuRow(1));
         assert_eq!(ui.update(&tap(row.x + 20, row.y + 4), &mut c, DT), None);
         assert!(ui.menu.is_none());
         assert!(ui.shelf.is_favourite(key));
@@ -3635,6 +3660,49 @@ mod tests {
         redraw(&mut ui, &c);
         let keys: Vec<Hit> = ui.regions.iter().filter(|(a, _)| a.y == 224).map(|(_, h)| *h).collect();
         assert_eq!(keys, vec![Hit::Key(Key::Confirm), Hit::Key(Key::Back)]);
+    }
+
+    #[test]
+    fn ui_game_menu_play_online_only_in_solo_library() {
+        let mut cfg = Config::default();
+        let lib = games(3);
+        // Solo library: the first row creates a room with the selected game.
+        let mut ui = library(Purpose::Solo);
+        let mut c = ctx(&mut cfg, &lib, None);
+        ui.update(&nav(|n| n.right = true), &mut c, DT);
+        open_menu(&mut ui, &mut c);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::HostRoom(lib[1].clone())));
+        assert!(ui.menu.is_none());
+        // The picker for hosting keeps its four rows: the first is still the favourite.
+        let mut ui = library(Purpose::Host);
+        open_menu(&mut ui, &mut c);
+        assert_eq!(ui.menu.as_ref().map(GameMenu::rows), Some(4));
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
+        assert!(ui.shelf.is_favourite(key_of(&lib[0])));
+    }
+
+    #[test]
+    fn ui_idle_at_home() {
+        let mut cfg = Config::default();
+        let lib = games(2);
+        let mut c = ctx(&mut cfg, &lib, None);
+        let mut ui = Ui::new(Lang::En);
+        ui.show_main();
+        assert!(ui.idle_at_home(), "main menu");
+        ui.show_library();
+        assert!(ui.idle_at_home(), "plain library");
+        open_menu(&mut ui, &mut c);
+        assert!(!ui.idle_at_home(), "a game's menu is open");
+        ui.update(&nav(|n| n.back = true), &mut c, DT);
+        assert!(ui.idle_at_home());
+        ui.ask_delete(lib[0].path.clone(), &lib[0].name);
+        assert!(!ui.idle_at_home(), "a question box is open");
+        ui.modal = None;
+        ui.cards.set_search("ga");
+        assert!(!ui.idle_at_home(), "a search is typed");
+        ui.cards.set_search("");
+        ui.stack.push(Screen::Field(Field::Search));
+        assert!(!ui.idle_at_home(), "the search field is open");
     }
 
     /// The menu of a library game over the library (`/tmp/ebobo-gamemenu-<state>-<lang>.png`):
@@ -3665,6 +3733,7 @@ mod tests {
             let key = ui.menu.as_ref().unwrap().key;
             ui.shelf.toggle_favourite(key);
             ui.shelf.set_hidden(key, true);
+            ui.update(&nav(|n| n.down = true), &mut c, DT);
             ui.update(&nav(|n| n.down = true), &mut c, DT);
             shot(&mut ui, &c, "favhidden");
             ui.shelf.set_hidden(key, false);

@@ -381,9 +381,11 @@ impl App {
     }
 
     /// Initial state from the command line; `library` opens the library over the main menu.
+    /// With nothing to start, ebobo opens on the library when it already knows a game (from
+    /// its cache), else on the main menu; a scan finishing later does not change the screen.
     fn begin(&mut self, start: Start, library: bool) {
         self.ui.show_main();
-        if library {
+        if library || (matches!(start, Start::Menu) && !self.entries.is_empty()) {
             self.ui.show_library();
         }
         let file = |app: &mut App, path: PathBuf| match app.library.add_file(&path) {
@@ -595,7 +597,7 @@ impl App {
     }
 
     /// Self-update: blocker toasts, the main-menu status line, and the swap+relaunch, which
-    /// happens only in the main menu (never during a game or in a lobby).
+    /// happens only while the user is idle at a start screen (never in a game or a lobby).
     fn poll_update(&mut self) {
         if let Some(blocker) = self.updater.poll() {
             self.ui.toast(self.ui.text(match blocker {
@@ -606,7 +608,7 @@ impl App {
         if self.updater.take_changed() {
             self.ui.set_update(self.updater.updating_to().map(|v| format!("v{v}")));
         }
-        if self.updater.is_ready() && matches!(self.state, State::Menu) && self.ui.on_main() {
+        if self.updater.is_ready() && matches!(self.state, State::Menu) && self.ui.idle_at_home() {
             let args: Vec<String> = std::env::args().skip(1).collect();
             self.updater.apply(&args, true);
             self.ui.set_update(None);
@@ -744,8 +746,15 @@ impl App {
                 }
             }
             UiAction::LeaveLobby | UiAction::LeaveGame => {
+                // A solo game returns to the list of games; an online game or a room to the
+                // main menu.
+                let solo = matches!(self.state, State::Solo(_));
                 self.end_game();
-                self.ui.show_main();
+                if solo {
+                    self.ui.show_library();
+                } else {
+                    self.ui.show_main();
+                }
             }
             UiAction::Resume => self.ui.hide(),
             UiAction::Reset => {
@@ -977,8 +986,15 @@ impl App {
         }
     }
 
+    /// A game that did not open: the list of games when there are any, else the main menu,
+    /// with the error box on top.
     fn fail(&mut self, message: &str) {
-        self.ui.show_main();
+        self.refresh_entries();
+        if self.entries.is_empty() {
+            self.ui.show_main();
+        } else {
+            self.ui.show_library();
+        }
         self.ui.error(message);
     }
 
