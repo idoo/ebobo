@@ -1,9 +1,14 @@
 //! Getting rid of a game's file: into the system Trash where that works, else for good.
 //! Owner: trash slice.
 //!
-//! On macOS the Trash is Finder's, reached through `NSFileManager`. Everywhere else it is the
-//! freedesktop.org home trash, which a file can only be moved into without copying when both
-//! are on one device; a game on another device (an SD card) is deleted for good instead.
+//! On macOS the Trash is Finder's, reached through `NSFileManager`. Everywhere else it is a
+//! freedesktop.org trash (Trash specification 1.0). A file is moved into one without copying,
+//! so the trash has to be on the file's device: the home trash when the file is on the home
+//! trash's device, else the trash at the top of the file's own volume (`.Trash/<uid>` or
+//! `.Trash-<uid>`, as on a Steam Deck's SD card), which is the one file managers such as
+//! Dolphin show. A file with no usable trash (a read-only card) can only be deleted for good,
+//! and `plan` says so before the question is asked. `dispose` then does exactly what the
+//! question said and never turns a move to the Trash into deleting for good.
 //! The module has no dependencies on the rest of the crate, so it also compiles alone.
 
 use std::fs;
@@ -19,7 +24,8 @@ pub enum Disposal {
     Permanent,
 }
 
-/// What `dispose` would do with `path` now, so the question can say it before asking.
+/// What `dispose` can do with `path` now, so the question can say it before asking: `Trash`
+/// when there is a trash to move it into, else `Permanent`. Asking creates nothing.
 pub fn plan(path: &Path) -> Disposal {
     #[cfg(target_os = "macos")]
     {
@@ -28,29 +34,69 @@ pub fn plan(path: &Path) -> Disposal {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        match home_trash() {
-            Some(trash) => plan_in(path, &trash),
+        match find_trash(path, home_trash().as_deref(), uid()) {
+            Some(_) => Disposal::Trash,
             None => Disposal::Permanent,
         }
     }
 }
 
-/// Removes the file as `plan` said and returns what was done. On an error the file is still
-/// where it was; the message is for the user.
-pub fn dispose(path: &Path) -> Result<Disposal, String> {
+/// Does `how` to the file, as the question said: `Trash` moves it into the trash `plan` finds
+/// now and fails when there is none, `Permanent` deletes it for good. On an error the file is
+/// still where it was; the message is for the user.
+pub fn dispose(path: &Path, how: Disposal) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        mac::trash(path).map(|()| Disposal::Trash)
+        match how {
+            Disposal::Trash => mac::trash(path),
+            Disposal::Permanent => fs::remove_file(path).map_err(|e| e.to_string()),
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        match home_trash() {
-            Some(trash) if plan_in(path, &trash) == Disposal::Trash => {
-                trash_into(path, &trash).map(|()| Disposal::Trash)
-            }
-            _ => fs::remove_file(path).map(|()| Disposal::Permanent).map_err(|e| e.to_string()),
+        let place = match how {
+            Disposal::Trash => find_trash(path, home_trash().as_deref(), uid()),
+            Disposal::Permanent => None,
+        };
+        dispose_with(path, how, place)
+    }
+}
+
+/// A freedesktop.org trash folder to move a file into.
+#[derive(Debug, PartialEq, Eq)]
+struct Place {
+    /// The folder holding `files/` and `info/`.
+    dir: PathBuf,
+    /// The top directory of the volume for a trash on the file's own volume, which the
+    /// record's `Path=` is relative to; `None` for the home trash, whose paths are absolute.
+    top: Option<PathBuf>,
+}
+
+/// Does `how` to `path` with `place` as the trash: `Trash` without a place is an error and the
+/// file stays, never a deletion for good.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn dispose_with(path: &Path, how: Disposal, place: Option<Place>) -> Result<(), String> {
+    match (how, place) {
+        (Disposal::Permanent, _) => fs::remove_file(path).map_err(|e| e.to_string()),
+        (Disposal::Trash, Some(place)) => trash_into(path, &place.dir, place.top.as_deref()),
+        (Disposal::Trash, None) => {
+            Err(format!("there is no trash on the disk of {}, so it was left in place", path.display()))
         }
     }
+}
+
+/// The trash `path` would go to: the home trash `home` when the file is on its device, else
+/// the trash at the top of the file's own volume for user `uid`. `None` when there is no
+/// usable one (or the file is gone); nothing is created.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn find_trash(path: &Path, home: Option<&Path>, uid: Option<u32>) -> Option<Place> {
+    device(path)?;
+    if let Some(home) = home.filter(|home| plan_in(path, home) == Disposal::Trash) {
+        return Some(Place { dir: home.to_path_buf(), top: None });
+    }
+    let top = volume_top(path)?;
+    let dir = volume_trash(&top, uid?)?;
+    Some(Place { dir, top: Some(top) })
 }
 
 /// The user's freedesktop.org home trash: `$XDG_DATA_HOME/Trash`, else `~/.local/share/Trash`.
@@ -81,17 +127,165 @@ fn device(path: &Path) -> Option<u64> {
 }
 
 /// Whether a file can be moved into the trash without copying: both devices are known and are
-/// the same one. Anything else means the file would be deleted for good.
+/// the same one. Anything else means that trash cannot take the file.
 fn same_device(file: Option<u64>, trash: Option<u64>) -> bool {
     matches!((file, trash), (Some(a), Some(b)) if a == b)
 }
 
-/// What disposing of `path` does when the trash folder is `trash`. A trash folder that does not
-/// exist yet is judged by its nearest ancestor that does, since that is where it will be made.
+/// Whether the home trash `trash` can take `path` (`Trash`) or not (`Permanent`, unless the
+/// file's own volume has a trash). A trash folder that does not exist yet is judged by its
+/// nearest ancestor that does, since that is where it will be made.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn plan_in(path: &Path, trash: &Path) -> Disposal {
     let trash_device = trash.ancestors().find_map(device);
     if same_device(device(path), trash_device) { Disposal::Trash } else { Disposal::Permanent }
+}
+
+/// The top directory of the volume `path` is on: the highest ancestor of its folder that is
+/// still on the same device. `None` when the folder cannot be found or asked.
+fn volume_top(path: &Path) -> Option<PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    let mut top = fs::canonicalize(absolute.parent()?).ok()?;
+    let own = device(&top)?;
+    while let Some(parent) = top.parent() {
+        if device(parent) != Some(own) {
+            break;
+        }
+        top = parent.to_path_buf();
+    }
+    Some(top)
+}
+
+/// The trash of user `uid` on the volume whose top directory is `top`, as the specification
+/// orders them: `<top>/.Trash/<uid>` when `<top>/.Trash` is a real directory with the sticky
+/// bit, else `<top>/.Trash-<uid>`; each only when `usable`. Nothing is created.
+fn volume_trash(top: &Path, uid: u32) -> Option<PathBuf> {
+    let shared = top.join(".Trash");
+    if real_dir(&shared) && sticky(&shared) {
+        let own = shared.join(uid.to_string());
+        if usable(&own) {
+            return Some(own);
+        }
+    }
+    let own = top.join(format!(".Trash-{uid}"));
+    usable(&own).then_some(own)
+}
+
+/// Whether a trash folder can take files: it is a real, writable directory, or it is missing
+/// and its parent is one, so that it can be made at the moment of trashing.
+fn usable(dir: &Path) -> bool {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => meta.is_dir() && writable(dir),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            dir.parent().is_some_and(|parent| real_dir(parent) && writable(parent))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether `path` is a directory itself, not a symlink to one.
+fn real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// Whether the directory has the sticky bit, which a shared `.Trash` must have.
+fn sticky(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o1000 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+#[cfg(unix)]
+mod sys {
+    use std::ffi::{c_char, c_int};
+
+    unsafe extern "C" {
+        pub fn getuid() -> u32;
+        pub fn access(path: *const c_char, mode: c_int) -> c_int;
+    }
+}
+
+/// The user's id, which names their trash on a volume; `None` off unix.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid takes nothing and cannot fail.
+        Some(unsafe { sys::getuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Whether this user may create and remove entries in the directory: false on a read-only
+/// volume too.
+fn writable(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        const X_OK: std::ffi::c_int = 1;
+        const W_OK: std::ffi::c_int = 2;
+        let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: a valid NUL-terminated path that outlives the call.
+        unsafe { sys::access(c_path.as_ptr(), W_OK | X_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        fs::metadata(dir).is_ok_and(|meta| !meta.permissions().readonly())
+    }
+}
+
+/// Makes a volume trash folder with mode 0700 when it is missing; one that is there must be a
+/// real directory.
+fn make_own_dir(dir: &Path) -> Result<(), String> {
+    if real_dir(dir) {
+        return Ok(());
+    }
+    if fs::symlink_metadata(dir).is_ok() {
+        return Err(format!("{} is not a folder", dir.display()));
+    }
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
+        builder.mode(0o700);
+        builder
+    };
+    match builder.create(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists && real_dir(dir) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `original` as a path relative to the volume's top directory `top`, for a volume trash's
+/// record. `top` is a resolved path, so the file's folder is resolved too when needed.
+fn relative_to(original: &Path, top: &Path) -> Result<PathBuf, String> {
+    if let Ok(relative) = original.strip_prefix(top) {
+        return Ok(relative.to_path_buf());
+    }
+    let resolved = original
+        .parent()
+        .and_then(|folder| fs::canonicalize(folder).ok())
+        .zip(original.file_name())
+        .map(|(folder, name)| folder.join(name));
+    resolved
+        .as_deref()
+        .and_then(|path| path.strip_prefix(top).ok())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("{} is not under {}", original.display(), top.display()))
 }
 
 /// The `n`th name to try for a file in the trash: the name itself, then `<stem> 2.<ext>`,
@@ -177,11 +371,13 @@ fn deletion_date() -> String {
 
 /// Moves `path` into the freedesktop.org trash folder `trash`: a record in `info/` saying where
 /// the file was and when it went, then the file itself into `files/` under the record's name.
+/// `top` is the volume's top directory for a trash on the file's own volume: the folder is
+/// then made with mode 0700 when missing, and the record's path is relative to `top`; for the
+/// home trash (`None`) it is absolute.
 /// The record is made first and with `create_new`, which is what claims the name, so two
 /// files of one name never overwrite each other. On an error the file has not moved and no
 /// record of it is left.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-fn trash_into(path: &Path, trash: &Path) -> Result<(), String> {
+fn trash_into(path: &Path, trash: &Path, top: Option<&Path>) -> Result<(), String> {
     let text = |e: std::io::Error| e.to_string();
     fs::symlink_metadata(path).map_err(text)?;
     let original = std::path::absolute(path).map_err(text)?;
@@ -189,6 +385,14 @@ fn trash_into(path: &Path, trash: &Path) -> Result<(), String> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| format!("{} is not a file", original.display()))?;
+    let recorded = match top {
+        Some(top) => {
+            let relative = relative_to(&original, top)?;
+            make_own_dir(trash)?;
+            relative
+        }
+        None => original.clone(),
+    };
     let (files, info) = (trash.join("files"), trash.join("info"));
     fs::create_dir_all(&files).map_err(text)?;
     fs::create_dir_all(&info).map_err(text)?;
@@ -209,7 +413,7 @@ fn trash_into(path: &Path, trash: &Path) -> Result<(), String> {
     };
     let body = format!(
         "[Trash Info]\nPath={}\nDeletionDate={}\n",
-        percent_encode(&original),
+        percent_encode(&recorded),
         deletion_date()
     );
     let moved = record
@@ -335,7 +539,7 @@ mod tests {
         let rom = dir.join("my игра.nes");
         fs::write(&rom, b"NES\x1a rom bytes").unwrap();
 
-        trash_into(&rom, &trash).unwrap();
+        trash_into(&rom, &trash, None).unwrap();
 
         assert!(!rom.exists(), "the file is still in its place");
         assert_eq!(fs::read(trash.join("files/my игра.nes")).unwrap(), b"NES\x1a rom bytes");
@@ -369,7 +573,7 @@ mod tests {
             fs::create_dir_all(dir.join(folder)).unwrap();
             let rom = dir.join(folder).join("game.nes");
             fs::write(&rom, bytes).unwrap();
-            trash_into(&rom, &trash).unwrap();
+            trash_into(&rom, &trash, None).unwrap();
             assert!(!rom.exists());
         }
 
@@ -389,7 +593,7 @@ mod tests {
         let dir = scratch("missing");
         let trash = dir.join("Trash");
 
-        let result = trash_into(&dir.join("gone.nes"), &trash);
+        let result = trash_into(&dir.join("gone.nes"), &trash, None);
 
         assert!(result.is_err());
         let records = fs::read_dir(trash.join("info")).map_or(0, |entries| entries.count());
@@ -418,6 +622,117 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A trash of the test's own on a "card" whose top directory is the scratch folder.
+    fn card(test: &str) -> PathBuf {
+        fs::canonicalize(scratch(test)).unwrap()
+    }
+
+    #[test]
+    fn card_trash_takes_the_file_with_a_relative_path() {
+        let top = card("card");
+        fs::create_dir_all(top.join("roms")).unwrap();
+        let rom = top.join("roms/My Game (U).nes");
+        fs::write(&rom, b"card bytes").unwrap();
+        let uid = uid().unwrap_or(1000);
+        let own = top.join(format!(".Trash-{uid}"));
+
+        assert_eq!(volume_trash(&top, uid), Some(own.clone()));
+        assert!(!own.exists(), "asking made the trash");
+        let place = Place { dir: own.clone(), top: Some(top.clone()) };
+        dispose_with(&rom, Disposal::Trash, Some(place)).unwrap();
+
+        assert!(!rom.exists(), "the file is still in its place");
+        assert_eq!(fs::read(own.join("files/My Game (U).nes")).unwrap(), b"card bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&own).unwrap().permissions().mode() & 0o7777, 0o700);
+        }
+        let record = fs::read_to_string(own.join("info/My Game (U).nes.trashinfo")).unwrap();
+        assert!(record.contains("\nPath=roms/My%20Game%20%28U%29.nes\n"), "{record}");
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_trash_needs_a_sticky_real_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let top = card("sticky");
+        let shared = top.join(".Trash");
+        let fallback = top.join(".Trash-1000");
+        fs::create_dir(&shared).unwrap();
+
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(volume_trash(&top, 1000), Some(fallback.clone()), "not sticky");
+
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert_eq!(volume_trash(&top, 1000), Some(shared.join("1000")));
+        assert!(!shared.join("1000").exists(), "asking made the trash");
+        let rom = top.join("game.nes");
+        fs::write(&rom, b"x").unwrap();
+        let place = Place { dir: shared.join("1000"), top: Some(top.clone()) };
+        dispose_with(&rom, Disposal::Trash, Some(place)).unwrap();
+        assert!(shared.join("1000/files/game.nes").exists());
+        let mode = fs::metadata(shared.join("1000")).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700);
+
+        // A symlinked `.Trash` is refused even when it points at a sticky directory.
+        let elsewhere = top.join("elsewhere");
+        fs::rename(&shared, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &shared).unwrap();
+        assert_eq!(volume_trash(&top, 1000), Some(fallback), "symlinked");
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_top_has_no_trash() {
+        use std::os::unix::fs::PermissionsExt;
+        if uid() == Some(0) {
+            return; // root may write anywhere
+        }
+        let top = card("readonly");
+        fs::set_permissions(&top, fs::Permissions::from_mode(0o555)).unwrap();
+        let found = volume_trash(&top, 1000);
+        fs::set_permissions(&top, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(found, None);
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn trash_without_a_trash_leaves_the_file() {
+        let top = card("notrash");
+        let rom = top.join("game.nes");
+        fs::write(&rom, b"x").unwrap();
+
+        assert!(dispose_with(&rom, Disposal::Trash, None).is_err());
+        assert!(rom.exists(), "deleted although the Trash was promised");
+        let blocker = top.join(".Trash-1000");
+        fs::write(&blocker, b"not a folder").unwrap();
+        let place = Place { dir: blocker, top: Some(top.clone()) };
+        assert!(dispose_with(&rom, Disposal::Trash, Some(place)).is_err());
+        assert!(rom.exists(), "deleted although the Trash was promised");
+
+        dispose_with(&rom, Disposal::Permanent, None).unwrap();
+        assert!(!rom.exists());
+        let _ = fs::remove_dir_all(&top);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn volume_top_is_the_highest_folder_on_the_device() {
+        let dir = card("top");
+        let rom = dir.join("game.nes");
+        fs::write(&rom, b"x").unwrap();
+
+        let top = volume_top(&rom).unwrap();
+        assert!(dir.starts_with(&top), "{} is not above {}", top.display(), dir.display());
+        assert_eq!(device(&top), device(&rom));
+        assert!(top.parent().is_none_or(|parent| device(parent) != device(&rom)));
+        assert_eq!(volume_top(&dir.join("gone/game.nes")), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn utc_fallback_reads_the_calendar() {
         assert_eq!(utc_date(0), "1970-01-01T00:00:00");
@@ -435,9 +750,9 @@ mod tests {
         fs::write(&rom, b"ebobo trash test").unwrap();
 
         assert_eq!(plan(&rom), Disposal::Trash);
-        let result = dispose(&rom);
+        let result = dispose(&rom, Disposal::Trash);
         println!("dispose: {result:?}");
-        assert_eq!(result, Ok(Disposal::Trash));
+        assert_eq!(result, Ok(()));
         assert!(!rom.exists(), "the file is still in its place");
     }
 }

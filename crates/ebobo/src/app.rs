@@ -773,8 +773,8 @@ impl App {
             },
             UiAction::ConfigChanged => self.apply_config(),
             UiAction::Rescan => self.library.rescan(),
-            UiAction::DeleteRom(path) => match trash::dispose(&path) {
-                Ok(how) => {
+            UiAction::DeleteRom(path, how) => match trash::dispose(&path, how) {
+                Ok(()) => {
                     // Off the list at once; the rescan then finds another copy of the game, if
                     // there is one.
                     self.library.forget(&path);

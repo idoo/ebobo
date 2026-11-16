@@ -50,9 +50,9 @@ pub enum UiAction {
     /// `UiCtx::config` was edited; the app saves it and applies scale/volume/fullscreen.
     ConfigChanged,
     Rescan,
-    /// Get rid of a game's file (`crate::trash::dispose`); asked for and confirmed in the
-    /// game's menu.
-    DeleteRom(PathBuf),
+    /// Get rid of a game's file (`crate::trash::dispose`) the way the question said it would
+    /// go; asked for and confirmed in the game's menu.
+    DeleteRom(PathBuf, Disposal),
     /// Run `ebobo_net::diagnose` in the background and hand the result to `Ui::set_net_diag`.
     RunNetCheck,
     Quit,
@@ -1260,7 +1260,7 @@ impl Ui {
             Disposal::Trash => S::AnswerTrash,
             Disposal::Permanent => S::AnswerForGood,
         };
-        self.ask(S::DeleteTitle, lines, Confirm { action: UiAction::DeleteRom(path), yes, no: S::Cancel });
+        self.ask(S::DeleteTitle, lines, Confirm { action: UiAction::DeleteRom(path, disposal), yes, no: S::Cancel });
     }
 
     /// The rows of the menu of game `key`, in order: favourite, rename, hide, delete.
@@ -3476,7 +3476,8 @@ mod tests {
         assert!(ui.modal.is_none());
         ask(&mut ui, &mut c);
         ui.update(&nav(|n| n.up = true), &mut c, DT);
-        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::DeleteRom(lib[0].path.clone())));
+        let asked = crate::trash::plan(&lib[0].path);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::DeleteRom(lib[0].path.clone(), asked)));
         // What the question says follows what will happen to the file.
         for lang in [Lang::Ru, Lang::En] {
             let trash = delete_lines(lang, "Game 00.nes", Disposal::Trash);
