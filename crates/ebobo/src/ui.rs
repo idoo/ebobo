@@ -906,6 +906,15 @@ impl Ui {
             k.draw(canvas, font);
             h.extend(k.key_rects().map(|(i, r)| (Area { x: r.x, y: r.y, w: r.w, h: r.h }, Hit::Osk(i))));
         }
+        // A toast in the library takes the place of the second detail line. The line is wiped
+        // here, under any box that dims the screen, so it dims with the rest and nothing reads
+        // beside the toast.
+        let library = matches!(top, Some(Screen::Picker(_)));
+        if library {
+            for i in 0..self.toasts.len() as i32 {
+                canvas.fill_rect(0, cards::INFO_Y - i * 14 - 3, 256, 14, BG);
+            }
+        }
         if let Some(menu) = self.menu.as_ref().filter(|_| visible) {
             // Like a modal: only the menu takes taps, and only it reads at full strength.
             h.clear();
@@ -919,15 +928,13 @@ impl Ui {
             self.draw_modal(canvas, font, modal, &mut h);
         }
         // The keyboard covers the hint bar (its keys say the same) and the toast line. Over a
-        // menu a toast's box is solid, so the text under it never shows through. In the
-        // library it takes the place of the second detail line, which is cleared for it.
-        let library = matches!(top, Some(Screen::Picker(_)));
+        // menu a toast's box is solid, so the text under it never shows through.
         let (base, solid) = match top {
             _ if osk_shown => (osk::TOP - 16, true),
             _ if library => (cards::INFO_Y, true),
             _ => (if visible { 214 } else { 224 }, visible),
         };
-        self.draw_toasts(canvas, font, base, solid, library && !osk_shown);
+        self.draw_toasts(canvas, font, base, solid);
         if visible && !osk_shown {
             self.draw_hints(canvas, font, ctx, input.hint_kind, top, &mut h);
         }
@@ -2186,17 +2193,12 @@ impl Ui {
         }
     }
 
-    /// Toasts from `base` upwards, the latest lowest. `solid`: the box hides what is under it;
-    /// `clear`: the whole line a toast lies on is wiped first (text on both sides of the box
-    /// would read as one broken line).
-    fn draw_toasts(&self, c: &mut Canvas, f: &mut Font, base: i32, solid: bool, clear: bool) {
+    /// Toasts from `base` upwards, the latest lowest. `solid`: the box hides what is under it.
+    fn draw_toasts(&self, c: &mut Canvas, f: &mut Font, base: i32, solid: bool) {
         for (i, (msg, _)) in self.toasts.iter().rev().enumerate() {
             let line = trunc(msg, 30);
             let w = f.width(&line, 1);
             let y = base - i as i32 * 14;
-            if clear {
-                c.fill_rect(0, y - 3, 256, 14, BG);
-            }
             c.fill_rect((256 - w) / 2 - 4, y - 3, w + 8, 14, if solid { TOAST_BG } else { SHADE });
             f.draw_centered(c, y, &line, WHITE, 1);
         }

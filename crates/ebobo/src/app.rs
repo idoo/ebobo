@@ -674,6 +674,14 @@ impl App {
             self.net_error(&err);
             return;
         }
+        // A host stays in the lobby when a guest cannot play; it is told why (and an update
+        // check starts when the versions differ).
+        if status.is_host {
+            let before = self.lobby_status.as_ref().and_then(|s| s.error.as_ref());
+            if let Some(err) = logic::host_notice(before, status.error.as_ref()).cloned() {
+                self.net_error(&err);
+            }
+        }
         self.lobby_status = Some(status);
     }
 

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use ebobo_console::Region;
 use ebobo_console::nes::pad;
-use ebobo_net::{INPUT_TURBO_A, INPUT_TURBO_B};
+use ebobo_net::{NetError, INPUT_TURBO_A, INPUT_TURBO_B};
 
 use crate::config::Config;
 
@@ -25,6 +25,14 @@ pub fn region_hint(name: &str, header: Region) -> Option<Region> {
         return None;
     }
     ["(E)", "(EUROPE)", "(PAL)"].iter().any(|m| upper.contains(m)).then_some(Region::Pal)
+}
+
+/// The lobby problem a host is told about now: one that keeps the game from starting and that
+/// the host can do something about (a guest on another ebobo version, a saved game that did
+/// not reach a player). The host stays in the lobby with it, so it is told once per problem:
+/// `before` is the error of the previous poll. A guest's ROM trouble shows on its lobby row.
+pub fn host_notice<'a>(before: Option<&NetError>, now: Option<&'a NetError>) -> Option<&'a NetError> {
+    now.filter(|e| before != Some(*e) && matches!(e, NetError::Version | NetError::SaveTransfer))
 }
 
 /// Pacing stretch, two-sided: +2 % per frame we are ahead of the slowest peer (max +10 %),
@@ -230,6 +238,19 @@ mod tests {
     fn app_save_naming() {
         assert_eq!(save_file_name("Zelda (U)", 0x0123abcd), "Zelda (U)-0123abcd.sav");
         assert_eq!(save_file_name("a/b:c", 0xFFFF_FFFF), "a_b_c-ffffffff.sav");
+    }
+
+    #[test]
+    fn app_host_is_told_once_why_a_guest_cannot_play() {
+        let (version, save) = (NetError::Version, NetError::SaveTransfer);
+        assert_eq!(host_notice(None, Some(&version)), Some(&version));
+        assert_eq!(host_notice(Some(&version), Some(&version)), None, "the same problem is not repeated every poll");
+        // A save that failed again after the host started again is told again.
+        assert_eq!(host_notice(None, Some(&save)), Some(&save));
+        assert_eq!(host_notice(Some(&version), Some(&save)), Some(&save));
+        // A guest's own ROM trouble has words for the guest only.
+        assert_eq!(host_notice(None, Some(&NetError::RomMissing)), None);
+        assert_eq!(host_notice(Some(&save), None), None);
     }
 
     #[test]
