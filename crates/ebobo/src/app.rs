@@ -3,6 +3,7 @@
 
 mod cli;
 mod logic;
+mod moment;
 mod netsave;
 mod png;
 mod rewind;
@@ -42,6 +43,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKDROP: canvas::Color = [0x14, 0x13, 0x1A, 0xFF];
 const MENU_FPS: f64 = 60.0;
 const BATTERY_EVERY: Duration = Duration::from_secs(10);
+/// A solo game's moment is written this often during play.
+const MOMENT_EVERY: Duration = Duration::from_secs(30);
 /// Net stats (ping, routes) are refreshed this often, in frames.
 const STATS_EVERY: u32 = 10;
 /// GGRS not advancing this long during netplay: the game is dimmed (it waits for a peer).
@@ -62,6 +65,10 @@ struct Solo {
     save_path: Option<PathBuf>,
     saved_ram: Vec<u8>,
     battery_at: Instant,
+    /// Where this game's moment (the state to continue from next time) is written and when
+    /// it last was; `None` = this run keeps no moment.
+    moment: Option<PathBuf>,
+    moment_at: Instant,
     /// Current save-state slot (0-based) and when each slot file was written (`None` = empty).
     slot: u8,
     slot_times: [Option<std::time::SystemTime>; slots::SLOTS as usize],
@@ -122,6 +129,9 @@ struct App {
     pump: sdl2::EventPump,
     input: Input,
     video: Video,
+    /// Solo games start from power-on and keep no moment (`--fresh`, or a timed run of a
+    /// game named on the command line).
+    fresh: bool,
     audio: Option<Audio>,
     audio_paused: bool,
     library: Library,
@@ -327,6 +337,7 @@ impl App {
             pump,
             input,
             video,
+            fresh: !logic::keeps_moment(cli.fresh, matches!(cli.start, Start::Solo(_)), cli.exit_after.is_some()),
             audio,
             audio_paused: false,
             entries_gen: library.generation(),
@@ -543,6 +554,9 @@ impl App {
 
         self.advance(&frame);
         self.update_battery(false);
+        if matches!(&self.state, State::Solo(s) if !s.rewinding && s.moment_at.elapsed() >= MOMENT_EVERY) {
+            self.save_moment();
+        }
         self.compose(&frame);
         if frame.mouse_moved {
             self.mouse_at = Some(Instant::now());
@@ -881,6 +895,16 @@ impl App {
             saved_ram = console.battery_ram().map(<[u8]>::to_vec).unwrap_or_default();
             save_path = Some(path);
         }
+        // Continue where the game was left, over the battery RAM just loaded.
+        let moment = (!self.fresh).then(|| moment::path(&moment::dir(), &entry.name, console.crc32()));
+        let mut continued = false;
+        if let Some(path) = &moment {
+            match slots::load(&mut console, path) {
+                Ok(()) => continued = true,
+                Err(slots::LoadError::Empty) => {}
+                Err(err) => eprintln!("ebobo: moment {} not loaded: {err:?}", path.display()),
+            }
+        }
         let snapshot_bytes = console.encode_state(&console.snapshot()).len();
         let mut solo = Solo {
             console,
@@ -888,6 +912,8 @@ impl App {
             save_path,
             saved_ram,
             battery_at: Instant::now(),
+            moment,
+            moment_at: Instant::now(),
             slot: 0,
             slot_times: [None; slots::SLOTS as usize],
             rewind: rewind::Ring::new(rewind::BUDGET_BYTES, snapshot_bytes),
@@ -906,6 +932,9 @@ impl App {
         self.ui.hide();
         self.menu_hint = true;
         self.video.power_on();
+        if continued {
+            self.ui.toast(self.ui.text(Text::Continued));
+        }
     }
 
     fn fail(&mut self, message: &str) {
@@ -1069,6 +1098,7 @@ impl App {
     /// Leaves whatever runs (battery written, online game kept as the last moment, BYE sent)
     /// and goes to the no-game state.
     fn end_game(&mut self) {
+        self.save_moment();
         self.update_battery(true);
         match std::mem::replace(&mut self.state, State::Menu) {
             State::Lobby(lobby) => lobby.leave(),
@@ -1081,6 +1111,17 @@ impl App {
         self.lobby_status = None;
         if let Some(audio) = &mut self.audio {
             audio.clear();
+        }
+    }
+
+    /// Writes the solo game's moment, the state it continues from next time; nothing when
+    /// no solo game runs or this run keeps no moment.
+    fn save_moment(&mut self) {
+        let State::Solo(s) = &mut self.state else { return };
+        s.moment_at = Instant::now();
+        let Some(path) = &s.moment else { return };
+        if let Err(err) = slots::save(&s.console, path) {
+            eprintln!("ebobo: moment {} not written: {err}", path.display());
         }
     }
 

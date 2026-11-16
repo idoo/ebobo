@@ -338,6 +338,7 @@ pub(crate) enum S {
     SavesStay,
     AnswerForGood,
     CodeCopied,
+    Continued,
     OpenNotRom,
     OpenDamaged,
     OpenMapper,
@@ -571,6 +572,7 @@ impl S {
             SavesStay => ("Сохранения останутся.", "Your saves stay."),
             AnswerForGood => ("Удалить навсегда", "Delete for good"),
             CodeCopied => ("Код скопирован", "Code copied"),
+            Continued => ("Продолжаем с того же места", "Continuing where you left off"),
             OpenNotRom => ("это не игра NES или Sega", "not a NES or Genesis game"),
             OpenDamaged => ("файл игры повреждён", "the game's file is damaged"),
             OpenMapper => (

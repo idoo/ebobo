@@ -166,9 +166,35 @@ pub fn scale_nearest(rgba: &[u8], w: usize, h: usize, k: usize, out: &mut Vec<u8
     }
 }
 
+/// Whether solo games of this run continue from, and write, their last moment. Not with
+/// `--fresh`, and not in a timed run (`--exit-after`) that names the game to play alone:
+/// such runs are checks and screenshots that must start from power-on and leave no trace.
+pub fn keeps_moment(fresh_flag: bool, solo_rom_named: bool, timed: bool) -> bool {
+    !fresh_flag && !(solo_rom_named && timed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_keeps_moment_truth_table() {
+        // (--fresh, ROM named for solo, --exit-after) -> kept
+        let table = [
+            (false, false, false, true),
+            (false, true, false, true),
+            // A timed run of the menu or library: games picked there still continue.
+            (false, false, true, true),
+            (false, true, true, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, true, true, false),
+        ];
+        for (fresh, named, timed, kept) in table {
+            assert_eq!(keeps_moment(fresh, named, timed), kept, "fresh {fresh} named {named} timed {timed}");
+        }
+    }
 
     #[test]
     fn app_region_hint() {

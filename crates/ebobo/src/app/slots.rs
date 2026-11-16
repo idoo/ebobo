@@ -32,10 +32,14 @@ impl LoadError {
     }
 }
 
+/// A game's name as it goes into a file name: path separators are replaced.
+pub fn clean_stem(stem: &str) -> String {
+    stem.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect()
+}
+
 /// `dir/<stem>-<crc32 hex>.<slot>.state`; path separators in the stem are replaced.
 pub fn path(dir: &Path, stem: &str, crc32: u32, slot: u8) -> PathBuf {
-    let stem: String = stem.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
-    dir.join(format!("{stem}-{crc32:08x}.{}.state", slot + 1))
+    dir.join(format!("{}-{crc32:08x}.{}.state", clean_stem(stem), slot + 1))
 }
 
 /// Writes the state atomically: a temp file next to it, then rename over the old one.

@@ -29,6 +29,7 @@ usage: ebobo [ROM] [options]
   --screen MODE        screen mode: stretch, fit (aspect kept), pixel (integer scale)
   --library            start in the library of games (for screenshots and checks)
   --exit-after SECONDS quit after this many seconds
+  --fresh              start from power-on and keep no moment
   --autostart N        host: start the game once N players are in the room
   --resume FROM        host: start from new, last (the last moment) or save instead of the
                        default (the last moment, else the save, else a new game); a missing
@@ -89,6 +90,8 @@ pub struct Cli {
     /// `--library`: open the library over the main menu (only without a game to start).
     pub library: bool,
     pub exit_after: Option<f64>,
+    /// `--fresh`: solo games neither continue from their last moment nor write it.
+    pub fresh: bool,
     pub autostart: Option<usize>,
     pub resume: Option<ResumeFrom>,
     /// `--script` steps sorted by frame.
@@ -207,6 +210,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                 });
             }
             "--library" => cli.library = true,
+            "--fresh" => cli.fresh = true,
             "--effect" => {
                 let raw = value(flag)?;
                 cli.effect = Some(Effect::parse(&raw).ok_or_else(|| format!("bad effect: {raw} (off, crt, pvm, lcd)"))?);
@@ -238,7 +242,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
             _ if flag.starts_with('-') && flag.len() > 1 => return Err(format!("unknown option: {flag}")),
             _ => set_start(&mut cli, Start::Solo(arg.into()))?,
         }
-        if inline.is_some() && matches!(flag, "--relay" | "--fullscreen" | "--windowed" | "--library") {
+        if inline.is_some() && matches!(flag, "--relay" | "--fullscreen" | "--windowed" | "--library" | "--fresh") {
             return Err(format!("{flag} takes no value"));
         }
     }

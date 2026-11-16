@@ -135,6 +135,8 @@ pub enum Text {
     CantDelete,
     /// The room code went to the clipboard.
     CodeCopied,
+    /// A solo game started from the moment it was left at.
+    Continued,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -694,6 +696,7 @@ impl Ui {
             Text::FileDeleted => S::FileDeleted,
             Text::CantDelete => S::CantDelete,
             Text::CodeCopied => S::CodeCopied,
+            Text::Continued => S::Continued,
         })
     }
 
