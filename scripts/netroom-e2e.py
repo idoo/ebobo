@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rooms end to end, without windows: ebobo processes play through the real room server.
 
-    scripts/netroom-e2e.py target/debug/ebobo game.nes [--phases SJRKHO] [--base DIR]
+    scripts/netroom-e2e.py target/debug/ebobo game.nes [--phases SJRKHO] [--slow 2] [--base DIR]
 
 Phases (each a fresh set of processes):
   S  two devices with two players each: the game starts with controllers [0,0,1,1]
@@ -10,14 +10,20 @@ Phases (each a fresh set of processes):
   R  a guest quits a running game and joins again with the same code: the game continues
   K  a guest's ebobo is killed mid-game (no goodbye) and another device joins seconds later:
      the host does not wait for the dead one and plays on with the newcomer
+  L  the same, but the newcomer joins after the game gave the dead player up (20 s): the
+     host played on alone meanwhile
   H  saves for the host only: the host's save counts, the guest's does not
   O  saves off: nobody's save counts and no file is written
 A phase passes when every process ran its games, exited with 0, and the processes of the last
-game printed the same state hashes.
+game printed the same state hashes. On a Mac loaded by other work the games run several times
+slower than real time and phases fail with "the two-player game did not run": `--slow 2`
+doubles every time budget.
 """
 import argparse, os, re, shutil, subprocess, sys, threading, time
 
 ENV = dict(os.environ, SDL_VIDEODRIVER="dummy", SDL_AUDIODRIVER="dummy", SDL_RENDER_DRIVER="software")
+# Every time budget (a process's --exit-after, a wait for a log line) is multiplied by this.
+SLOW = 1.0
 
 
 class Proc:
@@ -27,7 +33,7 @@ class Proc:
         env = dict(ENV, HOME=home, XDG_CONFIG_HOME=os.path.join(home, "cfg"), XDG_DATA_HOME=os.path.join(home, "data"))
         self.tag, self.home, self.lines = tag, home, []
         self.shot = os.path.join(base, tag + ".png")
-        cmd = [binary, *args, "--windowed", "--exit-after", str(secs), "--screenshot", self.shot, "--screenshot-size", "512x480"]
+        cmd = [binary, *args, "--windowed", "--exit-after", str(round(secs * SLOW)), "--screenshot", self.shot, "--screenshot-size", "512x480"]
         self.p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         threading.Thread(target=lambda: self.lines.extend(self.p.stdout), daemon=True).start()
 
@@ -35,7 +41,7 @@ class Proc:
         return "".join(self.lines)
 
     def wait_for(self, pattern, secs, count=1):
-        end = time.time() + secs
+        end = time.time() + secs * SLOW
         while time.time() < end:
             found = re.findall(pattern, self.text())
             if len(found) >= count:
@@ -70,7 +76,7 @@ def finish(procs, secs):
     problems = []
     for pr in procs:
         try:
-            pr.p.wait(timeout=secs)
+            pr.p.wait(timeout=secs * SLOW)
         except subprocess.TimeoutExpired:
             pr.p.kill()
             problems.append(f"{pr.tag} did not exit")
@@ -151,7 +157,7 @@ def phase_return(binary, base, rom):
     g1 = Proc(binary, base, "g1", ["--join", code, "--name", "G1"], 16)
     if not h.wait_for(r"frame 300 hash", 40):
         return finish([h, g1], 100) + ["the two-player game did not run"]
-    g1.p.wait(timeout=60)
+    g1.p.wait(timeout=60 * SLOW)
     time.sleep(3)
     back = Proc(binary, base, "g1", ["--join", code, "--name", "G1"], 40)
     problems = finish([h, back], 140)
@@ -164,15 +170,16 @@ def phase_return(binary, base, rom):
     return problems
 
 
-def phase_killed(binary, base, rom):
-    h, code = host(binary, base, rom, ["--autostart", "2"], 85)
+def phase_killed(binary, base, rom, gap):
+    h, code = host(binary, base, rom, ["--autostart", "2"], 80 + gap)
     if not code:
         return finish([h], 5) + ["no room code"]
     g1 = Proc(binary, base, "g1", ["--join", code, "--name", "G1"], 80)
     if not h.wait_for(r"frame 300 hash", 40):
         return finish([h, g1], 100) + ["the two-player game did not run"]
     g1.p.kill()
-    time.sleep(5)
+    # Real seconds: the game gives a silent player up after 20 of them.
+    time.sleep(gap)
     g2 = Proc(binary, base, "g2", ["--join", code, "--name", "G2"], 45)
     problems = finish([h, g2], 140)
     if len(h.games()) != 2:
@@ -210,12 +217,16 @@ def main():
     ap.add_argument("rom")
     ap.add_argument("--phases", default="SJRKHO")
     ap.add_argument("--base", default="/tmp/ebobo-netroom")
+    ap.add_argument("--slow", type=float, default=1.0)
     a = ap.parse_args()
+    global SLOW
+    SLOW = a.slow
     phases = {
         "S": ("two players on each of two devices", lambda b: phase_seats(a.binary, b, a.rom)),
         "J": ("a third device joins a running game", lambda b: phase_join(a.binary, b, a.rom)),
         "R": ("a guest quits and comes back", lambda b: phase_return(a.binary, b, a.rom)),
-        "K": ("a guest is killed and another device joins", lambda b: phase_killed(a.binary, b, a.rom)),
+        "K": ("a guest is killed and another device joins", lambda b: phase_killed(a.binary, b, a.rom, 5)),
+        "L": ("a guest is killed, another device joins after the timeout", lambda b: phase_killed(a.binary, b, a.rom, 27)),
         "H": ("saves for the host only", lambda b: phase_saves(a.binary, b, a.rom, "host")),
         "O": ("saves off", lambda b: phase_saves(a.binary, b, a.rom, "off")),
     }
