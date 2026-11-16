@@ -102,6 +102,8 @@ struct Net {
     slots: Vec<PeerId>,
     /// Indexes into `slots` nobody plays: they carry the host's id and get no presses.
     idle: Vec<usize>,
+    /// Who may save and load in this game (the room's setting).
+    saves: SavePolicy,
     names: Vec<String>,
     rom_name: String,
     /// Interrupted peers and when they will be dropped.
@@ -791,7 +793,9 @@ impl App {
             }
             UiAction::SaveState => match &mut self.state {
                 State::Net(n) => {
-                    n.press(ScriptKey::Save);
+                    if let Err(text) = n.press(ScriptKey::Save) {
+                        self.ui.toast(self.ui.text(text));
+                    }
                     self.ui.hide();
                 }
                 State::Solo(s) => {
@@ -828,8 +832,8 @@ impl App {
             },
             UiAction::LoadState => match &mut self.state {
                 State::Net(n) => {
-                    if !n.press(ScriptKey::Load) {
-                        self.ui.toast(self.ui.text(Text::NoQuickSave));
+                    if let Err(text) = n.press(ScriptKey::Load) {
+                        self.ui.toast(self.ui.text(text));
                     }
                     self.ui.hide();
                 }
@@ -1103,7 +1107,7 @@ impl App {
                 }
             },
         };
-        let session = match NetSession::new(start.link, &start.slots, start.input_delay, start.delay_auto, fps, shared_save, SavePolicy::Everyone) {
+        let session = match NetSession::new(start.link, &start.slots, start.input_delay, start.delay_auto, fps, shared_save, start.saves) {
             Ok(session) => session,
             Err(err) => {
                 self.ui.show_main();
@@ -1121,6 +1125,7 @@ impl App {
             me: start.me,
             slots: start.slots,
             idle: start.idle,
+            saves: start.saves,
             names: start.names,
             rom_name: start.rom_name,
             interrupted: Vec::new(),
@@ -1307,7 +1312,9 @@ impl App {
                         Err(()) => failed = true,
                     }
                 }
-                if let Some(snapshot) = n.session.take_checkpoint().filter(|_| netsave::last_due(n.advanced)) {
+                // With saves off nothing of this game is written.
+                let checkpoint = n.session.take_checkpoint().filter(|_| n.saves != SavePolicy::Off && netsave::last_due(n.advanced));
+                if let Some(snapshot) = checkpoint {
                     match n.write_state(ResumeKind::Last, &snapshot) {
                         Ok(sha) => println!("ebobo: last moment sha {sha}"),
                         Err(()) => failed = true,
@@ -1352,8 +1359,8 @@ impl App {
                                     break;
                                 }
                                 n.script_at += 1;
-                                if !n.press(key) {
-                                    self.ui.toast(self.ui.text(Text::NoQuickSave));
+                                if let Err(text) = n.press(key) {
+                                    self.ui.toast(self.ui.text(text));
                                 }
                             }
                         }
@@ -1531,14 +1538,18 @@ impl Net {
     }
 
     /// F5 / F7 in a netplay game (menu, hotkey or `--script`): every peer saves / loads at the
-    /// frame this player's input reaches. A load without a shared save is refused (`false`).
-    fn press(&mut self, key: ScriptKey) -> bool {
+    /// frame this player's input reaches. Refused with what to tell the player when the room
+    /// does not let this player save, or for a load without a shared save.
+    fn press(&mut self, key: ScriptKey) -> Result<(), Text> {
+        if !self.saves.allows(self.me) {
+            return Err(if self.saves == SavePolicy::Off { Text::SavesOff } else { Text::SavesHostOnly });
+        }
         match key {
             ScriptKey::Save => self.save_pending = true,
             ScriptKey::Load if self.session.has_save() => self.load_pending = true,
-            ScriptKey::Load => return false,
+            ScriptKey::Load => return Err(Text::NoQuickSave),
         }
-        true
+        Ok(())
     }
 
     /// Leaving the game: this very frame becomes the last moment, so the next session
@@ -1546,7 +1557,7 @@ impl Net {
     /// would be alive again). The newest frames ran on predicted inputs of the others, so
     /// unlike the checkpoints this file is this player's own view.
     fn keep_last_moment(&self) {
-        if !netsave::last_due(self.advanced) {
+        if self.saves == SavePolicy::Off || !netsave::last_due(self.advanced) {
             return;
         }
         if let Ok(sha) = self.write_state(ResumeKind::Last, &self.console.snapshot()) {
@@ -1631,6 +1642,8 @@ fn make_ctx<'a>(
             save_slot: Some((s.slot, s.slot_times[s.slot as usize])),
             slot_thumb: s.slot_thumbs[s.slot as usize].as_deref(),
             can_load: false,
+            can_save: true,
+            host: false,
             away,
         }),
         State::Net(n) => Some(GameView {
@@ -1644,6 +1657,8 @@ fn make_ctx<'a>(
             save_slot: None,
             slot_thumb: None,
             can_load: n.session.has_save(),
+            can_save: n.saves.allows(n.me),
+            host: n.me == PeerId(0),
             away: false,
         }),
         State::Menu | State::Lobby(_) => None,
