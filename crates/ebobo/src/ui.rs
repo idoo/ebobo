@@ -12,6 +12,7 @@ use ebobo_net::{
     CODE_ALPHABET, CODE_LEN,
 };
 
+use crate::app::slots;
 use crate::canvas::{Canvas, Color, Font};
 use crate::cards::{self, Cards};
 use crate::config::{is_steam_deck, Config, ScreenMode, SpriteLimit};
@@ -78,6 +79,9 @@ pub struct GameView<'a> {
     pub stalled: bool,
     /// Solo: current save slot (0-based) and when it was written (`None` = empty).
     pub save_slot: Option<(u8, Option<SystemTime>)>,
+    /// Solo: the current slot's picture, `slots::THUMB_W` x `slots::THUMB_H` RGBA (`None` =
+    /// the slot is empty or was saved before pictures existed).
+    pub slot_thumb: Option<&'a [u8]>,
     /// Netplay: a shared save exists, so "Load for everyone" can load it.
     pub can_load: bool,
 }
@@ -2009,6 +2013,14 @@ impl Ui {
             .collect();
         let y0 = if netplay { 96 } else { 84 };
         Self::draw_rows(c, f, &items, self.sel[Screen::Pause.slot()].min(items.len() - 1), y0, 16, h);
+        // The selected slot's picture, under the Slot row's value at the right end of the
+        // Save / Load / Reset rows (their labels are on the left). Drawn after the rows so the
+        // selection bar passes under it.
+        if let Some(thumb) = ctx.game.as_ref().filter(|g| !g.netplay).and_then(|g| g.slot_thumb) {
+            let (w, h) = (slots::THUMB_W, slots::THUMB_H);
+            c.rect(171, 109, w as i32 + 2, h as i32 + 2, SEC);
+            c.blit(172, 110, w, h, thumb);
+        }
         if !netplay {
             let (lt, rt, shot) = match kind {
                 Some(PadKind::PlayStation) => ("L2", "R2", "Share+Triangle"),
@@ -2987,7 +2999,7 @@ mod tests {
         let mut cfg = Config::default();
         let mut ui = Ui::new(Lang::Ru);
         ui.show_pause();
-        let solo = |slot| GameView { rom_name: "X", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((slot, None)), can_load: false };
+        let solo = |slot| GameView { rom_name: "X", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((slot, None)), slot_thumb: None, can_load: false };
         let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(solo(0)), pads: &[], config: &mut cfg, version: "0.1.0" };
         ui.update(&nav(|n| n.down = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::SelectSlot(1)));
@@ -3010,7 +3022,7 @@ mod tests {
         let names = vec!["A".to_string(), "B".to_string()];
         let mut ui = Ui::new(Lang::Ru);
         ui.show_pause();
-        let game = GameView { rom_name: "X", netplay: true, names: &names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, can_load: false };
+        let game = GameView { rom_name: "X", netplay: true, names: &names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, slot_thumb: None, can_load: false };
         let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &[], config: &mut cfg, version: "0.1.0" };
         ui.update(&nav(|n| n.up = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "exit must confirm");
@@ -3087,7 +3099,7 @@ mod tests {
     }
 
     fn net_game(names: &[String], can_load: bool) -> GameView<'_> {
-        GameView { rom_name: "X", netplay: true, names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, can_load }
+        GameView { rom_name: "X", netplay: true, names, stats: None, notice: None, desync: false, stalled: false, save_slot: None, slot_thumb: None, can_load }
     }
 
     #[test]
@@ -3795,13 +3807,39 @@ mod tests {
             ui.stack = vec![screen];
             ui.toast("Геймпад DualSense → игрок 2");
             let mut canvas = Canvas::new();
-            let game = (screen == Screen::Pause).then(|| GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice: None, desync: false, stalled: false, save_slot: None, can_load: true });
+            let game = (screen == Screen::Pause).then(|| GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice: None, desync: false, stalled: false, save_slot: None, slot_thumb: None, can_load: true });
             if game.is_some() {
                 canvas.clear(rgb(0x5C, 0x94, 0xFC));
             }
             let c = UiCtx { library: &[], scanning: false, lobby: Some(&lob), game, pads: &pads, config: &mut cfg, version: "0.1.0" };
             ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
             write_png(&format!("/tmp/ebobo-ui-{name}.png"), &canvas.px, 256, 240);
+        }
+        // Solo pause menu with the selected slot's picture (sky, ground, a white square):
+        // on Save in both languages, and on the Slot row.
+        let mut thumb = Vec::with_capacity(slots::THUMB_W * slots::THUMB_H * 4);
+        for y in 0..slots::THUMB_H {
+            for x in 0..slots::THUMB_W {
+                let square = (20..28).contains(&x) && (22..30).contains(&y);
+                thumb.extend_from_slice(&if square { WHITE } else if y < 30 { rgb(0x5C, 0x94, 0xFC) } else { OK });
+            }
+        }
+        let saved = SystemTime::now() - Duration::from_secs(5 * 60);
+        for (path, lang, sel) in [
+            ("/tmp/ebobo-pause-thumb-ru.png", Lang::Ru, 2),
+            ("/tmp/ebobo-pause-thumb-en.png", Lang::En, 2),
+            ("/tmp/ebobo-pause-thumb-slot-ru.png", Lang::Ru, 1),
+            ("/tmp/ebobo-pause-thumb-slot-en.png", Lang::En, 1),
+        ] {
+            let mut ui = Ui::new(lang);
+            ui.show_pause();
+            ui.sel[Screen::Pause.slot()] = sel;
+            let mut canvas = Canvas::new();
+            canvas.clear(rgb(0x5C, 0x94, 0xFC));
+            let game = GameView { rom_name: "Test Game (USA)", netplay: false, names: &[], stats: None, notice: None, desync: false, stalled: false, save_slot: Some((1, Some(saved))), slot_thumb: Some(&thumb), can_load: false };
+            let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
+            ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
+            write_png(path, &canvas.px, 256, 240);
         }
     }
 
@@ -3958,7 +3996,7 @@ mod tests {
         let mut canvas = Canvas::new();
         canvas.clear(rgb(0x5C, 0x94, 0xFC));
         let notice = Some("Ждём Саша... 7 с".to_string());
-        let game = GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice, desync: false, stalled: true, save_slot: None, can_load: false };
+        let game = GameView { rom_name: "Test Game (USA)", netplay: true, names: &names, stats: Some(&stats), notice, desync: false, stalled: true, save_slot: None, slot_thumb: None, can_load: false };
         let c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(game), pads: &pads, config: &mut cfg, version: "0.1.0" };
         ui.draw(&mut canvas, &mut font, &c, &hint(PadKind::PlayStation));
         write_png("/tmp/ebobo-ui-game-wait.png", &canvas.px, 256, 240);

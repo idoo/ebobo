@@ -75,6 +75,56 @@ pub fn saved_at(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// Size of a slot's picture, pixels.
+pub const THUMB_W: usize = 64;
+pub const THUMB_H: usize = 48;
+
+/// The picture file of a slot: the state's name with `thumb` in place of `state`.
+pub fn thumb_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("thumb")
+}
+
+/// Shrinks a `w`x`h` straight-RGBA frame to `THUMB_W`x`THUMB_H` opaque RGBA: every thumbnail
+/// pixel is the average of the block of frame pixels it covers. A frame with no pixels (or a
+/// buffer shorter than `w * h * 4`) gives a black picture.
+pub fn shrink(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(THUMB_W * THUMB_H * 4);
+    let usable = w > 0 && h > 0 && rgba.len() >= w * h * 4;
+    for oy in 0..THUMB_H {
+        for ox in 0..THUMB_W {
+            let mut sum = [0u32; 3];
+            let mut n = 0u32;
+            if usable {
+                // The block never is empty, also when the frame is smaller than the thumbnail.
+                let (x0, y0) = (ox * w / THUMB_W, oy * h / THUMB_H);
+                let x1 = ((ox + 1) * w / THUMB_W).max(x0 + 1);
+                let y1 = ((oy + 1) * h / THUMB_H).max(y0 + 1);
+                for y in y0..y1 {
+                    for p in rgba[(y * w + x0) * 4..(y * w + x1) * 4].chunks_exact(4) {
+                        sum[0] += p[0] as u32;
+                        sum[1] += p[1] as u32;
+                        sum[2] += p[2] as u32;
+                        n += 1;
+                    }
+                }
+            }
+            let n = n.max(1);
+            out.extend_from_slice(&[(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, 255]);
+        }
+    }
+    out
+}
+
+/// Writes a slot's picture (atomically, like the state).
+pub fn save_thumb(path: &Path, thumb: &[u8]) -> io::Result<()> {
+    write(path, thumb)
+}
+
+/// A slot's picture; `None` when there is none or the file is not a whole picture.
+pub fn load_thumb(path: &Path) -> Option<Vec<u8>> {
+    std::fs::read(path).ok().filter(|b| b.len() == THUMB_W * THUMB_H * 4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +186,41 @@ mod tests {
         assert_eq!(LoadError::State(StateError::WrongRom).text(), Text::StateWrongRom);
         assert_eq!(LoadError::State(StateError::Version(0)).text(), Text::StateOldVersion);
         assert_eq!(LoadError::State(StateError::BadMagic).text(), Text::StateCorrupt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_slot_thumb_shrinks_both_frame_sizes() {
+        for (w, h) in [(256usize, 240usize), (320, 224)] {
+            let mut frame = Vec::with_capacity(w * h * 4);
+            for _ in 0..h {
+                for x in 0..w {
+                    frame.extend_from_slice(if x < w / 2 { &[255, 0, 0, 7] } else { &[0, 0, 255, 7] });
+                }
+            }
+            let t = shrink(&frame, w, h);
+            assert_eq!(t.len(), THUMB_W * THUMB_H * 4, "{w}x{h}");
+            for y in 0..THUMB_H {
+                for x in 0..THUMB_W {
+                    let i = (y * THUMB_W + x) * 4;
+                    let want = if x < THUMB_W / 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+                    assert_eq!(t[i..i + 4], want, "{w}x{h} at {x},{y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn app_slot_thumb_file_must_be_whole() {
+        let dir = tmp_dir("thumb");
+        let p = thumb_path(&path(&dir, "game", 0xAB, 0));
+        assert_eq!(p.file_name().unwrap().to_str().unwrap(), "game-000000ab.1.thumb");
+        assert!(load_thumb(&p).is_none());
+        let thumb = shrink(&[9; 8 * 8 * 4], 8, 8);
+        save_thumb(&p, &thumb).unwrap();
+        assert_eq!(load_thumb(&p), Some(thumb.clone()));
+        std::fs::write(&p, &thumb[..100]).unwrap();
+        assert!(load_thumb(&p).is_none(), "a cut file is no picture");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

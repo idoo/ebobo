@@ -154,6 +154,28 @@ impl Canvas {
             }
         }
     }
+
+    /// Copies an opaque `w`x`h` RGBA picture with its top-left corner at `(x, y)`; the part
+    /// outside the canvas is dropped. A buffer shorter than `w * h * 4` draws nothing.
+    pub fn blit(&mut self, x: i32, y: i32, w: usize, h: usize, rgba: &[u8]) {
+        if rgba.len() < w * h * 4 {
+            return;
+        }
+        // Columns and rows of the picture that land on the canvas.
+        let sx0 = (-x).max(0) as usize;
+        let sx1 = w.min((W as i32 - x).max(0) as usize);
+        let sy0 = (-y).max(0) as usize;
+        let sy1 = h.min((H as i32 - y).max(0) as usize);
+        if sx0 >= sx1 {
+            return;
+        }
+        for sy in sy0..sy1 {
+            let dst = ((y + sy as i32) as usize * W + (x + sx0 as i32) as usize) * 4;
+            let src = (sy * w + sx0) * 4;
+            let len = (sx1 - sx0) * 4;
+            self.px[dst..dst + len].copy_from_slice(&rgba[src..src + len]);
+        }
+    }
 }
 
 const FONT_TTF: &[u8] = include_bytes!("../assets/PressStart2P-Regular.ttf");
@@ -372,6 +394,30 @@ mod tests {
 
     fn placed(clip: (i32, i32, i32, i32)) -> Placed {
         Placed { id: (1 << 32) | 0xDEAD_BEEF, x: -10, y: -10, w: 44, h: 62, clip, back: [1, 2, 3, 255], alpha: 255 }
+    }
+
+    #[test]
+    fn canvas_blit_is_clipped_to_the_canvas() {
+        let pic = [200u8; 8 * 8 * 4];
+        let mut c = Canvas::new();
+        // Half off the right edge: only the four columns inside are written, nothing wraps round.
+        c.blit(W as i32 - 4, 10, 8, 8, &pic);
+        assert_eq!(c.px.chunks_exact(4).filter(|p| **p == [200; 4]).count(), 4 * 8);
+        assert_eq!(px(&c, W - 4, 10), [200; 4]);
+        assert_eq!(px(&c, W - 1, 17), [200; 4]);
+        assert_eq!(px(&c, 0, 11), [0, 0, 0, 255]);
+        assert_eq!(px(&c, W - 5, 10), [0, 0, 0, 255]);
+        // Off the top-left corner and fully outside.
+        let mut c = Canvas::new();
+        c.blit(-4, -4, 8, 8, &pic);
+        c.blit(W as i32, H as i32 - 2, 8, 8, &pic);
+        c.blit(-8, 0, 8, 8, &pic);
+        assert_eq!(c.px.chunks_exact(4).filter(|p| **p == [200; 4]).count(), 4 * 4);
+        assert_eq!(px(&c, 3, 3), [200; 4]);
+        // Off the bottom edge.
+        let mut c = Canvas::new();
+        c.blit(0, H as i32 - 2, 8, 8, &pic);
+        assert_eq!(c.px.chunks_exact(4).filter(|p| **p == [200; 4]).count(), 8 * 2);
     }
 
     /// Values computed by the formulas the canvas had before it learned about transparency.

@@ -7,7 +7,7 @@ mod moment;
 mod netsave;
 mod png;
 mod rewind;
-mod slots;
+pub(crate) mod slots;
 mod steam_input;
 mod update;
 
@@ -72,6 +72,9 @@ struct Solo {
     /// Current save-state slot (0-based) and when each slot file was written (`None` = empty).
     slot: u8,
     slot_times: [Option<std::time::SystemTime>; slots::SLOTS as usize],
+    /// Each slot's picture (`slots::THUMB_W` x `slots::THUMB_H` RGBA); `None` = empty slot or
+    /// a save made before pictures existed.
+    slot_thumbs: [Option<Vec<u8>>; slots::SLOTS as usize],
     /// Rewind history: a snapshot and the pads of the frame run right after it.
     rewind: rewind::Ring<(Snapshot, [u16; 4])>,
     /// Frames run since the last snapshot was pushed (one every `rewind::EVERY`).
@@ -758,7 +761,22 @@ impl App {
                     let path = s.slot_path(s.slot);
                     let text = match slots::save(&s.console, &path) {
                         Ok(()) => {
-                            s.slot_times[s.slot as usize] = slots::saved_at(&path);
+                            let slot = s.slot as usize;
+                            s.slot_times[slot] = slots::saved_at(&path);
+                            // The picture now on screen goes next to the state. Without it the
+                            // save still counts, and the slot must not keep its old picture.
+                            let mut frame = Vec::new();
+                            let (w, h) = s.console.frame_rgba(&mut frame);
+                            let thumb = slots::shrink(&frame, w, h);
+                            let thumb_path = slots::thumb_path(&path);
+                            s.slot_thumbs[slot] = match slots::save_thumb(&thumb_path, &thumb) {
+                                Ok(()) => Some(thumb),
+                                Err(err) => {
+                                    eprintln!("ebobo: save picture {}: {err}", thumb_path.display());
+                                    let _ = std::fs::remove_file(&thumb_path);
+                                    None
+                                }
+                            };
                             self.ui.hide();
                             Text::StateSaved
                         }
@@ -916,6 +934,7 @@ impl App {
             moment_at: Instant::now(),
             slot: 0,
             slot_times: [None; slots::SLOTS as usize],
+            slot_thumbs: Default::default(),
             rewind: rewind::Ring::new(rewind::BUDGET_BYTES, snapshot_bytes),
             since_snapshot: 0,
             rewinding: false,
@@ -923,7 +942,9 @@ impl App {
             ff_held: false,
         };
         for slot in 0..slots::SLOTS {
-            solo.slot_times[slot as usize] = slots::saved_at(&solo.slot_path(slot));
+            let path = solo.slot_path(slot);
+            solo.slot_times[slot as usize] = slots::saved_at(&path);
+            solo.slot_thumbs[slot as usize] = slots::load_thumb(&slots::thumb_path(&path));
         }
         self.game_started(solo.console.system(), solo.console.crc32());
         self.input.reset_seats();
@@ -1531,6 +1552,7 @@ fn make_ctx<'a>(
             desync: false,
             stalled: false,
             save_slot: Some((s.slot, s.slot_times[s.slot as usize])),
+            slot_thumb: s.slot_thumbs[s.slot as usize].as_deref(),
             can_load: false,
         }),
         State::Net(n) => Some(GameView {
@@ -1542,6 +1564,7 @@ fn make_ctx<'a>(
             desync: n.desync,
             stalled: n.last_advance.elapsed() > STALL_DIM_AFTER,
             save_slot: None,
+            slot_thumb: None,
             can_load: n.session.has_save(),
         }),
         State::Menu | State::Lobby(_) => None,
