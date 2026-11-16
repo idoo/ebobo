@@ -310,6 +310,9 @@ fn blank_status() -> LobbyStatus {
         can_start: false,
         error: None,
         resume: None,
+        order: Vec::new(),
+        saves: SavePolicy::Everyone,
+        regrouped: false,
     }
 }
 
@@ -340,6 +343,7 @@ fn add_guest(w: &mut Worker, g: u8, guests: &[u8]) {
     p.ready = true;
     p.links = [0].iter().chain(guests).copied().filter(|o| *o != g).collect();
     w.peers.insert(PeerId(g), p);
+    w.admit(PeerId(g));
 }
 
 /// Guest with the ROM and game info, so a `start` gets as far as the saved game.

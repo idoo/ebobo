@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::mesh::{Link, Mesh, MeshConfig, MeshEvent, MeshRole};
 use crate::packet::{Packet, ROM_CHUNK_DATA, STATE_CHUNK_DATA};
 use crate::transport::{PeerId, RouteKind};
-use crate::{NetError, MAX_PLAYERS, PROTOCOL_VERSION};
+use crate::{NetError, SavePolicy, MAX_PLAYERS, PROTOCOL_VERSION};
 
 const TICK: Duration = Duration::from_millis(4);
 const CTRL_RETRY: Duration = Duration::from_millis(200);
@@ -128,6 +128,8 @@ pub struct PlayerInfo {
     /// The server lost this player's connection; they may come back within 60 s (shown as
     /// "reconnecting" instead of disappearing). Always false for self.
     pub away: bool,
+    /// Local players this device brings (seats the host gave it), at least 1.
+    pub seats: u8,
 }
 
 /// Snapshot of the lobby for the UI; cheap to clone, refreshed by the lobby thread.
@@ -146,6 +148,13 @@ pub struct LobbyStatus {
     pub error: Option<NetError>,
     /// The save the host will start from; `None` = a new game. Guests learn it from the host.
     pub resume: Option<ResumeInfo>,
+    /// Seat i (controller i+1) → peer; a peer appears once per local player. The host owns it,
+    /// guests learn it from the host.
+    pub order: Vec<PeerId>,
+    /// Who may save in the game: the host's choice; guests learn it from the host.
+    pub saves: SavePolicy,
+    /// This room came back from a running game: Start continues it.
+    pub regrouped: bool,
 }
 
 /// Everything the game loop needs once the host pressed start.
@@ -172,6 +181,8 @@ pub struct GameStart {
     pub state: Option<Vec<u8>>,
     /// What `state` is (kind and age), as the host announced it with the start; `None` with it.
     pub resume: Option<ResumeInfo>,
+    /// Who may save in this game, as the host set it in the room.
+    pub saves: SavePolicy,
 }
 
 /// Handle to the lobby thread.
@@ -201,6 +212,9 @@ impl Lobby {
             can_start: false,
             error: None,
             resume: None,
+            order: Vec::new(),
+            saves: SavePolicy::Everyone,
+            regrouped: false,
         }));
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (game_tx, game_rx) = mpsc::channel();
@@ -232,6 +246,23 @@ impl Lobby {
         self.game.try_recv().ok()
     }
 
+    /// How many local players this device brings, 1..=4. The host applies it to its own seats;
+    /// a guest asks the host, which gives as many as are free.
+    pub fn set_seats(&self, n: u8) {
+        let _ = self.cmd.send(Cmd::SetSeats(n));
+    }
+
+    /// Host only: swaps seat `seat` (index into `LobbyStatus::order`) with the one before it
+    /// (`up`) or after it. Out of range does nothing.
+    pub fn move_seat(&self, seat: usize, up: bool) {
+        let _ = self.cmd.send(Cmd::MoveSeat(seat, up));
+    }
+
+    /// Host only: who may save in the game.
+    pub fn set_saves(&self, p: SavePolicy) {
+        let _ = self.cmd.send(Cmd::SetSaves(p));
+    }
+
     /// Leaves the room (BYE/leave to peers) and stops the thread.
     pub fn leave(self) {
         drop(self);
@@ -250,6 +281,9 @@ impl Drop for Lobby {
 enum Cmd {
     StartGame,
     SetResume(Option<Resume>),
+    SetSeats(u8),
+    MoveSeat(usize, bool),
+    SetSaves(SavePolicy),
     Leave,
 }
 
@@ -278,6 +312,7 @@ struct ListEntry {
     name: String,
     ready: bool,
     rom: RomState,
+    seats: u8,
 }
 
 struct Pending {
@@ -496,6 +531,8 @@ struct Peer {
     bad_version: bool,
     /// The server reported this peer's WebSocket dropped (`away`) and not yet `back`.
     away: bool,
+    /// Host: refused because every seat was taken (`room_full`); not a player of this room.
+    full: bool,
 }
 
 impl Peer {
@@ -511,6 +548,7 @@ impl Peer {
             sent_players: None,
             bad_version: false,
             away: false,
+            full: false,
         }
     }
 }
@@ -561,6 +599,14 @@ struct Worker {
     /// The host's resume choice from its `players` message.
     announced: Option<ResumeInfo>,
     state_rx: Option<StateRx>,
+    // Both.
+    /// Seat i (controller i+1) → peer. The host owns it and starts with itself on seat 1; a
+    /// guest copies it from the host's `players` message.
+    order: Vec<PeerId>,
+    /// Local players this device wants (`Lobby::set_seats`).
+    want_seats: u8,
+    /// Who may save in the game: the host's choice, or what it announced.
+    saves: SavePolicy,
 }
 
 /// One-way latency, in frames, that the input delay hides outright: 3 frames (50 ms at 60 fps)
@@ -615,6 +661,9 @@ fn run(cfg: LobbyConfig, shared: Arc<Mutex<LobbyStatus>>, cmds: Receiver<Cmd>, g
             match cmds.try_recv() {
                 Ok(Cmd::StartGame) => w.start_game(),
                 Ok(Cmd::SetResume(resume)) => w.set_resume(resume),
+                Ok(Cmd::SetSeats(n)) => w.set_seats(n),
+                Ok(Cmd::MoveSeat(seat, up)) => w.move_seat(seat, up),
+                Ok(Cmd::SetSaves(p)) => w.set_saves(p),
                 Ok(Cmd::Leave) | Err(TryRecvError::Disconnected) => {
                     w.leave();
                     return;
@@ -705,6 +754,7 @@ fn error_of(msg: &str) -> NetError {
         "rom_missing" => NetError::RomMissing,
         "host_left" => NetError::HostLeft,
         "save" => NetError::SaveTransfer,
+        "room_full" => NetError::RoomFull,
         other => NetError::Io(other.to_string()),
     }
 }
@@ -747,6 +797,9 @@ impl Worker {
             host_list: None,
             announced: None,
             state_rx: None,
+            order: if is_host { vec![PeerId(0)] } else { Vec::new() },
+            want_seats: 1,
+            saves: SavePolicy::Everyone,
         }
     }
 
@@ -762,6 +815,82 @@ impl Worker {
     fn set_resume(&mut self, resume: Option<Resume>) {
         if self.is_host && self.offer.is_none() && self.pending_start.is_none() {
             self.resume = resume;
+        }
+    }
+
+    /// Peers that play in this room: everyone but the guests the host refused for lack of a seat.
+    fn seated(&self) -> impl Iterator<Item = (&PeerId, &Peer)> + '_ {
+        self.peers.iter().filter(|(_, p)| !p.full)
+    }
+
+    /// Seats `id` holds.
+    fn seats_of(&self, id: PeerId) -> usize {
+        self.order.iter().filter(|p| **p == id).count()
+    }
+
+    /// Host: a guest it has not seated yet gets one seat. With no seat free it is told
+    /// `room_full` (it fails with `NetError::RoomFull`) and is neither a player nor waited for.
+    fn admit(&mut self, id: PeerId) {
+        if !self.is_host || self.order.contains(&id) || self.peers.get(&id).is_some_and(|p| p.full) {
+            return;
+        }
+        if self.order.len() < MAX_PLAYERS {
+            self.order.push(id);
+            return;
+        }
+        self.send_ctrl(id, json!({"t": "error", "msg": "room_full"}));
+        let p = self.peers.entry(id).or_insert_with(Peer::new);
+        p.full = true;
+        p.ready = false;
+        p.xfer = None;
+    }
+
+    /// Host: `peer` gets up to `n` seats (1..=`MAX_PLAYERS`): new ones go to the end while seats
+    /// are free, extra ones are taken from its last. Ignored once `start` went out.
+    fn resize_seats(&mut self, peer: PeerId, n: u8) {
+        if self.pending_start.is_some() {
+            return;
+        }
+        let n = usize::from(n).clamp(1, MAX_PLAYERS);
+        let mut have = self.seats_of(peer);
+        while have < n && self.order.len() < MAX_PLAYERS {
+            self.order.push(peer);
+            have += 1;
+        }
+        while have > n {
+            if let Some(last) = self.order.iter().rposition(|p| *p == peer) {
+                self.order.remove(last);
+            }
+            have -= 1;
+        }
+    }
+
+    /// This device's local players: the host changes its own seats, a guest asks the host
+    /// (once it heard the host's `game`; before that `on_game` asks).
+    fn set_seats(&mut self, n: u8) {
+        self.want_seats = n.clamp(1, MAX_PLAYERS as u8);
+        if self.is_host {
+            self.resize_seats(self.me.unwrap_or(PeerId(0)), self.want_seats);
+        } else if self.game.is_some() && self.stage == Stage::Lobby {
+            self.send_ctrl(PeerId(0), json!({"t": "seats", "n": self.want_seats}));
+        }
+    }
+
+    /// Host: swaps seat `seat` with the one before it (`up`) or after it.
+    fn move_seat(&mut self, seat: usize, up: bool) {
+        if !self.is_host || self.pending_start.is_some() {
+            return;
+        }
+        let other = if up { seat.checked_sub(1) } else { seat.checked_add(1) };
+        if let Some(other) = other.filter(|o| seat.max(*o) < self.order.len()) {
+            self.order.swap(seat, other);
+        }
+    }
+
+    /// Host: who may save in the game. Ignored once `start` went out.
+    fn set_saves(&mut self, p: SavePolicy) {
+        if self.is_host && self.pending_start.is_none() {
+            self.saves = p;
         }
     }
 
@@ -798,11 +927,15 @@ impl Worker {
                 if !name.is_empty() {
                     p.name = name;
                 }
+                self.admit(id);
             }
             MeshEvent::RouteUp { id, kind } => {
                 self.peers.entry(id).or_insert_with(Peer::new).route = Some(kind);
                 if self.is_host {
-                    self.send_game(id);
+                    self.admit(id);
+                    if !self.peers.get(&id).is_some_and(|p| p.full) {
+                        self.send_game(id);
+                    }
                 }
             }
             MeshEvent::RouteChanged { id, kind } => {
@@ -837,6 +970,9 @@ impl Worker {
 
     fn peer_left(&mut self, id: PeerId) {
         self.peers.remove(&id);
+        if self.is_host {
+            self.order.retain(|p| *p != id);
+        }
         if let Some(list) = &mut self.host_list {
             list.retain(|e| e.id != id);
         }
@@ -921,8 +1057,14 @@ impl Worker {
             self.refuse_version(from);
             return;
         }
+        if t == "seats" {
+            if !self.peers.get(&from).is_none_or(|p| p.bad_version || p.full) {
+                self.resize_seats(from, v["n"].as_u64().unwrap_or(1).clamp(1, MAX_PLAYERS as u64) as u8);
+            }
+            return;
+        }
         let p = self.peers.entry(from).or_insert_with(Peer::new);
-        if p.bad_version {
+        if p.bad_version || p.full {
             return;
         }
         match t {
@@ -983,11 +1125,16 @@ impl Worker {
                             name: e["name"].as_str().unwrap_or("").to_string(),
                             ready: e["ready"].as_bool().unwrap_or(false),
                             rom,
+                            seats: e["seats"].as_u64().unwrap_or(1).clamp(1, MAX_PLAYERS as u64) as u8,
                         })
                     })
                     .collect();
                 self.host_list = Some(list);
                 self.announced = resume_of(&v["resume"]);
+                if let Some(order) = v["order"].as_array() {
+                    self.order = order.iter().filter_map(Value::as_u64).map(|x| PeerId(x as u8)).collect();
+                }
+                self.saves = SavePolicy::parse(v["saves"].as_str());
             }
             "start" => {
                 if self.stage != Stage::Lobby {
@@ -1005,6 +1152,9 @@ impl Worker {
                 let delay_auto = v["auto"].as_bool().unwrap_or(false);
                 let four = v["four_score"].as_bool().unwrap_or(slots.len() > 2);
                 let (rom_name, region) = (game.rom_name.clone(), game.region);
+                // The policy travels with the start: the `players` message that changed it may
+                // still be on its way.
+                self.saves = SavePolicy::parse(v["saves"].as_str());
                 let state = match v.get("state").filter(|s| !s.is_null()) {
                     None => {
                         self.state_rx = None;
@@ -1045,7 +1195,12 @@ impl Worker {
             self.fail(NetError::BadRom("game message without a known region".into()));
             return;
         };
+        let first = self.game.is_none();
         self.game = Some(GameInfo { crc, rom_name: v["rom"]["name"].as_str().unwrap_or("").to_string(), region });
+        // `set_seats` before the host was heard could not ask; ask now.
+        if first && self.want_seats != 1 {
+            self.send_ctrl(host, json!({"t": "seats", "n": self.want_seats}));
+        }
         if self.rom.is_some() {
             return;
         }
@@ -1243,7 +1398,7 @@ impl Worker {
         let Some(o) = self.offer.as_mut() else { return };
         let chunks = state_chunks(o.state.len());
         for (id, p) in &self.peers {
-            if p.route.is_some() {
+            if p.route.is_some() && !p.full {
                 o.tx.entry(*id).or_insert_with(|| StateTx::new(chunks));
             }
         }
@@ -1276,21 +1431,25 @@ impl Worker {
         let Some(me) = self.me else { return };
         let mut list = vec![json!({
             "id": me.0, "name": self.nickname, "route": "self", "rtt": 0, "ready": true,
-            "rom": "have", "pct": 100,
+            "rom": "have", "pct": 100, "seats": self.seats_of(me),
         })];
-        for (id, p) in &self.peers {
+        for (id, p) in self.seated() {
             let (rom, pct) = rom_json(p.rom);
             list.push(json!({
                 "id": id.0, "name": p.name, "route": route_str(p.route), "rtt": Self::rtt_ms(p),
-                "ready": p.ready, "rom": rom, "pct": pct,
+                "ready": p.ready, "rom": rom, "pct": pct, "seats": self.seats_of(*id),
             }));
         }
-        let text = json!({"t": "players", "list": list, "resume": resume_json(self.resume_info())});
+        let order: Vec<u8> = self.order.iter().map(|p| p.0).collect();
+        let text = json!({
+            "t": "players", "list": list, "resume": resume_json(self.resume_info()),
+            "order": order, "saves": self.saves.as_str(),
+        });
         let key = text.to_string();
         let targets: Vec<PeerId> = self
             .peers
             .iter()
-            .filter(|(_, p)| p.route.is_some() && p.sent_players.as_ref() != Some(&key))
+            .filter(|(_, p)| !p.full && p.route.is_some() && p.sent_players.as_ref() != Some(&key))
             .map(|(id, _)| *id)
             .collect();
         for id in targets {
@@ -1310,11 +1469,11 @@ impl Worker {
         if !self.is_host || self.stage != Stage::Lobby || self.me.is_none() {
             return false;
         }
-        let ids: Vec<u8> = self.peers.keys().map(|p| p.0).collect();
+        let ids: Vec<u8> = self.seated().map(|(p, _)| p.0).collect();
         let me = self.me.map_or(0, |m| m.0);
         !ids.is_empty()
-            && ids.len() < MAX_PLAYERS
-            && self.peers.iter().all(|(id, p)| {
+            && ids.iter().all(|id| self.order.contains(&PeerId(*id)))
+            && self.seated().all(|(id, p)| {
                 p.route.is_some()
                     && p.ready
                     && ids.iter().chain([&me]).filter(|&&o| o != id.0).all(|o| p.links.contains(o))
@@ -1345,31 +1504,32 @@ impl Worker {
             crc: ebobo_console::crc32(&[&resume.state]),
             state: resume.state.clone(),
             deadline: Instant::now() + STATE_WAIT,
-            tx: self.peers.keys().map(|p| (*p, StateTx::new(chunks))).collect(),
+            tx: self.seated().map(|(p, _)| (*p, StateTx::new(chunks))).collect(),
         });
     }
 
     /// Host: locks the room and sends `start` (with the `state` announcement `(id, crc, bytes)`
     /// of a finished transfer); hands over once every guest acked it or `START_ACK_WAIT` passed.
     fn launch(&mut self, state: Option<(u32, u32, Vec<u8>)>) {
-        let (Some(me), Some(hr)) = (self.me, self.host_rom.as_ref()) else { return };
+        let (Some(_), Some(hr)) = (self.me, self.host_rom.as_ref()) else { return };
         let frame_ms = if hr.region.is_pal() { 20.0 } else { 16.64 };
         let header_four = hr.four_score;
-        let worst = self.peers.values().filter_map(|p| p.ctrl.delay_rtt()).fold(0.0, f64::max);
+        let worst = self.seated().filter_map(|(_, p)| p.ctrl.delay_rtt()).fold(0.0, f64::max);
         let delay = match self.input_delay {
             Some(d) => d as usize,
             None => auto_input_delay(worst, frame_ms),
         };
-        let mut slots = vec![me];
-        slots.extend(self.peers.keys().copied());
-        slots.sort();
+        let slots = self.order.clone();
         let four_score = slots.len() > 2 || header_four;
         if let Some(mesh) = self.mesh.as_mut() {
             mesh.lock_room();
         }
         let slot_ids: Vec<u8> = slots.iter().map(|p| p.0).collect();
         let delay_auto = self.input_delay.is_none();
-        let mut msg = json!({"t": "start", "slots": slot_ids, "delay": delay, "auto": delay_auto, "four_score": four_score});
+        let mut msg = json!({
+            "t": "start", "slots": slot_ids, "delay": delay, "auto": delay_auto, "four_score": four_score,
+            "saves": self.saves.as_str(),
+        });
         let resume = state.as_ref().and_then(|_| self.resume_info());
         if let Some((id, crc, bytes)) = &state {
             let mut announce = json!({"id": id, "size": bytes.len(), "crc32": format!("{crc:08x}")});
@@ -1379,7 +1539,7 @@ impl Worker {
             }
             msg["state"] = announce;
         }
-        let guests: Vec<PeerId> = self.peers.keys().copied().collect();
+        let guests: Vec<PeerId> = self.seated().map(|(p, _)| *p).collect();
         let acks = guests.into_iter().map(|g| (g, self.send_ctrl(g, msg.clone()))).collect();
         let state = state.map(|(_, _, bytes)| bytes);
         self.pending_start = Some(PendingStart {
@@ -1419,6 +1579,19 @@ impl Worker {
         self.peers.get(&id).map(|p| p.name.clone()).unwrap_or_default()
     }
 
+    /// Player names by slot: the second and later seats of one device are "<name> 2", "<name> 3",
+    /// "<name> 4".
+    fn slot_names(&self, slots: &[PeerId]) -> Vec<String> {
+        slots
+            .iter()
+            .enumerate()
+            .map(|(i, id)| match slots[..i].iter().filter(|p| *p == id).count() {
+                0 => self.name_of(*id),
+                before => format!("{} {}", self.name_of(*id), before + 1),
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn hand_over(
         &mut self,
@@ -1433,7 +1606,7 @@ impl Worker {
         resume: Option<ResumeInfo>,
     ) {
         let (Some(me), Some(mesh)) = (self.me, self.mesh.take()) else { return };
-        let names = slots.iter().map(|id| self.name_of(*id)).collect();
+        let names = self.slot_names(&slots);
         let game = GameStart {
             link: mesh.into_link(),
             me,
@@ -1447,6 +1620,7 @@ impl Worker {
             region,
             state,
             resume,
+            saves: self.saves,
         };
         let _ = self.game_tx.send(game);
         self.stage = Stage::Starting;
@@ -1475,6 +1649,7 @@ impl Worker {
                 rom: self_rom,
                 ready: self_ready,
                 away: false,
+                seats: self.seats_of(me).max(1) as u8,
             });
             match (&self.host_list, self.is_host) {
                 (Some(list), false) => {
@@ -1489,11 +1664,12 @@ impl Worker {
                             rom: e.rom,
                             ready: e.ready,
                             away: p.is_some_and(|p| p.away),
+                            seats: e.seats,
                         });
                     }
                 }
                 _ => {
-                    for (id, p) in &self.peers {
+                    for (id, p) in self.seated() {
                         let host_seen_by_guest = !self.is_host && *id == PeerId(0);
                         players.push(PlayerInfo {
                             id: *id,
@@ -1504,6 +1680,7 @@ impl Worker {
                             rom: if host_seen_by_guest { RomState::Have } else { p.rom },
                             ready: if host_seen_by_guest { true } else { p.ready },
                             away: p.away,
+                            seats: self.seats_of(*id).max(1) as u8,
                         });
                     }
                 }
@@ -1524,6 +1701,9 @@ impl Worker {
             can_start: self.can_start(),
             error: self.error.clone(),
             resume: self.resume_info(),
+            order: self.order.clone(),
+            saves: self.saves,
+            regrouped: false,
         }
     }
 

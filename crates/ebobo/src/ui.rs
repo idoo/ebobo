@@ -2739,9 +2739,11 @@ mod tests {
                 rom: if i == 2 { RomState::Receiving { percent: 45 } } else { RomState::Have },
                 ready: i != 2,
                 away: i == 2,
+                seats: 1,
             })
             .collect();
-        LobbyStatus { stage: Stage::Lobby, code: Some("K7QPA".into()), me: Some(PeerId(0)), is_host: host, players, rom_name: Some("Super Mario Bros. 3 (USA)".into()), can_start, error: None, resume: None }
+        let order = (0..n).map(|i| PeerId(i as u8)).collect();
+        LobbyStatus { stage: Stage::Lobby, code: Some("K7QPA".into()), me: Some(PeerId(0)), is_host: host, players, rom_name: Some("Super Mario Bros. 3 (USA)".into()), can_start, error: None, resume: None, order, saves: ebobo_net::SavePolicy::Everyone, regrouped: false }
     }
 
     #[test]
@@ -3964,6 +3966,7 @@ mod tests {
         let four = |host: bool, can_start: bool| {
             let mut l = lobby(3, host, can_start);
             l.players.push(PlayerInfo { id: PeerId(3), ..l.players[1].clone() });
+            l.order.push(PeerId(3));
             for (p, name) in l.players.iter_mut().zip(long) {
                 p.name = name.into();
             }
