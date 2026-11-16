@@ -180,6 +180,9 @@ struct App {
     autostart: Option<usize>,
     /// Room code already printed to stdout.
     room_printed: bool,
+    /// Host: the game went back to the room for a newcomer, so it starts again by itself as
+    /// soon as the room can start.
+    auto_continue: bool,
     /// Running network check (Settings ▸ Advanced ▸ Network check).
     net_check: Option<mpsc::Receiver<NetDiag>>,
     /// Self-update from GitHub releases (checked on start unless `config.auto_update` is off).
@@ -375,6 +378,7 @@ impl App {
             away: false,
             autostart: cli.autostart,
             room_printed: false,
+            auto_continue: false,
             net_check: None,
             updater,
             mouse_at: None,
@@ -694,6 +698,11 @@ impl App {
                 self.autostart = None;
             }
         }
+        // Back in the room for a newcomer: continue once it is ready (or was refused or left).
+        if self.auto_continue && status.is_host && status.regrouped && status.can_start {
+            lobby.start_game();
+            self.auto_continue = false;
+        }
         if let Some(start) = lobby.take_game() {
             let routes: Vec<String> = status
                 .players
@@ -768,6 +777,7 @@ impl App {
                 }
             }
             UiAction::Resume => self.ui.hide(),
+            UiAction::BackToRoom => self.regroup(false),
             UiAction::Reset => {
                 match &mut self.state {
                     State::Solo(s) => {
@@ -1061,6 +1071,7 @@ impl App {
     /// `lobby` is the room it starts from; when the game cannot start, the room is left.
     fn start_net(&mut self, start: GameStart, lobby: Lobby) {
         let resume = start.resume.map(|r| r.kind);
+        self.auto_continue = false;
         if let Some(audio) = &mut self.audio {
             audio.clear();
         }
@@ -1187,9 +1198,44 @@ impl App {
             State::Solo(_) | State::Menu => {}
         }
         self.lobby_status = None;
+        self.auto_continue = false;
         if let Some(audio) = &mut self.audio {
             audio.clear();
         }
+    }
+
+    /// Takes the online game back to its room on the same connections (a newcomer knocked, or
+    /// the host chose "Back to the room"). The host hands the room the game's current state
+    /// to continue from, and keeps it as the last moment too, so nothing is lost if the room
+    /// falls apart. `auto`: the host starts the game again by itself once the room can start.
+    fn regroup(&mut self, auto: bool) {
+        if !matches!(self.state, State::Net(_)) {
+            return;
+        }
+        let State::Net(net) = std::mem::replace(&mut self.state, State::Menu) else { return };
+        let Net { console, session, lobby, me, gone, saves, .. } = *net;
+        let resume = (me == PeerId(0)).then(|| {
+            let state = console.save_state();
+            if saves != SavePolicy::Off {
+                let dir = netsave::dir();
+                match netsave::write(&dir, console.crc32(), ResumeKind::Last, &state) {
+                    Ok(()) => println!("ebobo: last moment on regroup sha {}", netsave::sha16(&state)),
+                    Err(err) => eprintln!("ebobo: cannot write {}: {err}", netsave::path(&dir, console.crc32(), ResumeKind::Last).display()),
+                }
+            }
+            let saved_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            Resume { kind: ResumeKind::Last, saved_at, state }
+        });
+        self.auto_continue = auto && resume.is_some();
+        lobby.regroup(session.into_link(), gone, resume);
+        self.lobby_status = Some(lobby.status());
+        self.state = State::Lobby(lobby);
+        self.ui.show_lobby();
+        if let Some(audio) = &mut self.audio {
+            audio.clear();
+        }
+        println!("ebobo: back to the room");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     /// Writes the solo game's moment, the state it continues from next time; nothing when
@@ -1260,6 +1306,8 @@ impl App {
                 n.session.poll();
                 // Who made the save `take_saved` holds: its `Saved` event comes with it.
                 let mut saver = None;
+                // Going back to the room happens after the events: `n` is borrowed here.
+                let mut regroup = None;
                 for event in n.session.events() {
                     match event {
                         NetEvent::Interrupted { peer, disconnect_in_ms } => {
@@ -1293,8 +1341,16 @@ impl App {
                             self.ui.toast(&text);
                         }
                         NetEvent::Synchronizing { .. } | NetEvent::Synchronized { .. } => {}
+                        // A newcomer knocks: the host takes everyone back to the room. The
+                        // host's call to go back reaches a guest as `Regroup`.
+                        NetEvent::Knock { .. } if n.me == PeerId(0) => regroup = Some(true),
+                        NetEvent::Regroup if n.me != PeerId(0) => regroup = Some(false),
                         NetEvent::Knock { .. } | NetEvent::Regroup => {}
                     }
+                }
+                if let Some(auto) = regroup {
+                    self.regroup(auto);
+                    return;
                 }
                 if n.slots.iter().all(|p| *p == n.me || n.gone.contains(p)) {
                     let text = format_text(self.ui.text(Text::PeerLeft), &n.others(), 0);

@@ -54,6 +54,8 @@ pub enum UiAction {
     /// Pause menu slot row changed the current save slot (0-based).
     SelectSlot(u8),
     LeaveGame,
+    /// Host: take everyone from the running online game back to the room.
+    BackToRoom,
     /// `UiCtx::config` was edited; the app saves it and applies scale/volume/fullscreen.
     ConfigChanged,
     Rescan,
@@ -361,6 +363,21 @@ const MAIN_ITEMS: [S; 6] = [S::CreateRoom, S::JoinByCode, S::PlaySolo, S::ByIp, 
 const PAUSE_SOLO: [S; 6] = [S::Resume, S::Slot, S::SaveState, S::LoadState, S::Reset, S::ExitToMenu];
 const PAUSE_NET: [S; 5] = [S::Resume, S::SaveAll, S::LoadAll, S::ResetAll, S::ExitGame];
 const DELAYS: [Option<u8>; 7] = [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)];
+
+/// Rows of the pause menu: the solo ones, or the online ones with "Back to the room" before
+/// the exit row for the host.
+fn pause_items(game: Option<&GameView>) -> Vec<S> {
+    match game {
+        Some(g) if g.netplay => {
+            let mut items = PAUSE_NET.to_vec();
+            if g.host {
+                items.insert(items.len() - 1, S::BackToRoom);
+            }
+            items
+        }
+        _ => PAUSE_SOLO.to_vec(),
+    }
+}
 
 /// Hint bar glyphs.
 #[derive(Clone, Copy)]
@@ -873,7 +890,7 @@ impl Ui {
                 // A player the room does not let save can neither save nor load.
                 let can_save = ctx.game.as_ref().is_some_and(|g| g.can_save);
                 let can_load = can_save && ctx.game.as_ref().is_some_and(|g| g.can_load);
-                let items: &[S] = if netplay { &PAUSE_NET } else { &PAUSE_SOLO };
+                let items = pause_items(ctx.game.as_ref());
                 let sel = self.sel[top.slot()].min(items.len() - 1);
                 if items[sel] == S::Slot && (nav.left || nav.right || nav.confirm) {
                     let (slot, _) = ctx.game.as_ref().and_then(|g| g.save_slot)?;
@@ -898,6 +915,7 @@ impl Ui {
                         return None;
                     }
                     S::Reset | S::ResetAll => UiAction::Reset,
+                    S::BackToRoom => UiAction::BackToRoom,
                     _ if netplay => {
                         self.ask_leave(S::LeaveGameQ, UiAction::LeaveGame);
                         return None;
@@ -2058,7 +2076,7 @@ impl Ui {
         if netplay {
             f.draw_centered(c, 72, self.t(S::NetRunning), WARN, 1);
         }
-        let list: &[S] = if netplay { &PAUSE_NET } else { &PAUSE_SOLO };
+        let list = pause_items(ctx.game.as_ref());
         let items: Vec<Item> = list
             .iter()
             .map(|s| match (s, ctx.game.as_ref().and_then(|g| g.save_slot)) {
@@ -3193,6 +3211,39 @@ mod tests {
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::LoadState));
         ui.update(&nav(|n| n.down = true), &mut c, DT);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::Reset));
+    }
+
+    #[test]
+    fn ui_netplay_pause_follows_save_setting_and_host() {
+        let mut cfg = Config::default();
+        let names = vec!["A".to_string(), "B".to_string()];
+        let rows = |ui: &Ui| -> Vec<bool> { ui.regions.iter().filter_map(|(_, h)| if let Hit::Row { enabled, .. } = h { Some(*enabled) } else { None }).collect() };
+        // A guest under "host only": Save and Load are off, and there is no way back to the room.
+        let mut ui = Ui::new(Lang::Ru);
+        ui.show_pause();
+        let guest = GameView { can_save: false, ..net_game(&names, true) };
+        let mut c = UiCtx { library: &[], scanning: false, lobby: None, game: Some(guest), pads: &[], config: &mut cfg, version: "0.1.0" };
+        redraw(&mut ui, &c);
+        assert_eq!(rows(&ui), [true, false, false, true, true], "Resume, Save, Load, Reset, Leave");
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "a guest cannot save");
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "nor load");
+        assert!(ui.modal.is_none());
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None, "the row after Reset is Leave, which asks");
+        assert!(ui.modal.is_some());
+
+        // The host has "Back to the room" between Reset and Leave.
+        let mut ui = Ui::new(Lang::Ru);
+        ui.show_pause();
+        c.game = Some(GameView { host: true, ..net_game(&names, true) });
+        redraw(&mut ui, &c);
+        assert_eq!(rows(&ui).len(), 6);
+        ui.update(&nav(|n| n.up = true), &mut c, DT);
+        ui.update(&nav(|n| n.up = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::BackToRoom));
     }
 
     #[test]
