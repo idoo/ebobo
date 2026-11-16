@@ -2,7 +2,7 @@
 
 A NES and Sega Mega Drive / Genesis emulator for playing with friends over the internet, on a Mac, a Windows PC or a Steam Deck. Up to four players. Both cores are written from scratch for this.
 
-It uses rollback netcode, like fighting games do. A bad connection makes a sprite jump now and then, and the game never slows down. The input delay follows the connection during the game: up to three frames on a slow link, the rest is rollback. If the Wi-Fi drops or a phone hotspot switches networks mid-game, ebobo reroutes through the server within a few seconds, goes back to a direct link when one works again, and waits up to 20 seconds for a player to come back. IPv6 is used when both sides have it, which gets many mobile connections a direct link.
+It uses rollback netcode, like fighting games do. A bad connection makes a sprite jump now and then, and the game never slows down. The input delay follows the connection during the game: up to three frames on a slow link, the rest is rollback. If the Wi-Fi drops or a phone hotspot switches networks mid-game, ebobo reroutes through the server within a few seconds, goes back to a direct link when one works again, and waits up to 20 seconds for a player to come back. Someone who dropped out for longer joins again with the same code and the game goes on.
 
 No games included. Bring your own ROMs. The Mega Drive core is new and so far checked on free homebrew and demos only: if a game misbehaves, open an issue.
 
@@ -24,11 +24,17 @@ It updates itself on launch, so everyone stays on the same version.
 
 ## Playing
 
-The host picks Create room and gets a five-letter code (Cmd+C or Ctrl+C copies it). Friends pick Join by code and type or paste it in. They don't need the ROM. The host sends it over and it stays in their library.
+ebobo opens on your games. Pick one to play alone: it continues where you left it last time (Reset in the menu starts over), and it pauses while its window is behind another one. Four save slots keep a picture of the moment each was saved.
+
+To play online, open a game's menu (Start on a gamepad, Space, a right click) and pick Play online, or pick Create room in the main menu. You get a five-letter code (Cmd+C or Ctrl+C copies it). Friends pick Join by code and type or paste it in. They don't need the ROM. The host sends it over and it stays in their library.
+
+Two to four people can share one device in a room: set Players here to how many of you sit at it, and each takes a gamepad (the keyboard is the first player). A room holds four players in all. The host can move players to other controller numbers: select a player in the room and press Left or Right.
+
+The room stays open while you play. A friend who joins late, or comes back after dropping out, brings everyone back to the room for a few seconds, and the game goes on from the same moment with them in it. The host can also go back to the room from the menu, for example to change the seats.
 
 If someone can't get in, Settings > Advanced > Network check usually tells you why.
 
-Online games can be saved too: anyone can save or load for everyone from the menu (F5, F7). Next time the host makes a room with the same game, it continues where you stopped, or from the save.
+Online games can be saved too, from the menu (F5, F7). The host picks in the room who may do it: everyone, only the host, or nobody. Next time the host makes a room with the same game, it continues where you stopped, or from the save.
 
 ROMs (`.nes`, `.md`, `.gen`, `.smd`, `.bin`, or any of them in a `.zip`) are found in `~/ROMs`, `~/Downloads`, EmuDeck's folders and a few other usual places. You can also drop one on the window.
 
