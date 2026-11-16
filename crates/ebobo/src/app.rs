@@ -95,6 +95,9 @@ impl Solo {
 struct Net {
     console: Console,
     session: NetSession,
+    /// The room this game came from. It lives as long as the game, so everyone can go back
+    /// to it on the same connections; dropping it leaves the room.
+    lobby: Lobby,
     me: PeerId,
     slots: Vec<PeerId>,
     names: Vec<String>,
@@ -702,7 +705,10 @@ impl App {
             println!("ebobo: game started slots={:?} me={:?} route={}", start.slots, start.me, routes.join(","));
             let _ = std::io::Write::flush(&mut std::io::stdout());
             self.lobby_status = None;
-            self.start_net(start);
+            // The room handle moves into the game: the room is not left.
+            if let State::Lobby(lobby) = std::mem::replace(&mut self.state, State::Menu) {
+                self.start_net(start, lobby);
+            }
             return;
         }
         if status.stage == Stage::Failed {
@@ -1046,12 +1052,16 @@ impl App {
     }
 
     /// Starts the netplay game, from `start.state` when the host continues a saved game.
-    fn start_net(&mut self, start: GameStart) {
+    /// `lobby` is the room it starts from; when the game cannot start, the room is left.
+    fn start_net(&mut self, start: GameStart, lobby: Lobby) {
         let resume = start.resume.map(|r| r.kind);
-        self.end_game();
+        if let Some(audio) = &mut self.audio {
+            audio.clear();
+        }
         let mut console = match Console::new(&start.rom, Some(start.region)) {
             Ok(console) => console,
             Err(err) => {
+                start.link.close();
                 self.ui.show_main();
                 return self.net_error(&NetError::BadRom(err.to_string()));
             }
@@ -1105,6 +1115,7 @@ impl App {
             console,
             stats: session.stats(),
             session,
+            lobby,
             me: start.me,
             slots: start.slots,
             names: start.names,
@@ -1152,8 +1163,8 @@ impl App {
         }
     }
 
-    /// Leaves whatever runs (battery written, online game kept as the last moment, BYE sent)
-    /// and goes to the no-game state.
+    /// Leaves whatever runs (battery written, online game kept as the last moment, BYE sent,
+    /// the room left) and goes to the no-game state.
     fn end_game(&mut self) {
         self.save_moment();
         self.update_battery(true);
@@ -1161,7 +1172,9 @@ impl App {
             State::Lobby(lobby) => lobby.leave(),
             State::Net(net) => {
                 net.keep_last_moment();
-                net.session.leave();
+                let Net { session, lobby, .. } = *net;
+                session.leave();
+                lobby.leave();
             }
             State::Solo(_) | State::Menu => {}
         }
