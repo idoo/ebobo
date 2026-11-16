@@ -276,7 +276,9 @@ impl Md {
     /// nearer plane covers), which [`Md::frame_tilted`] needs to move them against each
     /// other. Not emulated state: no snapshot, hash or saved state holds it, and loading one
     /// leaves it as it was.
-    pub fn set_tilt(&mut self, _on: bool) {}
+    pub fn set_tilt(&mut self, on: bool) {
+        self.m.screen.set_tilt(on);
+    }
 
     /// Farthest plane B moves in [`Md::frame_tilted`], in pixels across and down, for the
     /// last finished picture (rows count double in interlace mode 2). The tilted picture is
@@ -293,9 +295,10 @@ impl Md {
     /// [`Md::frame_layers`] gives them (both resized). With no shift, and until a picture
     /// was finished with [`Md::set_tilt`] on, it is the middle of the plain picture, byte
     /// for byte.
-    pub fn frame_tilted(&self, _shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
+    pub fn frame_tilted(&self, shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
         let (fw, fh) = self.frame_size();
         let (rx, ry) = self.tilt_reach();
+        let shift = (shift.0.clamp(-rx, rx), shift.1.clamp(-ry, ry));
         let (rx, ry) = (rx as usize, ry as usize);
         if fw <= 2 * rx || fh <= 2 * ry {
             rgba.clear();
@@ -305,6 +308,10 @@ impl Md {
         let (w, h) = (fw - 2 * rx, fh - 2 * ry);
         rgba.resize(w * h * 4, 0);
         layers.resize(w * h, 0);
+        if let Some(rows) = self.m.screen.kept() {
+            crate::vdp_render::compose_tilted(rows, w, (rx, ry), shift, rgba, layers);
+            return (w, h);
+        }
         for y in 0..h {
             let line = &self.m.screen.px[(y + ry) * MAX_W + rx..][..w];
             let out = rgba[y * w * 4..][..w * 4].chunks_exact_mut(4).zip(&mut layers[y * w..][..w]);

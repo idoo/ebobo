@@ -38,12 +38,84 @@ const TAG_SPRITE: u16 = 3 << 8;
 /// The caller handles a blanked display (register 1 bit 6 off: the whole row is the
 /// background colour, no sprite flags); this function draws an enabled display.
 pub fn render_row(m: &Mem, row: u32, out: Option<&mut [u32]>) -> SpriteFlags {
+    render_row_kept(m, row, out, None)
+}
+
+/// [`render_row`] that also leaves the row's layers apart in `keep`, for
+/// [`compose_tilted`]. `keep` is filled only when the row is drawn (`out` is `Some`).
+pub fn render_row_kept(m: &Mem, row: u32, out: Option<&mut [u32]>, keep: Option<&mut KeptRow>) -> SpriteFlags {
     let mut sprites: SpriteRow = [0; 320];
     let flags = sprite_row(m, row, &mut sprites);
     if let Some(out) = out {
-        draw_row(m, row, &sprites, out);
+        draw_row(m, row, &sprites, out, keep);
     }
     flags
+}
+
+/// The layers of one drawn row before compositing, and what compositing them needs: the
+/// picture can be put together again with the planes moved against each other.
+#[derive(Clone)]
+pub struct KeptRow {
+    /// Line buffers of plane B, of plane A with the window, and of the sprites.
+    b: [u8; 320],
+    a: [u8; 320],
+    s: [u8; 320],
+    /// The colour entries as the row was drawn.
+    cram: [u16; 64],
+    /// Index of the backdrop colour (register 7).
+    bg: u8,
+    /// Shadow and highlight mode (register 12 bit 3).
+    sh: bool,
+}
+
+impl KeptRow {
+    /// A row of a blanked display: nothing but the backdrop colour `bg` of `cram`.
+    pub fn blank(cram: &[u16; 64], bg: u8) -> KeptRow {
+        KeptRow { b: [0; 320], a: [0; 320], s: [0; 320], cram: *cram, bg: bg & 0x3F, sh: false }
+    }
+}
+
+/// Composites a picture from kept rows with the planes moved: plane B by `shift` pixels
+/// (right, down), plane A and the window by half of it (towards zero), the sprites not at
+/// all. Output pixel (x, y) is screen pixel (x + `crop.0`, y + `crop.1`); the picture is
+/// `w` wide and as high as `layers.len() / w`. `rgba` gets four bytes per pixel, `layers`
+/// the layer of each pixel as in the top byte of [`render_row`]'s output. The caller keeps
+/// `shift` within `crop` and `crop` plus the picture inside `rows`, so no moved plane is
+/// read past an edge.
+///
+/// A pixel is mixed as [`render_row`] mixes it, in the shadow and highlight mode of its
+/// screen row; its colour comes from the colour entries of the row the winning layer was
+/// drawn on, and where nothing is drawn it is the backdrop of plane B's row.
+///
+/// The blanked left column (register 0 bit 5) is not redrawn: its 8 columns lie inside the
+/// 8 columns the crop takes off the left edge.
+pub fn compose_tilted(rows: &[KeptRow], w: usize, crop: (usize, usize), shift: (i32, i32), rgba: &mut [u8], layers: &mut [u8]) {
+    if w == 0 {
+        return;
+    }
+    let (rx, ry) = crop;
+    let moved = |at: usize, by: i32| (at as i32 - by) as usize;
+    let xa = moved(rx, shift.0 / 2);
+    let xb = moved(rx, shift.0);
+    for (y, (rgba, layers)) in rgba.chunks_exact_mut(w * 4).zip(layers.chunks_exact_mut(w)).enumerate() {
+        let row_s = &rows[y + ry];
+        let row_a = &rows[moved(y + ry, shift.1 / 2)];
+        let row_b = &rows[moved(y + ry, shift.1)];
+        let (s, a, b) = (&row_s.s[rx..rx + w], &row_a.a[xa..xa + w], &row_b.b[xb..xb + w]);
+        for (x, (rgba, layer)) in rgba.chunks_exact_mut(4).zip(layers.iter_mut()).enumerate() {
+            let (c, shade) = mix(b[x], a[x], s[x], row_s.sh);
+            let index = usize::from(c & 0x3F);
+            let entry = match c & 0x300 {
+                TAG_SPRITE => row_s.cram[index],
+                TAG_A => row_a.cram[index],
+                TAG_B => row_b.cram[index],
+                _ => row_b.cram[usize::from(row_b.bg)],
+            };
+            let px = rgb(entry, shade);
+            rgba.copy_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, px as u8, 255]);
+            *layer = (c >> 8) as u8;
+        }
+    }
 }
 
 /// A 9-bit colour entry (`0000BBB0GGG0RRR0`) as `0x00RRGGBB`, through the console's
@@ -157,6 +229,35 @@ fn plane_front(b: u8, a: u8) -> u16 {
     }
 }
 
+/// The pixel in front where plane B's pixel is `b`, plane A's (or the window's) `a` and the
+/// sprites' `s` (line buffer bytes), tagged with its layer (0 = nothing drawn: the
+/// backdrop), and its shade: 0 normal, 1 shadow, 2 highlight. `sh`: shadow and highlight
+/// mode is on; without it the shade is always 0.
+#[inline]
+pub fn mix(b: u8, a: u8, s: u8, sh: bool) -> (u16, u8) {
+    let p = plane_front(b, a);
+    let sprite = s & 15 != 0 && (s >= 0x80 || p & 0x80 == 0);
+    if !sh {
+        return (if sprite { u16::from(s) | TAG_SPRITE } else { p }, 0);
+    }
+    // Shadowed unless a high-priority cell of either plane is here, whatever its pixel.
+    let mut shade = u8::from((a | b) & 0x80 == 0);
+    let mut c = p;
+    if sprite {
+        match s & 0x3F {
+            0x3E => shade = if shade == 1 { 0 } else { 2 },
+            0x3F => shade = 1,
+            _ => {
+                c = u16::from(s) | TAG_SPRITE;
+                if s >= 0x80 || s & 15 == 14 {
+                    shade = 0;
+                }
+            }
+        }
+    }
+    (c, shade)
+}
+
 /// The output word of the composited pixel `c` (a tagged line buffer byte): its colour from
 /// `pal`, or the backdrop colour `bg` if it is transparent, under its layer. A transparent
 /// pixel is only ever the 0 of [`plane_front`], so the backdrop comes out as layer 0.
@@ -166,7 +267,7 @@ fn output(pal: &[u32; 64], bg: usize, c: u16) -> u32 {
 }
 
 /// Planes and compositing of [`render_row`], given the row's sprite pixels.
-fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32]) {
+fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32], keep: Option<&mut KeptRow>) {
     let r = m.regs;
     let h40 = r[12] & 0x81 != 0;
     let width = if h40 { 320 } else { 256 };
@@ -213,6 +314,9 @@ fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32]) {
     plane_span(m, table_w, cell_shift, 0, row, w0, w1, &mut buf_a);
 
     let bg = usize::from(r[7] & 0x3F);
+    if let Some(k) = keep {
+        *k = KeptRow { b: buf_b, a: buf_a, s: *sprites, cram: *m.cram, bg: bg as u8, sh: r[12] & 8 != 0 };
+    }
     let out = &mut out[..width];
     let layers = out.iter_mut().zip(&buf_b[..width]).zip(&buf_a[..width]).zip(&sprites[..width]);
     if r[12] & 8 == 0 {
@@ -221,9 +325,7 @@ fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32]) {
             *p = rgb(c, 0);
         }
         for (((o, &b), &a), &s) in layers {
-            let p = plane_front(b, a);
-            let c = if s & 15 != 0 && (s >= 0x80 || p & 0x80 == 0) { u16::from(s) | TAG_SPRITE } else { p };
-            *o = output(&pal, bg, c);
+            *o = output(&pal, bg, mix(b, a, s, false).0);
         }
     } else {
         let mut pal = [[0u32; 64]; 3];
@@ -233,22 +335,8 @@ fn draw_row(m: &Mem, row: u32, sprites: &SpriteRow, out: &mut [u32]) {
             }
         }
         for (((o, &b), &a), &s) in layers {
-            // Shadowed unless a high-priority cell of either plane is here, whatever its pixel.
-            let mut shade = usize::from((a | b) & 0x80 == 0);
-            let mut c = plane_front(b, a);
-            if s & 15 != 0 && (s >= 0x80 || c & 0x80 == 0) {
-                match s & 0x3F {
-                    0x3E => shade = if shade == 1 { 0 } else { 2 },
-                    0x3F => shade = 1,
-                    _ => {
-                        c = u16::from(s) | TAG_SPRITE;
-                        if s >= 0x80 || s & 15 == 14 {
-                            shade = 0;
-                        }
-                    }
-                }
-            }
-            *o = output(&pal[shade], bg, c);
+            let (c, shade) = mix(b, a, s, true);
+            *o = output(&pal[usize::from(shade)], bg, c);
         }
     }
     if r[0] & 0x20 != 0 {
@@ -317,7 +405,7 @@ mod tests {
         /// The row as drawn: colour and layer of every column.
         fn raw_with(&self, row: u32, sprites: &SpriteRow) -> [u32; 320] {
             let mut out = [UNTOUCHED; 320];
-            draw_row(&self.mem(), row, sprites, &mut out);
+            draw_row(&self.mem(), row, sprites, &mut out, None);
             out
         }
 
