@@ -55,7 +55,7 @@ Client → server:
 
 | Message | Effect |
 |---|---|
-| `{"t":"lock"}` | host only: further guests get `409 room_locked` |
+| `{"t":"lock"}` | host only: further guests get `409 room_locked` (ebobo 0.5 and later never lock: a device may join a running game) |
 | `{"t":"unlock"}` | host only |
 | any object with `"to": <id>` | forwarded to peer `<id>` with `"from": <sender id>` set by the server (client-supplied `from` is overwritten); dropped if no such peer |
 | any object with `"to": "*"` | same, to every other peer |
@@ -260,13 +260,22 @@ Guest → host whenever its state changes: `{"t":"ready","links":[0,2]}` = ROM l
 peer ids it has a decided route to.
 
 Seats: a room has 4 seats (controller ports) and a device may bring 1-4 local players, one seat
-each. The host holds seat 1 from the start; every new guest gets one seat at the end. A guest
+each. The host holds seat 1 from the start; every new guest gets one seat: the first empty seat
+(below), else a new one at the end. A guest
 arriving when all 4 seats are taken gets `{"t":"error","msg":"room_full"}` (it fails with
 `NetError::RoomFull`); the host never counts it as a player nor waits for it. Guest → host
 `{"t":"seats","n":2}` (any time after the host's `game`; `n` is clamped to 1-4) asks for `n`
-seats: the host appends seats for that guest while any are free and it holds fewer than `n`, or
-removes that guest's last seats when it holds more. The host changes its own seats the same way
-and may swap any two neighbouring seats. A peer that leaves loses all its seats.
+seats: the host gives that guest seats (first empty ones, then new ones at the end) while any
+are free and it holds fewer than `n`, or gives up that guest's last seats when it holds more.
+The host changes its own seats the same way and may swap any two neighbouring seats, empty ones
+included. A peer that leaves loses all its seats.
+
+In a room that came back from a game ("regrouped", below) nobody's character changes hands:
+the players of the interrupted game ("veterans") keep their seats, and a seat its player gives
+up or leaves becomes empty instead of closing the gap. An empty seat that has a newcomer's seat
+after it takes the first such seat (the newcomer moves forward; a veteran never moves by
+itself), and empty seats at the end are dropped. A room that never left for a game has no
+empty seats.
 
 Any → every routed peer every 250 ms while in the lobby: `{"t":"ping"}` (about 25 bytes). The
 receiver only acks it (unknown `t` values are acked and ignored); its job is to give the RTT
@@ -282,20 +291,26 @@ Host → every guest whenever anything changes (lobby UI):
 `last` (the automatic save of the last online session of this ROM) or `save` (made with "save
 for everyone", section 5) and when it was saved in Unix seconds. Guests only show it.
 `seats` = the local players that device brings (seats the host gave it). `order[i]` = peer id on
-seat i (controller i+1), one entry per seat. `saves` = who may save in the game: `all` (every
+seat i (controller i+1), one entry per seat; `254` is an empty seat (only in a regrouped room).
+`saves` = who may save in the game: `all` (every
 player, the default when missing), `host` (only the host) or `off` (nobody).
 
 The host may start when ≥ 2 peers are present and every guest is ready with links to all other
-present peers. Host sends `{"t":"lock"}` to the server, then to every guest:
+present peers (empty seats are nobody). It sends to every guest:
 
 ```json
 {"t":"start","slots":[0,0,1],"delay":2,"auto":true,"four_score":true,"saves":"all"}
 ```
 
+The room is not locked at start: the server keeps admitting guests while the game runs (see
+"Joining a running game" below).
+
 `slots[i]` = peer id playing controller i+1: the room's `order`. A peer id repeats once per
 local player of that device, its players in their order (`[0,0,1]` = the host plays
-controllers 1 and 2, the guest controller 3). `saves` = the room's save setting, as in
-`players`. `delay` = GGRS input delay every peer starts
+controllers 1 and 2, the guest controller 3). An empty seat goes out as the host's id plus its
+index in `idle` (`"slots":[0,0,2],"idle":[1]`: controller 2 is nobody's, the host's device
+feeds it no presses; the key is missing when no seat is empty). `saves` = the room's save
+setting, as in `players`. `delay` = GGRS input delay every peer starts
 with, chosen by the host: its setting (1-6), or auto. Auto: L = ceil(R / 2 / frame_ms) is the
 one-way latency in frames; delay = clamp(min(L, 3) + max(L - 9, 0), 1, 6). The first 3 frames of
 latency are hidden by delay (no rollbacks), the next 6 are left to rollback, the rest is delay
@@ -304,13 +319,14 @@ otherwise SRTT·1.25 (RFC 6298's cold-start RTTVAR = R/2 would add a whole extra
 no samples counts as 0 ms, and the start never waits for samples. frame_ms is 16.64 (NTSC) or 20
 (PAL). `auto` = true when the host's input delay setting is Auto: then every peer adapts its own
 delay during the game (section 5); false keeps `delay` fixed for everyone. Direct-IP mode uses
-the same rule. `four_score` = true when more than 2 slots are used or the ROM header asks for it.
+the same rule. `four_score` = true when more than 2 slots (idle ones included) are used or the
+ROM header asks for it.
 Each peer starts GGRS when it receives (guests) or sends (host) `start`.
 
 Start from a saved game: when the host's `resume` is set, pressing start first sends the state
 (an `ebobo_console::Console::save_state` blob) to every guest with STATE_CHUNK (section 3). Until every
-present guest holds all of it nothing else changes: the room stays unlocked, and a guest that
-leaves is dropped from the transfer. Then the host locks the room and sends `start` with one
+present guest holds all of it nothing else changes, and a guest that
+leaves is dropped from the transfer. Then the host sends `start` with one
 more field, `"state":{"id":7,"size":61234,"crc32":"1a2b3c4d","kind":"last","saved_at":1794690000}`
 (`kind` and `saved_at` as in `resume`). A guest starts only if it holds exactly that state (id,
 size, CRC-32 as for ROMs), and every peer loads it into the freshly powered-on console before
@@ -321,6 +337,27 @@ off: it reports `NetError::SaveTransfer`, stays in the lobby and may start again
 without `state` is a game from power-on.
 
 `{"t":"leave"}` (any → all) and BYE packets end the lobby/game for that peer.
+
+### Joining a running game ("regroup")
+
+A device that joins the room while its game runs gets its routes as usual; the game shows the
+host a knock. Then (or when the host picks "Back to the room") everyone returns to the room on
+the same connections:
+
+1. The host takes the game's current state (a `Console::save_state` blob) and leaves the game
+   without BYE.
+2. Host → every other player of the game: `{"t":"regroup"}`. While that player is still in the
+   game its link takes the message without acking it, so the host's normal CTRL retransmit
+   repeats it until that player's lobby is back (a lobby that is already back acks and ignores
+   it). The player leaves the game the same way.
+3. Everyone is in the room on the same routes. Devices that left during the game are forgotten
+   (one may come back under the same id with fresh CTRL sequence numbers) and their seats are
+   empty. Each player sends `ready` with its links again; the host does not count a player of
+   the game as ready before that.
+4. A newcomer gets `game`, the ROM if it lacks it, and a seat (the first empty one, else a new
+   one), exactly as any guest.
+5. The host starts with the game's state as `resume` (`kind` `last`): STATE_CHUNK and `start`
+   with `state` as for any start from a saved game.
 
 ## 5. Game (GGRS)
 
