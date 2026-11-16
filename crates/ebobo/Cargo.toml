@@ -3,7 +3,7 @@ name = "ebobo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "NES emulator with online play for friends (Mac + Steam Deck)"
+description = "NES and Mega Drive emulator with online play for friends (Mac, Windows, Steam Deck)"
 
 [dependencies]
 ebobo-console = { path = "../ebobo-console" }
