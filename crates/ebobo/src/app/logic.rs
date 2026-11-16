@@ -47,21 +47,24 @@ pub fn frame_stretch(frames_ahead: i32) -> f64 {
     }
 }
 
-/// Local netplay input word: bits 0-15 = the pads of every seat merged (all local players
-/// drive one netplay pad), plus the turbo buttons as held bits. Turbo never becomes A/B
-/// presses here: every peer expands the held bits from the simulated frame number, so a held
-/// turbo button is a constant word that "repeat the last input" predicts right.
-pub fn net_input(pads: &[u16; 4], turbo: &[u8; 4]) -> u32 {
-    let held = pads.iter().fold(0u16, |acc, p| acc | p);
-    let turbo = turbo.iter().fold(0u8, |acc, t| acc | t);
-    let mut word = u32::from(held);
-    if turbo & pad::A != 0 {
-        word |= INPUT_TURBO_A;
+/// Local netplay input words, one per real player of this device, in seat order: player k
+/// gets local seat k's pad (bits 0-15) and turbo buttons; seats beyond `players` all drive
+/// the first player (one player = every seat merged). Turbo goes as held bits and never
+/// becomes A/B presses here: every peer expands the held bits from the simulated frame
+/// number, so a held turbo button is a constant word that "repeat the last input" predicts right.
+pub fn net_words(pads: &[u16; 4], turbo: &[u8; 4], players: usize) -> Vec<u32> {
+    let mut words = vec![0u32; players];
+    for (k, (&held, &t)) in pads.iter().zip(turbo).enumerate() {
+        let Some(word) = words.get_mut(if k < players { k } else { 0 }) else { break };
+        *word |= u32::from(held);
+        if t & pad::A != 0 {
+            *word |= INPUT_TURBO_A;
+        }
+        if t & pad::B != 0 {
+            *word |= INPUT_TURBO_B;
+        }
     }
-    if turbo & pad::B != 0 {
-        word |= INPUT_TURBO_B;
-    }
-    word
+    words
 }
 
 /// Frame period at `fps`, stretched (ahead) or shortened (behind) by `frame_stretch(frames_ahead)`.
@@ -232,20 +235,33 @@ mod tests {
     }
 
     #[test]
-    fn app_net_input_sends_turbo_as_held_bits() {
-        assert_eq!(net_input(&[0; 4], &[0; 4]), 0);
+    fn app_net_words_one_player_merges_every_seat() {
+        let one = |pads: [u16; 4], turbo: [u8; 4]| net_words(&pads, &turbo, 1)[0];
+        assert_eq!(one([0; 4], [0; 4]), 0);
         // Every seat merges into the pad bits.
         let w = |bits: u8| u16::from(bits);
-        assert_eq!(net_input(&[w(pad::A), w(pad::LEFT), 0, w(pad::START)], &[0; 4]), u32::from(pad::A | pad::LEFT | pad::START));
+        assert_eq!(one([w(pad::A), w(pad::LEFT), 0, w(pad::START)], [0; 4]), u32::from(pad::A | pad::LEFT | pad::START));
         // Turbo from any seat sets its own bit and never an A/B press.
-        assert_eq!(net_input(&[0; 4], &[pad::A, 0, 0, 0]), INPUT_TURBO_A);
-        assert_eq!(net_input(&[0; 4], &[0, 0, pad::B, 0]), INPUT_TURBO_B);
-        assert_eq!(net_input(&[w(pad::UP), 0, 0, 0], &[pad::B, pad::A, 0, 0]), u32::from(pad::UP) | INPUT_TURBO_A | INPUT_TURBO_B);
+        assert_eq!(one([0; 4], [pad::A, 0, 0, 0]), INPUT_TURBO_A);
+        assert_eq!(one([0; 4], [0, 0, pad::B, 0]), INPUT_TURBO_B);
+        assert_eq!(one([w(pad::UP), 0, 0, 0], [pad::B, pad::A, 0, 0]), u32::from(pad::UP) | INPUT_TURBO_A | INPUT_TURBO_B);
         // Plain A next to turbo B stays plain A.
-        assert_eq!(net_input(&[w(pad::A), 0, 0, 0], &[pad::B, 0, 0, 0]), u32::from(pad::A) | INPUT_TURBO_B);
+        assert_eq!(one([w(pad::A), 0, 0, 0], [pad::B, 0, 0, 0]), u32::from(pad::A) | INPUT_TURBO_B);
         // Only A/B have turbo, and the word never touches the reset bit.
-        assert_eq!(net_input(&[0xFFFF; 4], &[0xFF; 4]), 0xFFFF | INPUT_TURBO_A | INPUT_TURBO_B);
-        assert_eq!(net_input(&[0xFFFF; 4], &[0xFF; 4]) & ebobo_net::INPUT_RESET, 0);
+        assert_eq!(one([0xFFFF; 4], [0xFF; 4]), 0xFFFF | INPUT_TURBO_A | INPUT_TURBO_B);
+        assert_eq!(one([0xFFFF; 4], [0xFF; 4]) & ebobo_net::INPUT_RESET, 0);
+    }
+
+    #[test]
+    fn app_net_words_gives_each_local_player_own_pad() {
+        let w = |bits: u8| u16::from(bits);
+        // Two players: each gets its own pad and turbo, nothing crosses over.
+        let two = net_words(&[w(pad::A), w(pad::LEFT), 0, 0], &[0, pad::B, 0, 0], 2);
+        assert_eq!(two, [u32::from(pad::A), u32::from(pad::LEFT) | INPUT_TURBO_B]);
+        // A third pad on a device with two players drives the first player.
+        let folded = net_words(&[w(pad::A), w(pad::LEFT), w(pad::START), 0], &[0, 0, pad::A, 0], 2);
+        assert_eq!(folded, [u32::from(pad::A | pad::START) | INPUT_TURBO_A, u32::from(pad::LEFT)]);
+        assert!(net_words(&[0xFFFF; 4], &[0xFF; 4], 0).is_empty());
     }
 
     #[test]

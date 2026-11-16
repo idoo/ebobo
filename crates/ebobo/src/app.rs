@@ -100,6 +100,8 @@ struct Net {
     lobby: Lobby,
     me: PeerId,
     slots: Vec<PeerId>,
+    /// Indexes into `slots` nobody plays: they carry the host's id and get no presses.
+    idle: Vec<usize>,
     names: Vec<String>,
     rom_name: String,
     /// Interrupted peers and when they will be dropped.
@@ -1118,6 +1120,7 @@ impl App {
             lobby,
             me: start.me,
             slots: start.slots,
+            idle: start.idle,
             names: start.names,
             rom_name: start.rom_name,
             interrupted: Vec::new(),
@@ -1314,22 +1317,28 @@ impl App {
                 if failed && !std::mem::replace(&mut n.write_failed, true) {
                     self.ui.toast(self.ui.text(Text::StateSaveFailed));
                 }
-                let mut local: u32 = 0;
-                if !ui_visible {
-                    local = u32::from(logic::net_input(&frame.pads, &frame.turbo));
-                }
                 // Each request goes to the session once; it keeps the bit until GGRS takes an
                 // input of this player.
+                let mut request: u32 = 0;
                 if std::mem::take(&mut n.reset_pending) {
-                    local |= INPUT_RESET;
+                    request |= INPUT_RESET;
                 }
                 if std::mem::take(&mut n.save_pending) {
-                    local |= INPUT_SAVE;
+                    request |= INPUT_SAVE;
                 }
                 if std::mem::take(&mut n.load_pending) {
-                    local |= INPUT_LOAD;
+                    request |= INPUT_LOAD;
                 }
-                match n.session.advance(&mut n.console, &[local]) {
+                // One word per controller this device holds: an idle seat gets no presses,
+                // the real ones this device's players in order; the request rides on the first.
+                let locals = n.session.local_slots();
+                let players = locals.iter().filter(|s| !n.idle.contains(s)).count();
+                let mut real = if ui_visible { vec![0; players] } else { logic::net_words(&frame.pads, &frame.turbo, players) }.into_iter();
+                let mut words: Vec<u32> = locals.iter().map(|s| if n.idle.contains(s) { 0 } else { real.next().unwrap_or(0) }).collect();
+                if let Some(first) = locals.iter().position(|s| !n.idle.contains(s)) {
+                    words[first] |= request;
+                }
+                match n.session.advance(&mut n.console, &words) {
                     Ok(outcome) => {
                         if outcome.advanced {
                             n.advanced += 1;
@@ -1488,24 +1497,37 @@ impl App {
 }
 
 impl Net {
+    /// A peer's name, from its first seat somebody plays (an idle seat carries the host's id
+    /// and no name).
     fn name_of(&self, peer: PeerId) -> &str {
-        self.slots
-            .iter()
-            .position(|p| *p == peer)
+        (0..self.slots.len())
+            .find(|i| self.slots[*i] == peer && !self.idle.contains(i))
             .and_then(|i| self.names.get(i))
             .map(String::as_str)
             .unwrap_or("?")
     }
 
-    /// Names of every remote player, comma separated.
+    /// Names of every remote player, comma separated, each once (a device may hold several
+    /// seats).
     fn others(&self) -> String {
-        let names: Vec<&str> = self.slots.iter().filter(|p| **p != self.me).map(|p| self.name_of(*p)).collect();
+        let mut peers: Vec<PeerId> = Vec::new();
+        for p in &self.slots {
+            if *p != self.me && !peers.contains(p) {
+                peers.push(*p);
+            }
+        }
+        let names: Vec<&str> = peers.iter().map(|p| self.name_of(*p)).collect();
         names.join(", ")
     }
 
-    /// Name of the player on NES controller `slot`, short enough for a toast.
+    /// Name of the player on controller `slot`, short enough for a toast; an idle seat names
+    /// the peer it carries by that peer's first played seat.
     fn slot_name(&self, slot: usize) -> String {
-        self.names.get(slot).map_or("?", String::as_str).chars().take(12).collect()
+        let name = match self.names.get(slot) {
+            Some(name) if !self.idle.contains(&slot) => name.as_str(),
+            _ => self.slots.get(slot).map_or("?", |p| self.name_of(*p)),
+        };
+        name.chars().take(12).collect()
     }
 
     /// F5 / F7 in a netplay game (menu, hotkey or `--script`): every peer saves / loads at the
