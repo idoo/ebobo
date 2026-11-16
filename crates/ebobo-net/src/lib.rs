@@ -30,7 +30,7 @@ pub use mesh::Link;
 pub use transport::{PeerId, RouteKind};
 
 /// Lobby `proto` value; peers with a different one refuse to play together.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_PLAYERS: usize = 4;
 pub const DEFAULT_DIRECT_PORT: u16 = 7777;
 /// Netplay input bits 0-15: the pad, in the system's own pad bits (`ebobo_console::nes::pad` in
@@ -51,6 +51,49 @@ pub const INPUT_LOAD: u32 = 1 << 20;
 /// Room code alphabet: no I, O, 0, 1.
 pub const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 pub const CODE_LEN: usize = 5;
+
+/// Who may save and load for everyone in an online game. The host picks it in the room, it
+/// travels in `start` as `saves`, and every peer applies it to the save and load input bits,
+/// so a refused press changes nothing on any machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SavePolicy {
+    /// Any player.
+    #[default]
+    Everyone,
+    /// Only the host (peer 0).
+    Host,
+    /// Nobody: no saves, no loads, and no "last moment" kept for the next session.
+    Off,
+}
+
+impl SavePolicy {
+    /// The value on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SavePolicy::Everyone => "all",
+            SavePolicy::Host => "host",
+            SavePolicy::Off => "off",
+        }
+    }
+
+    /// A missing or unknown value means `Everyone`.
+    pub fn parse(s: Option<&str>) -> SavePolicy {
+        match s {
+            Some("host") => SavePolicy::Host,
+            Some("off") => SavePolicy::Off,
+            _ => SavePolicy::Everyone,
+        }
+    }
+
+    /// Whether a save or load pressed by `peer` counts.
+    pub fn allows(self, peer: PeerId) -> bool {
+        match self {
+            SavePolicy::Everyone => true,
+            SavePolicy::Host => peer == PeerId(0),
+            SavePolicy::Off => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetError {
