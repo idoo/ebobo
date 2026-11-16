@@ -875,14 +875,15 @@ impl Ui {
             self.draw_modal(canvas, font, modal, &mut h);
         }
         // The keyboard covers the hint bar (its keys say the same) and the toast line. Over a
-        // menu a toast's box is solid, so the text under it never shows through; in the
-        // library it lies on the second detail line and covers exactly that line.
+        // menu a toast's box is solid, so the text under it never shows through. In the
+        // library it takes the place of the second detail line, which is cleared for it.
+        let library = matches!(top, Some(Screen::Picker(_)));
         let (base, solid) = match top {
             _ if osk_shown => (osk::TOP - 16, true),
-            Some(Screen::Picker(_)) => (cards::INFO_Y, true),
+            _ if library => (cards::INFO_Y, true),
             _ => (if visible { 214 } else { 224 }, visible),
         };
-        self.draw_toasts(canvas, font, base, solid);
+        self.draw_toasts(canvas, font, base, solid, library && !osk_shown);
         if visible && !osk_shown {
             self.draw_hints(canvas, font, ctx, input.hint_kind, top, &mut h);
         }
@@ -2138,11 +2139,17 @@ impl Ui {
         }
     }
 
-    fn draw_toasts(&self, c: &mut Canvas, f: &mut Font, base: i32, solid: bool) {
+    /// Toasts from `base` upwards, the latest lowest. `solid`: the box hides what is under it;
+    /// `clear`: the whole line a toast lies on is wiped first (text on both sides of the box
+    /// would read as one broken line).
+    fn draw_toasts(&self, c: &mut Canvas, f: &mut Font, base: i32, solid: bool, clear: bool) {
         for (i, (msg, _)) in self.toasts.iter().rev().enumerate() {
             let line = trunc(msg, 30);
             let w = f.width(&line, 1);
             let y = base - i as i32 * 14;
+            if clear {
+                c.fill_rect(0, y - 3, 256, 14, BG);
+            }
             c.fill_rect((256 - w) / 2 - 4, y - 3, w + 8, 14, if solid { TOAST_BG } else { SHADE });
             f.draw_centered(c, y, &line, WHITE, 1);
         }
