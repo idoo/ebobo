@@ -194,6 +194,18 @@ export class Room extends DurableObject<Env> {
         if (me.role === "host") await this.ctx.storage.put("locked", o.t === "lock");
         return;
       }
+      // The host has given up on a guest whose connection dropped (its game timed the player
+      // out): the id is free at once instead of after the grace, so the player can join again
+      // right away, also into a room that would otherwise still count as full.
+      if (o.t === "drop" && typeof o.id === "number" && !("to" in o)) {
+        if (me.role !== "host") return;
+        const gone = (await this.awayPeers()).get(o.id);
+        if (gone && gone.role === "guest") {
+          await this.ctx.storage.delete(`away:${gone.id}`);
+          this.broadcast(JSON.stringify({ t: "left", id: gone.id }));
+        }
+        return;
+      }
       const to = o.to;
       if (to !== "*" && typeof to !== "number") return;
       o.from = me.id;

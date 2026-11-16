@@ -30,11 +30,11 @@ To play online, open a game's menu (Start on a gamepad, Space, a right click) an
 
 Two to four people can share one device in a room: set Players here to how many of you sit at it. Each takes a gamepad, and one of you can take the keyboard; whoever presses a button first after the game starts is that device's first player. A room holds four players in all. The host can move players to other controller numbers: select a player in the room and press Left or Right.
 
-The room stays open while you play. A friend who joins late, or comes back after dropping out, brings everyone back to the room for a few seconds, and the game goes on from the same moment with them in it. The host can also go back to the room from the menu, for example to change the seats.
+The room stays open while you play. A friend who joins late, or comes back after dropping out, brings everyone back to the room for a few seconds, and the game goes on from the same moment with them in it. The host can also go back to the room from the menu, for example to change the seats. If everyone else leaves, the host's game goes on and friends can join it again with the same code.
 
 If someone can't get in, Settings > Advanced > Network check usually tells you why.
 
-Online games can be saved too, from the menu (F5, F7). The host picks in the room who may do it: everyone, only the host, or nobody. Next time the host makes a room with the same game, it continues where you stopped, or from the save.
+Online games can be saved too, from the menu (F5, F7). The host picks in the room who may do it: everyone, only the host, or nobody. After the game went through the room, Load returns to that moment until someone saves again. Next time the host makes a room with the same game, it continues where you stopped, or from the save.
 
 ROMs (`.nes`, `.md`, `.gen`, `.smd`, `.bin`, or any of them in a `.zip`) are found in `~/ROMs`, `~/Downloads`, EmuDeck's folders and a few other usual places. You can also drop one on the window.
 

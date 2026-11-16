@@ -154,6 +154,35 @@ check("dropped guest -> left after grace", gone?.id === rgw?.id, JSON.stringify(
 const late = await upgradeStatus(`/v1/room/${R}?role=guest&name=x&rejoin=${rgw?.id}&secret=${rgw?.secret}`);
 check("rejoin after grace 409", late.status === 409, `${late.status} ${late.body}`);
 
+// The host gives up on a dropped guest: `left` at once (well inside the 4 s grace), the id is
+// free for the next guest, and the old secret no longer rejoins. A guest may not drop anyone.
+const rg5 = new Client(R, "guest", "RGuest5", G);
+const rg5w = await rg5.msg("welcome");
+await rh2.msg("joined");
+const rg6 = new Client(R, "guest", "RGuest6", G);
+const rg6w = await rg6.msg("welcome");
+await rh2.msg("joined");
+rg5.ws.close(4100, "test_drop");
+await rh2.msg("away");
+rg6.ws.send(JSON.stringify({ t: "drop", id: rg5w?.id }));
+const early = await rh2.msg("left", 1000);
+check("a guest cannot drop a player", early === null, JSON.stringify(early));
+rh2.ws.send(JSON.stringify({ t: "drop", id: rg5w?.id }));
+const [dropH, dropG] = await Promise.all([rh2.msg("left", 1500), rg6.msg("left", 1500)]);
+check("host drops an away guest: left at once for everyone", dropH?.id === rg5w?.id && dropG?.id === rg5w?.id, `${JSON.stringify(dropH)} ${JSON.stringify(dropG)}`);
+const stale = await upgradeStatus(`/v1/room/${R}?role=guest&name=x&rejoin=${rg5w?.id}&secret=${rg5w?.secret}`);
+check("dropped guest's secret no longer rejoins", stale.status === 409 && stale.body.includes("bad_rejoin"), `${stale.status} ${stale.body}`);
+const rg7 = new Client(R, "guest", "RGuest7", G);
+const rg7w = await rg7.msg("welcome");
+check("the freed id goes to the next guest", rg7w?.id === rg5w?.id && rg6w?.id !== rg5w?.id, JSON.stringify(rg7w));
+rh2.ws.send(JSON.stringify({ t: "drop", id: rg6w?.id }));
+const live = await rg6.msg("left", 1000);
+check("a connected guest is not dropped", live === null, JSON.stringify(live));
+rg6.ws.close();
+rg7.ws.close();
+await rh2.msg("left");
+await rh2.msg("left");
+
 const rg4 = new Client(R, "guest", "RGuest4", G);
 await rg4.msg("welcome");
 rh2.ws.close(4100, "test_drop");

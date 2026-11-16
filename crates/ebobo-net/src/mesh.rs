@@ -531,9 +531,20 @@ impl Mesh {
 
     /// Stops sending to `id` (it said BYE or stopped answering); a device that joins under
     /// this id later gets a new route.
-    pub(crate) fn forget_route(&mut self, id: PeerId) {
+    fn forget_route(&mut self, id: PeerId) {
         if self.routes.remove(&id).is_some() {
             self.transport.remove_route(id);
+        }
+    }
+
+    /// A player stopped answering and the game goes on without it: nothing more is sent to
+    /// it, and the host tells the server (`{"t":"drop"}`), which frees an id it only holds for
+    /// a dropped connection to come back. The player can then join again at once, also into
+    /// a room that would otherwise count as full.
+    fn give_up(&mut self, id: PeerId) {
+        self.forget_route(id);
+        if self.me == PeerId(0) && matches!(self.mode, Mode::Room { .. }) {
+            self.transport.send_text(json!({"t": "drop", "id": id.0}).to_string());
         }
     }
 
@@ -906,10 +917,10 @@ impl Link {
         std::mem::take(&mut self.regroup)
     }
 
-    /// Stops sending to a player who stopped answering. A device that joins the room under
-    /// that id later gets a new route and counts as a newcomer (`take_knocks`).
+    /// Gives up on a player who stopped answering (`Mesh::give_up`). A device that joins the
+    /// room under that id later gets a new route and counts as a newcomer (`take_knocks`).
     pub fn forget(&mut self, peer: PeerId) {
-        self.mesh.forget_route(peer);
+        self.mesh.give_up(peer);
     }
 
     /// Gives the mesh back to the lobby (the game returns to the room on the same routes).
@@ -1768,6 +1779,36 @@ mod tests {
 
     fn route_texts(texts: &[String], mode: &str) -> Vec<Value> {
         texts.iter().filter_map(|t| serde_json::from_str::<Value>(t).ok()).filter(|v| v["t"] == "route" && v["mode"] == mode).collect()
+    }
+
+    /// The host gives up on a silent player: the server is told to free the id and the route
+    /// goes. When that id joins again it is paired from scratch, like any newcomer. A guest
+    /// that gives up on a player tells the server nothing.
+    #[test]
+    fn link_host_gives_up_on_a_silent_player() {
+        let drops = |texts: &[String]| -> Vec<Value> {
+            texts.iter().filter_map(|t| serde_json::from_str::<Value>(t).ok()).filter(|v| v["t"] == "drop").collect()
+        };
+        let b = local_sock();
+        let mut host = fake_room(PeerId(0), PeerId(1), b.local_addr().unwrap(), 0xB0B);
+        host.poll();
+        host.drain();
+        host.link.forget(PeerId(1));
+        assert_eq!(drops(&host.drain().1), [json!({"t": "drop", "id": 1})]);
+        assert_eq!(host.link.route_kind(PeerId(1)), None);
+        host.link.take_knocks();
+        host.text.send(json!({"t": "left", "id": 1}).to_string()).unwrap();
+        host.text.send(json!({"t": "joined", "id": 1, "name": "Back"}).to_string()).unwrap();
+        host.poll();
+        let st = &host.link.mesh.peers[&PeerId(1)];
+        assert!(!st.decided && st.token.is_none(), "the id is paired from scratch");
+
+        let mut guest = fake_room(PeerId(2), PeerId(1), b.local_addr().unwrap(), 0xB0B);
+        guest.poll();
+        guest.drain();
+        guest.link.forget(PeerId(1));
+        assert_eq!(drops(&guest.drain().1), [] as [Value; 0]);
+        assert_eq!(guest.link.route_kind(PeerId(1)), None);
     }
 
     #[test]

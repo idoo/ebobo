@@ -1274,20 +1274,30 @@ fn session_load_inside_save_rollback_window_and_same_frame_save_load() {
         press(1, 300, INPUT_LOAD),
         press(0, 400, INPUT_LOAD),
     ];
-    // Peer 1's `has_save` when it first simulated past its load on frame 104.
-    let mut blind = None;
-    let mut observe = |i: usize, s: &NetSession| {
-        if i == 1 && s.sim_frame > 104 && blind.is_none() {
-            blind = Some(!s.has_save());
-        }
-    };
-    let Some(run) = run_saves(2, Profile::Far, 0x5A7E_0003, &presses, 520, None, &mut observe) else { return };
     use NetEvent::{Loaded, Saved};
-    assert_eq!(
-        run.reference.events,
-        [Saved { slot: 0 }, Loaded { slot: 1 }, Saved { slot: 0 }, Loaded { slot: 1 }, Loaded { slot: 0 }]
-    );
-    assert_eq!(blind, Some(true), "peer 1 knew of the save before simulating its load: no rollback tested");
+    // The run is paced by the wall clock. On a stalled machine the save's input can reach peer 1
+    // before it simulates its load, and then nothing is rolled back: such a run proves nothing
+    // about the rollback and is repeated.
+    let mut tested = None;
+    for _ in 0..5 {
+        // Peer 1's `has_save` when it first simulated past its load on frame 104.
+        let mut blind = None;
+        let mut observe = |i: usize, s: &NetSession| {
+            if i == 1 && s.sim_frame > 104 && blind.is_none() {
+                blind = Some(!s.has_save());
+            }
+        };
+        let Some(run) = run_saves(2, Profile::Far, 0x5A7E_0003, &presses, 520, None, &mut observe) else { return };
+        assert_eq!(
+            run.reference.events,
+            [Saved { slot: 0 }, Loaded { slot: 1 }, Saved { slot: 0 }, Loaded { slot: 1 }, Loaded { slot: 0 }]
+        );
+        if blind == Some(true) {
+            tested = Some(run);
+            break;
+        }
+    }
+    let run = tested.expect("peer 1 knew of the save before simulating its load in five runs: no rollback tested");
     let log = &run.log;
     assert_eq!(log[302][0] & INPUT_SAVE, INPUT_SAVE);
     assert_eq!(log[302][1] & INPUT_LOAD, INPUT_LOAD);

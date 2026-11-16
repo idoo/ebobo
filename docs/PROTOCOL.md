@@ -57,6 +57,7 @@ Client → server:
 |---|---|
 | `{"t":"lock"}` | host only: further guests get `409 room_locked` (ebobo 0.5 and later never lock: a device may join a running game) |
 | `{"t":"unlock"}` | host only |
+| `{"t":"drop","id":<id>}` | host only: a guest that is `away` is given up at once: everyone gets `left` for it and its id is free (its secret no longer rejoins). The host sends it when its game timed that player out, so the player can join again right away; a connected guest is not affected |
 | any object with `"to": <id>` | forwarded to peer `<id>` with `"from": <sender id>` set by the server (client-supplied `from` is overwritten); dropped if no such peer |
 | any object with `"to": "*"` | same, to every other peer |
 | literal text `ping` | server answers `pong` (auto-response, keeps NAT/proxies alive; clients send every 20 s) |
