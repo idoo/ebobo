@@ -3306,9 +3306,11 @@ mod tests {
         let ready = lobby(2, true, true);
         let mut c = ctx(&mut cfg, &[], Some(&ready));
         redraw(&mut ui, &c);
-        assert_eq!(lobby_rows(&ui), 2, "resume row above Start");
+        assert_eq!(lobby_rows(&ui), 6, "two seats, then resume, saves, players here, Start");
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::StartLobbyGame), "Start is preselected");
-        ui.update(&nav(|n| n.up = true), &mut c, DT);
+        for _ in 0..3 {
+            ui.update(&nav(|n| n.up = true), &mut c, DT);
+        }
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::PickResume(Some(1))));
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::PickResume(None)), "after the save: new game");
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::PickResume(Some(0))));
@@ -3338,12 +3340,11 @@ mod tests {
         let ready = lobby(2, true, true);
         let mut c = ctx(&mut cfg, &[], Some(&ready));
         redraw(&mut ui, &c);
-        assert_eq!(lobby_rows(&ui), 1, "nothing to continue from: Start only");
+        assert_eq!(lobby_rows(&ui), 5, "nothing to continue from: two seats, saves, players here, Start");
         assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), None);
-        assert_eq!(ui.update(&nav(|n| n.up = true), &mut c, DT), None);
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::StartLobbyGame));
 
-        // A guest sees the host's choice as text and cannot change it.
+        // A guest sees the host's choice as text and cannot change it, nor reach the seats.
         let mut guest = lobby(2, false, false);
         guest.resume = Some(ResumeInfo { kind: ResumeKind::Save, saved_at: 1_000 });
         let mut ui = Ui::new(Lang::Ru);
@@ -3351,10 +3352,84 @@ mod tests {
         ui.show_lobby();
         let mut c = ctx(&mut cfg, &[], Some(&guest));
         redraw(&mut ui, &c);
-        assert_eq!(lobby_rows(&ui), 0);
-        for key in [Key::Up, Key::Left, Key::Right, Key::Confirm] {
+        assert_eq!(lobby_rows(&ui), 1, "players here only");
+        for key in [Key::Up, Key::Down, Key::Left] {
             assert_eq!(ui.update(&nav(|n| *n = key.nav()), &mut c, DT), None, "{key:?}");
         }
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::SetSeats(2)), "still on players here");
+    }
+
+    #[test]
+    fn ui_lobby_host_moves_seats() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.show_lobby();
+        let mut room = lobby(3, true, true);
+        room.order = vec![PeerId(0), PeerId(0), PeerId(1)];
+        let mut c = ctx(&mut cfg, &[], Some(&room));
+        // Start, players here, saves, then up into the last seat.
+        for _ in 0..3 {
+            ui.update(&nav(|n| n.up = true), &mut c, DT);
+        }
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), None, "the last seat cannot go down");
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::MoveSeat(2, true)));
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::MoveSeat(1, true)), "the selection follows the seat");
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), None, "the first seat cannot go up");
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::MoveSeat(0, false)));
+        // A tap on a seat row selects it.
+        redraw(&mut ui, &c);
+        let seat = ui.regions.iter().find(|(_, h)| matches!(h, Hit::Row { i, .. } if *i == RoomRow::Seat(2).id())).map(|(a, _)| *a).expect("seat row");
+        ui.update(&tap(seat.x + 40, seat.y + seat.h / 2), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::MoveSeat(2, true)));
+        // Start stays selected when a guest joins and a seat row appears above it.
+        ui.sel[Screen::Lobby.slot()] = RoomRow::Start.id();
+        room.order.push(PeerId(2));
+        let mut c = ctx(&mut cfg, &[], Some(&room));
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::StartLobbyGame));
+    }
+
+    #[test]
+    fn ui_lobby_players_here_and_saves() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.show_lobby();
+        let mut room = lobby(2, true, true);
+        let mut c = ctx(&mut cfg, &[], Some(&room));
+        ui.update(&nav(|n| n.up = true), &mut c, DT);
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), None, "one player is the least");
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::SetSeats(2)));
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::SetSeats(2)));
+        room.players[0].seats = 4;
+        let mut c = ctx(&mut cfg, &[], Some(&room));
+        assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), None, "four is the most");
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::SetSeats(1)), "confirm wraps to one");
+        ui.update(&nav(|n| n.up = true), &mut c, DT);
+        let mut seen = Vec::new();
+        for policy in [SavePolicy::Everyone, SavePolicy::Host, SavePolicy::Off] {
+            room.saves = policy;
+            let mut c = ctx(&mut cfg, &[], Some(&room));
+            seen.push(ui.update(&nav(|n| n.right = true), &mut c, DT));
+        }
+        let want = [SavePolicy::Host, SavePolicy::Off, SavePolicy::Everyone].map(|p| Some(UiAction::SetSaves(p)));
+        assert_eq!(seen, want);
+        let mut c = ctx(&mut cfg, &[], Some(&room));
+        assert_eq!(ui.update(&nav(|n| n.left = true), &mut c, DT), Some(UiAction::SetSaves(SavePolicy::Host)));
+    }
+
+    #[test]
+    fn ui_lobby_regrouped_room_continues() {
+        let mut cfg = Config::default();
+        let mut ui = Ui::new(Lang::Ru);
+        ui.set_resume_options(resume_options(), Some(0));
+        ui.show_lobby();
+        let mut room = lobby(3, true, true);
+        room.regrouped = true;
+        room.order = vec![PeerId(0), EMPTY_SEAT, PeerId(2)];
+        let mut c = ctx(&mut cfg, &[], Some(&room));
+        redraw(&mut ui, &c);
+        assert_eq!(lobby_rows(&ui), 6, "three seats, saves, players here, Start: no resume row");
+        assert!(!ui.regions.iter().any(|(_, h)| matches!(h, Hit::Row { i, .. } if *i == RoomRow::Resume.id())));
+        assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::StartLobbyGame));
     }
 
     fn net_game(names: &[String], can_load: bool) -> GameView<'_> {
@@ -4263,6 +4338,47 @@ mod tests {
             ui.show_lobby();
             let c = UiCtx { library: &[], scanning: false, lobby: Some(&guest), game: None, pads: &pads, config: &mut cfg, version: "0.1.0" };
             write(&mut ui, &mut font, &c, "guest4", false);
+            // The room's seats and settings: (shot, room, selected row).
+            let alone = lobby(1, true, false);
+            let mut seats = lobby(2, true, true);
+            for p in &mut seats.players {
+                p.seats = 2;
+            }
+            seats.order = vec![PeerId(0), PeerId(0), PeerId(1), PeerId(1)];
+            let mut guest_view = seats.clone();
+            guest_view.is_host = false;
+            guest_view.can_start = false;
+            guest_view.me = Some(PeerId(1));
+            guest_view.saves = SavePolicy::Host;
+            guest_view.players[0].is_self = false;
+            guest_view.players[1].is_self = true;
+            let mut regroup = lobby(3, true, true);
+            regroup.regrouped = true;
+            regroup.order = vec![PeerId(0), EMPTY_SEAT, PeerId(2)];
+            regroup.players[2].away = false;
+            regroup.players[2].rom = RomState::Have;
+            let mut receiving = guest_view.clone();
+            receiving.players[1].rom = RomState::Receiving { percent: 45 };
+            receiving.players[1].ready = false;
+            receiving.resume = Some(options[0]);
+            receiving.saves = SavePolicy::Everyone;
+            let rooms = [
+                ("room-alone", &alone, None),
+                ("room-seats", &seats, Some(RoomRow::Seat(1))),
+                ("room-guest", &guest_view, None),
+                ("room-regroup", &regroup, Some(RoomRow::Seat(1))),
+                ("room-rom", &receiving, None),
+            ];
+            for (name, room, sel) in rooms {
+                let mut ui = Ui::new(lang);
+                ui.set_resume_options(if room.is_host { options.clone() } else { Vec::new() }, Some(0));
+                ui.show_lobby();
+                if let Some(row) = sel {
+                    ui.sel[Screen::Lobby.slot()] = row.id();
+                }
+                let c = UiCtx { library: &[], scanning: false, lobby: Some(room), game: None, pads: &pads, config: &mut cfg, version: "0.1.0" };
+                write(&mut ui, &mut font, &c, name, false);
+            }
             // Netplay pause menu on "Load for everyone": enabled, disabled, then its question.
             for (name, can_load) in [("pause-load", true), ("pause-noload", false)] {
                 let mut ui = Ui::new(lang);
