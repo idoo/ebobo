@@ -4,14 +4,9 @@ use std::path::Path;
 
 /// What changed in the version this build is, one short line per change: (Russian, English).
 pub const NOTES: &[(&str, &str)] = &[
-    ("Игры сразу при запуске", "Games first when ebobo opens"),
-    ("Игра продолжается с того же места", "A game continues where you left"),
-    ("По сети: несколько игроков с одного устройства", "Online: several players on one device"),
-    ("В идущую сетевую игру можно войти и вернуться", "Join or come back to a running online game"),
-    ("В комнате: кто может сохранять", "In the room: who may save"),
-    ("Картинка в слоте сохранения", "A picture in each save slot"),
-    ("Пауза, когда окно не впереди", "Pause while the window is behind"),
-    ("Версия для Windows", "A Windows version"),
+    ("Наклон: фон сдвигается, когда наклоняешь Deck", "Tilt the Deck and the background slides"),
+    ("Геймпад с гироскопом тоже", "Works with gyro gamepads"),
+    ("Включается в Настройках", "Turn it on in Settings"),
 ];
 
 /// Files only an install that already ran writes: their presence without `seen-version`
