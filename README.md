@@ -22,7 +22,7 @@ It updates itself on launch, so everyone stays on the same version.
 
 ## Playing
 
-The host picks Create room and gets a five-letter code. Friends pick Join by code and type it in. They don't need the ROM. The host sends it over and it stays in their library.
+The host picks Create room and gets a five-letter code (Cmd+C or Ctrl+C copies it). Friends pick Join by code and type or paste it in. They don't need the ROM. The host sends it over and it stays in their library.
 
 If someone can't get in, Settings > Advanced > Network check usually tells you why.
 
@@ -32,7 +32,7 @@ ROMs (`.nes`, `.md`, `.gen`, `.smd`, `.bin`, or any of them in a `.zip`) are fou
 
 The library shows games as cards with their box art, which ebobo looks up by the ROM's checksum, so file names don't matter. A hack or homebrew gets its own title screen instead. Filter by console, recently played or favourites, or just start typing to search. Settings > Advanced turns the downloads off.
 
-Start on a gamepad opens a game's menu (Space, a right click or a long press do the same): add it to favourites, give it your own name, hide it from the list, or delete its file. A deleted file goes to the Trash; on a Steam Deck a game on the SD card is deleted for good, and the question says so first. Hidden games wait under the crossed-out eye, where the same menu puts them back.
+Start on a gamepad opens a game's menu (Space, a right click or a long press do the same): add it to favourites, give it your own name, hide it from the list, or delete its file. A deleted file goes to the Trash; a game on a Steam Deck's SD card goes to the trash folder on that card (the standard `.Trash-1000` that Linux file managers read). Hidden games wait under the crossed-out eye, where the same menu puts them back.
 
 On the Steam Deck everything works by touch, and text fields bring up ebobo's own keyboard (Steam's keyboard can't type into it in Game Mode). Your Steam name is the default nickname. In Desktop Mode Steam makes the Deck's buttons type keys; ebobo switches them to a gamepad while its window is in front and back when you leave.
 
@@ -40,7 +40,7 @@ Settings > Enhance redraws the pixels of NES and Mega Drive games in HD: smooth 
 
 ## Keys
 
-Arrows to move, X is A, Z is B, Enter is Start, right Shift is Select, Esc opens the menu. Hold Tab to fast-forward and Backspace to rewind. F5 and F7 save and load.
+Arrows to move, X is A, Z is B, Enter is Start, right Shift is Select, Esc opens the menu. Hold Tab to fast-forward and Backspace to rewind. F5 and F7 save and load. F12 (Select+Y on a gamepad) saves a screenshot to Pictures/ebobo, online too.
 
 On a gamepad A and Y are A, B and X are B (PlayStation: Cross and Triangle, Circle and Square), so any two neighbouring buttons work. L1 and R1 are turbo B and turbo A, L2 rewinds, R2 fast-forwards. A click of the right stick opens the menu; so does holding Select+Start, or a tap or click on the picture. PlayStation, Xbox and Switch pads work over USB or Bluetooth; player 1 is whoever presses a button first after the game starts.
 
