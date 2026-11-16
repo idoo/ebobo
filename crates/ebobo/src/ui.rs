@@ -144,6 +144,9 @@ pub enum Text {
     DeckKeys,
     /// How to switch the Deck to its gamepad layout.
     DeckKeysFix,
+    /// Tilt was switched on and nothing measures motion (two toasts: one line holds 30 characters).
+    TiltNeedsGyro,
+    TiltNeedsGyroPad,
     /// How to open the menu from a game, for a gamepad and for the keyboard.
     MenuHintPad,
     MenuHintKeys,
@@ -554,8 +557,6 @@ pub struct Ui {
     diag: Option<NetDiag>,
     /// A network check runs in the background.
     diag_running: bool,
-    /// Something measures motion (a Steam Deck or a gamepad with a gyroscope): Tilt can work.
-    motion_sensor: bool,
     /// "vX.Y.Z" being installed by the self-updater (main-menu status line).
     update: Option<String>,
     /// Hit regions of the last drawn frame (topmost last).
@@ -611,7 +612,6 @@ impl Ui {
             clock: 0.0,
             diag: None,
             diag_running: false,
-            motion_sensor: false,
             update: None,
             regions: Vec::new(),
             press: None,
@@ -764,11 +764,6 @@ impl Ui {
         self.modal = Some(Modal { title, lines, confirm: None, sel: 0 });
     }
 
-    /// Whether anything measures motion right now; switching Tilt on without it says so.
-    pub fn set_motion_sensor(&mut self, present: bool) {
-        self.motion_sensor = present;
-    }
-
     /// Short notice at the bottom for ~2.5 s, also during play.
     pub fn toast(&mut self, message: &str) {
         self.toast_secs(message, TOAST_SECS);
@@ -806,6 +801,8 @@ impl Ui {
             Text::UpdateDownloadAgain => S::UpdateDownloadAgain,
             Text::DeckKeys => S::DeckKeys,
             Text::DeckKeysFix => S::DeckKeysFix,
+            Text::TiltNeedsGyro => S::TiltNeedsGyro,
+            Text::TiltNeedsGyroPad => S::TiltNeedsGyroPad,
             Text::MenuHintPad => S::MenuHintPad,
             Text::MenuHintKeys => S::MenuHintKeys,
             Text::NetSaved => S::NetSaved,
@@ -1766,11 +1763,6 @@ impl Ui {
             }
             7 => {
                 cfg.tilt = !cfg.tilt;
-                if cfg.tilt && !self.motion_sensor {
-                    // Two toasts: one line is cut at 30 characters.
-                    self.toast(self.t(S::TiltNeedsGyro));
-                    self.toast(self.t(S::TiltNeedsGyroPad));
-                }
                 Some(UiAction::ConfigChanged)
             }
             8 => {
@@ -3742,21 +3734,16 @@ mod tests {
         redraw(&mut ui, &c);
         assert_eq!(ui.update(&tap(30, y(6)), &mut c, DT), Some(UiAction::ConfigChanged));
         assert!(!c.config.ambient);
-        // Tilt: off by default; switching it on with no motion sensor says what it needs.
+        // Tilt: off by default; buttons and a tap toggle it.
         assert!(!c.config.tilt);
         ui.sel[Screen::Settings.slot()] = 7;
         assert_eq!(ui.update(&nav(|n| n.right = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert!(c.config.tilt);
-        assert_eq!(ui.toasts.len(), 2, "no sensor: a notice in two lines");
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), Some(UiAction::ConfigChanged));
         assert!(!c.config.tilt);
-        assert_eq!(ui.toasts.len(), 2, "switching off says nothing");
-        ui.toasts.clear();
-        ui.set_motion_sensor(true);
         redraw(&mut ui, &c);
         assert_eq!(ui.update(&tap(30, y(7)), &mut c, DT), Some(UiAction::ConfigChanged));
         assert!(c.config.tilt);
-        assert!(ui.toasts.is_empty(), "a sensor is there: no notice");
         assert!(!c.config.ambient, "the row above is untouched");
         // The rows below follow: Volume steps up, Language switches.
         redraw(&mut ui, &c);

@@ -131,7 +131,7 @@ struct Motion {
 }
 
 /// Seconds between two reports of a Steam Deck (250 per second).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 const DECK_REPORT_SECS: f32 = 0.004;
 
 /// `HID_ID` of a Steam Deck's controller (USB, Valve 28DE:1205) in a hidraw `uevent`.
@@ -191,6 +191,9 @@ mod deck_hid {
         /// Where hidraw devices are listed and where their nodes are.
         sys: PathBuf,
         dev: PathBuf,
+        /// Steam's pid file, and where the live processes are listed.
+        steam_pid: PathBuf,
+        proc: PathBuf,
         /// Open devices: every candidate until one delivers a state report, then that one.
         open: Vec<(PathBuf, File)>,
         chosen: bool,
@@ -205,14 +208,18 @@ mod deck_hid {
     }
 
     impl Sensor {
+        #[cfg(target_os = "linux")]
         pub fn new() -> Sensor {
-            Sensor::at(Path::new("/sys/class/hidraw"), Path::new("/dev"))
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+            Sensor::at(Path::new("/sys/class/hidraw"), Path::new("/dev"), &home.join(".steam/steam.pid"), Path::new("/proc"))
         }
 
-        pub fn at(sys: &Path, dev: &Path) -> Sensor {
+        pub fn at(sys: &Path, dev: &Path, steam_pid: &Path, proc: &Path) -> Sensor {
             Sensor {
                 sys: sys.to_owned(),
                 dev: dev.to_owned(),
+                steam_pid: steam_pid.to_owned(),
+                proc: proc.to_owned(),
                 open: Vec::new(),
                 chosen: false,
                 retry: 0.0,
@@ -223,7 +230,16 @@ mod deck_hid {
             }
         }
 
+        /// The Steam client is up: its pid file names a live process.
+        fn steam_runs(&self) -> bool {
+            std::fs::read_to_string(&self.steam_pid)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                .is_some_and(|pid| self.proc.join(pid.to_string()).exists())
+        }
+
         /// Why no report has arrived.
+        #[cfg(target_os = "linux")]
         pub fn why(&self) -> &str {
             &self.problem
         }
@@ -266,14 +282,24 @@ mod deck_hid {
         /// Hands every pending report to `on_report`; `dt` is the time since the last call.
         /// True while a device delivers.
         pub fn poll(&mut self, dt: f32, on_report: &mut impl FnMut(&Motion)) -> bool {
-            if self.open.is_empty() {
-                self.chosen = false;
-                self.retry -= dt;
-                if self.retry > 0.0 {
+            self.retry -= dt;
+            if self.retry <= 0.0 {
+                self.retry = RETRY_SECS;
+                if !self.steam_runs() {
+                    // Without Steam the kernel's driver makes this controller a gamepad, and
+                    // takes that gamepad away for as long as anyone holds the HID device open
+                    // (hid-steam.c, steam_client_ll_open): the Deck's buttons would stop
+                    // reaching us. Steam holds the device open itself, so reading next to it
+                    // changes nothing.
+                    self.open.clear();
+                    self.chosen = false;
+                    self.problem = "Steam is not running (the controller is then the system's gamepad, and reading it here would take that away)".to_owned();
                     return false;
                 }
-                self.retry = RETRY_SECS;
-                self.search();
+                if self.open.is_empty() {
+                    self.chosen = false;
+                    self.search();
+                }
             }
             let mut buf = [0u8; 64];
             let mut i = 0;
@@ -632,10 +658,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sensor_picks_the_interface_that_reports() {
+        use std::io::Write;
         let root = std::env::temp_dir().join(format!("ebobo-tilt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let (sys, dev) = (root.join("sys"), root.join("dev"));
+        let (sys, dev, proc) = (root.join("sys"), root.join("dev"), root.join("proc"));
         std::fs::create_dir_all(&dev).unwrap();
+        // Steam "runs": its pid file names a process that is listed.
+        let pid = root.join("steam.pid");
+        std::fs::write(&pid, "4242\n").unwrap();
+        std::fs::create_dir_all(proc.join("4242")).unwrap();
         let add = |name: &str, id: &str, data: &[u8]| {
             let d = sys.join(name).join("device");
             std::fs::create_dir_all(&d).unwrap();
@@ -650,11 +681,27 @@ mod tests {
         add("hidraw1", "0003:000028DE:00001205", &other);
         add("hidraw2", "0003:000028DE:00001205", &[other, state, state].concat());
 
-        let mut s = deck_hid::Sensor::at(&sys, &dev);
+        // Without Steam the device is left alone, whatever it would deliver.
+        let mut alone = deck_hid::Sensor::at(&sys, &dev, &root.join("no-steam.pid"), &proc);
+        let mut never = |_: &Motion| panic!("read without Steam");
+        assert!(!alone.poll(0.016, &mut never));
+        assert!(!alone.poll(5.0, &mut never));
+
+        let mut s = deck_hid::Sensor::at(&sys, &dev, &pid, &proc);
         let mut got = Vec::new();
         assert!(s.poll(0.016, &mut |m: &Motion| got.push(*m)));
         assert_eq!(got.len(), 2);
         assert!((got[0].gyro[1] - 1000.0 * DEG).abs() < 1e-3, "{:?}", got[0]);
+        // Steam stops: the device is let go, even with a report waiting.
+        std::fs::remove_dir_all(proc.join("4242")).unwrap();
+        std::fs::OpenOptions::new().append(true).open(dev.join("hidraw2")).unwrap().write_all(&state).unwrap();
+        let mut none = |_: &Motion| panic!("read after Steam stopped");
+        assert!(!s.poll(3.5, &mut none));
+        // Steam is back: found again, and the waiting reports are read from the start.
+        std::fs::create_dir_all(proc.join("4242")).unwrap();
+        let mut again = 0;
+        assert!(s.poll(3.5, &mut |_: &Motion| again += 1));
+        assert_eq!(again, 3);
         // Silent for too long: dropped, then looked for again.
         let mut none = |_: &Motion| panic!("no reports are left");
         assert!(s.poll(1.5, &mut none));

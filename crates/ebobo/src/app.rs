@@ -181,6 +181,9 @@ struct App {
     gyro: Option<[f32; 3]>,
     /// When the tilt was last updated (its `dt`).
     tilt_at: Instant,
+    /// Seconds since Tilt was switched on with nothing measuring motion yet; `None` once it
+    /// was answered (a reading came, or the notice was shown).
+    tilt_unanswered: Option<f32>,
     title_rom: Option<String>,
     quit: bool,
     /// The window is not the front one: a solo game stands still until it is again.
@@ -399,6 +402,7 @@ impl App {
             tilt_pinned: cli.tilt_at.is_some(),
             gyro: None,
             tilt_at: Instant::now(),
+            tilt_unanswered: None,
             title_rom: None,
             quit: false,
             away: false,
@@ -1569,12 +1573,22 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.tilt_at).as_secs_f32().min(0.1);
         self.tilt_at = now;
-        // Read in the menus too, so switching Tilt on can tell whether anything measures motion.
-        let tilt = if wanted || self.ui.is_visible() { self.tilt.update(self.gyro, dt) } else { None };
-        if wanted || self.ui.is_visible() {
-            self.ui.set_motion_sensor(tilt.is_some());
+        // No sensor is touched unless the effect is wanted.
+        let tilt = if wanted { self.tilt.update(self.gyro, dt) } else { None };
+        if !wanted {
+            self.tilt_unanswered = Some(0.0);
+        } else if tilt.is_some() {
+            self.tilt_unanswered = None;
+        } else if let Some(waited) = &mut self.tilt_unanswered {
+            // Switched on in this run and still no reading: say what it needs, once. A
+            // setting found on at start stays quiet.
+            *waited += dt;
+            if *waited > 0.5 {
+                self.tilt_unanswered = None;
+                self.ui.toast(self.ui.text(Text::TiltNeedsGyro));
+                self.ui.toast(self.ui.text(Text::TiltNeedsGyroPad));
+            }
         }
-        let tilt = tilt.filter(|_| wanted);
         let console = match &mut self.state {
             State::Solo(s) => Some(&mut s.console),
             State::Net(n) => Some(&mut n.console),
