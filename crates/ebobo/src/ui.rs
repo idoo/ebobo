@@ -47,6 +47,13 @@ pub enum UiAction {
     /// Host changed what the game starts from in the lobby: an index into the options given
     /// to `Ui::set_resume_options`, `None` = a new game.
     PickResume(Option<usize>),
+    /// How many players sit at this device (1-4).
+    SetSeats(u8),
+    /// Host: swap this seat (index into the room's order) with the one before it (`true`)
+    /// or after it.
+    MoveSeat(usize, bool),
+    /// Host: who may save and load in the online game.
+    SetSaves(ebobo_net::SavePolicy),
     Resume,
     Reset,
     SaveState,

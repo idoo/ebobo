@@ -34,6 +34,8 @@ usage: ebobo [ROM] [options]
   --resume FROM        host: start from new, last (the last moment) or save instead of the
                        default (the last moment, else the save, else a new game); a missing
                        file means a new game
+  --seats N            online: how many players sit at this device (1-4)
+  --saves WHO          host: who may save and load online: all, host, off
   --script LIST        netplay: press F5 (save) / F7 (load) for everyone at advanced frames,
                        e.g. 600=save,900=load
   --version            print the version
@@ -94,6 +96,10 @@ pub struct Cli {
     pub fresh: bool,
     pub autostart: Option<usize>,
     pub resume: Option<ResumeFrom>,
+    /// `--seats`: players at this device in an online room.
+    pub seats: Option<u8>,
+    /// `--saves`: who may save and load in a room this device hosts, for this run.
+    pub saves: Option<ebobo_net::SavePolicy>,
     /// `--script` steps sorted by frame.
     pub script: Vec<(u64, ScriptKey)>,
 }
@@ -134,6 +140,9 @@ impl Cli {
         }
         if let Some(screen) = self.screen {
             config.screen = screen;
+        }
+        if let Some(saves) = self.saves {
+            config.online_saves = saves.as_str().to_string();
         }
     }
 }
@@ -236,6 +245,20 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                     "last" => ResumeFrom::Last,
                     "save" => ResumeFrom::Save,
                     _ => return Err(format!("bad --resume: {raw} (new, last, save)")),
+                });
+            }
+            "--seats" => {
+                let raw = value(flag)?;
+                let n = raw.parse::<u8>().ok().filter(|n| (1..=4).contains(n)).ok_or_else(|| format!("bad --seats: {raw} (1-4)"))?;
+                cli.seats = Some(n);
+            }
+            "--saves" => {
+                let raw = value(flag)?;
+                cli.saves = Some(match raw.as_str() {
+                    "all" => ebobo_net::SavePolicy::Everyone,
+                    "host" => ebobo_net::SavePolicy::Host,
+                    "off" => ebobo_net::SavePolicy::Off,
+                    _ => return Err(format!("bad --saves: {raw} (all, host, off)")),
                 });
             }
             "--script" => cli.script = parse_script(&value(flag)?)?,
@@ -418,6 +441,23 @@ mod tests {
             &["--script", "600=save,"],
             &["--script", "-5=save"],
         ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn seats_and_saves() {
+        use ebobo_net::SavePolicy;
+        let none = run(&["--host", "a.nes"]);
+        assert_eq!((none.seats, none.saves), (None, None));
+        assert_eq!(run(&["--seats", "2"]).seats, Some(2));
+        assert_eq!(run(&["--seats=4"]).seats, Some(4));
+        assert_eq!(run(&["--saves", "all"]).saves, Some(SavePolicy::Everyone));
+        assert_eq!(run(&["--saves=host"]).saves, Some(SavePolicy::Host));
+        let mut config = Config::default();
+        run(&["--saves", "off"]).apply(&mut config);
+        assert_eq!(config.online_saves, "off");
+        for bad in [&["--seats", "0"][..], &["--seats", "5"], &["--seats", "two"], &["--seats"], &["--saves", "guests"], &["--saves"]] {
             assert!(p(bad).is_err(), "{bad:?}");
         }
     }

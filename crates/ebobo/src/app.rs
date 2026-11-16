@@ -201,6 +201,8 @@ struct App {
     /// Host lobby: the saves this game can continue from (`Ui::set_resume_options` has the
     /// same list without the bytes).
     host_resume: Vec<Resume>,
+    /// Players at this device in an online room (1-4): `--seats`, then the room's row.
+    seats_here: u8,
 }
 
 /// Runs the app; returns the process exit code.
@@ -388,6 +390,7 @@ impl App {
             resume_from: cli.resume,
             script: cli.script.clone(),
             host_resume: Vec::new(),
+            seats_here: cli.seats.unwrap_or(1),
         })
     }
 
@@ -796,6 +799,24 @@ impl App {
                     lobby.set_resume(pick.and_then(|i| self.host_resume.get(i)).cloned());
                 }
             }
+            UiAction::SetSeats(n) => {
+                if let State::Lobby(lobby) = &self.state {
+                    lobby.set_seats(n);
+                    self.seats_here = n;
+                }
+            }
+            UiAction::MoveSeat(seat, up) => {
+                if let State::Lobby(lobby) = &self.state {
+                    lobby.move_seat(seat, up);
+                }
+            }
+            UiAction::SetSaves(policy) => {
+                if let State::Lobby(lobby) = &self.state {
+                    lobby.set_saves(policy);
+                    self.config.online_saves = policy.as_str().to_string();
+                    self.persist();
+                }
+            }
             UiAction::SelectSlot(slot) => {
                 if let State::Solo(s) = &mut self.state {
                     s.slot = slot.min(slots::SLOTS - 1);
@@ -1041,6 +1062,7 @@ impl App {
         });
         if let State::Lobby(lobby) = &self.state {
             lobby.set_resume(pick.map(|i| options[i].clone()));
+            lobby.set_saves(SavePolicy::parse(Some(&self.config.online_saves)));
         }
         let infos = options.iter().map(|r| ResumeInfo { kind: r.kind, saved_at: r.saved_at }).collect();
         self.ui.set_resume_options(infos, pick);
@@ -1062,6 +1084,10 @@ impl App {
                 lib.find_crc(crc).and_then(|e| library::load_rom_file(&e.path).ok())
             }),
         });
+        // More than one player at this device: the host seats them, a guest asks the host.
+        if self.seats_here != 1 {
+            lobby.set_seats(self.seats_here);
+        }
         self.lobby_status = Some(lobby.status());
         self.state = State::Lobby(lobby);
         self.ui.show_lobby();

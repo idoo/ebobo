@@ -46,6 +46,8 @@ pub struct Config {
     pub enhance: crate::enhance::Mode,
     /// Ambient light: the bars around a game's picture glow softly in its colours.
     pub ambient: bool,
+    /// Who may save and load in an online game this device hosts: "all", "host" or "off".
+    pub online_saves: String,
 }
 
 /// "Sprite limit" setting.
@@ -107,6 +109,7 @@ impl Default for Config {
             online_art: true,
             enhance: crate::enhance::Mode::Off,
             ambient: true,
+            online_saves: "all".to_string(),
         }
     }
 }
@@ -341,6 +344,18 @@ mod tests {
             let text = toml::to_string_pretty(&Config { enhance: mode, ambient: false, ..Config::default() }).unwrap();
             let back: Config = toml::from_str(&text).unwrap();
             assert_eq!((back.enhance, back.ambient), (mode, false));
+        }
+    }
+
+    #[test]
+    fn online_saves_default_for_old_files_and_round_trip() {
+        use ebobo_net::SavePolicy;
+        let old: Config = toml::from_str("fullscreen = true\nscale = 2\n").unwrap();
+        assert_eq!(SavePolicy::parse(Some(&old.online_saves)), SavePolicy::Everyone);
+        for policy in [SavePolicy::Everyone, SavePolicy::Host, SavePolicy::Off] {
+            let text = toml::to_string_pretty(&Config { online_saves: policy.as_str().to_string(), ..Config::default() }).unwrap();
+            let back: Config = toml::from_str(&text).unwrap();
+            assert_eq!(SavePolicy::parse(Some(&back.online_saves)), policy);
         }
     }
 }
