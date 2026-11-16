@@ -1,4 +1,4 @@
-# ebobo network protocol (v4)
+# ebobo network protocol (v5)
 
 Up to 4 players. Peer 0 is the host (controller 1 by default), guests get ids 1..3.
 GGRS runs as a full mesh: every peer exchanges inputs with every other peer, each pair over
@@ -259,6 +259,15 @@ so the game cannot start with it.
 Guest → host whenever its state changes: `{"t":"ready","links":[0,2]}` = ROM loaded plus the
 peer ids it has a decided route to.
 
+Seats: a room has 4 seats (controller ports) and a device may bring 1-4 local players, one seat
+each. The host holds seat 1 from the start; every new guest gets one seat at the end. A guest
+arriving when all 4 seats are taken gets `{"t":"error","msg":"room_full"}` (it fails with
+`NetError::RoomFull`); the host never counts it as a player nor waits for it. Guest → host
+`{"t":"seats","n":2}` (any time after the host's `game`; `n` is clamped to 1-4) asks for `n`
+seats: the host appends seats for that guest while any are free and it holds fewer than `n`, or
+removes that guest's last seats when it holds more. The host changes its own seats the same way
+and may swap any two neighbouring seats. A peer that leaves loses all its seats.
+
 Any → every routed peer every 250 ms while in the lobby: `{"t":"ping"}` (about 25 bytes). The
 receiver only acks it (unknown `t` values are acked and ignored); its job is to give the RTT
 estimator steady samples for the input delay.
@@ -266,21 +275,27 @@ estimator steady samples for the input delay.
 Host → every guest whenever anything changes (lobby UI):
 
 ```json
-{"t":"players","list":[{"id":0,"name":"Ivan","route":"self","rtt":0,"ready":true},{"id":1,"name":"Sasha","route":"direct","rtt":34,"ready":true}],"resume":{"kind":"last","saved_at":1794690000}}
+{"t":"players","list":[{"id":0,"name":"Ivan","route":"self","rtt":0,"ready":true,"seats":1},{"id":1,"name":"Sasha","route":"direct","rtt":34,"ready":true,"seats":2}],"resume":{"kind":"last","saved_at":1794690000},"order":[0,1,1],"saves":"all"}
 ```
 
 `resume` is what the host will start from: `null` for a new game, or its saved game: `kind`
 `last` (the automatic save of the last online session of this ROM) or `save` (made with "save
 for everyone", section 5) and when it was saved in Unix seconds. Guests only show it.
+`seats` = the local players that device brings (seats the host gave it). `order[i]` = peer id on
+seat i (controller i+1), one entry per seat. `saves` = who may save in the game: `all` (every
+player, the default when missing), `host` (only the host) or `off` (nobody).
 
 The host may start when ≥ 2 peers are present and every guest is ready with links to all other
 present peers. Host sends `{"t":"lock"}` to the server, then to every guest:
 
 ```json
-{"t":"start","slots":[0,1,2],"delay":2,"auto":true,"four_score":true}
+{"t":"start","slots":[0,0,1],"delay":2,"auto":true,"four_score":true,"saves":"all"}
 ```
 
-`slots[i]` = peer id playing controller i+1. `delay` = GGRS input delay every peer starts
+`slots[i]` = peer id playing controller i+1: the room's `order`. A peer id repeats once per
+local player of that device, its players in their order (`[0,0,1]` = the host plays
+controllers 1 and 2, the guest controller 3). `saves` = the room's save setting, as in
+`players`. `delay` = GGRS input delay every peer starts
 with, chosen by the host: its setting (1-6), or auto. Auto: L = ceil(R / 2 / frame_ms) is the
 one-way latency in frames; delay = clamp(min(L, 3) + max(L - 9, 0), 1, 6). The first 3 frames of
 latency are hidden by delay (no rollbacks), the next 6 are left to rollback, the rest is delay
