@@ -148,6 +148,8 @@ const OK: Color = rgb(0x4C, 0xC6, 0x6A);
 const WARN: Color = rgb(0xE8, 0xB8, 0x3A);
 const ERR: Color = rgb(0xE4, 0x50, 0x50);
 const SHADE: Color = [0, 0, 0, 170];
+/// `SHADE` over `BG` as one solid colour: a toast's box over a menu.
+const TOAST_BG: Color = rgb(0x07, 0x06, 0x09);
 const SLOT: [Color; 4] = [rgb(0x3B, 0x7B, 0xE4), rgb(0xE4, 0x3B, 0x2C), rgb(0x4C, 0xC6, 0x6A), rgb(0xE4, 0x6A, 0xB4)];
 
 /// Smallest tap target height, canvas px (≈ 44 pt on the Deck).
@@ -872,8 +874,15 @@ impl Ui {
             canvas.dim(0.55);
             self.draw_modal(canvas, font, modal, &mut h);
         }
-        // The keyboard covers the hint bar (its keys say the same) and the toast line.
-        self.draw_toasts(canvas, font, if osk_shown { osk::TOP - 16 } else if visible { 214 } else { 224 });
+        // The keyboard covers the hint bar (its keys say the same) and the toast line. Over a
+        // menu a toast's box is solid, so the text under it never shows through; in the
+        // library it lies on the second detail line and covers exactly that line.
+        let (base, solid) = match top {
+            _ if osk_shown => (osk::TOP - 16, true),
+            Some(Screen::Picker(_)) => (cards::INFO_Y, true),
+            _ => (if visible { 214 } else { 224 }, visible),
+        };
+        self.draw_toasts(canvas, font, base, solid);
         if visible && !osk_shown {
             self.draw_hints(canvas, font, ctx, input.hint_kind, top, &mut h);
         }
@@ -1115,7 +1124,9 @@ impl Ui {
         if let Some(i) = tap {
             out.extend(k.press_key(i));
         }
-        let mut f = InputFrame { nav: Nav { back: n.back, confirm: n.confirm && !pad.used, ..Nav::default() }, ..input.clone() };
+        // The shoulders pass through: in a text field they move the caret on every console.
+        let nav = Nav { back: n.back, confirm: n.confirm && !pad.used, prev_tab: n.prev_tab, next_tab: n.next_tab, ..Nav::default() };
+        let mut f = InputFrame { nav, ..input.clone() };
         if pad.used && n.back && !input.backspace && !empty {
             f.nav.back = false;
             out.extend(k.nav(OskNav::Backspace));
@@ -1324,7 +1335,9 @@ impl Ui {
         let nav = input.nav;
         // The box as `draw_field` draws it.
         let on_box = |e: &PointerEvent| matches!(e, PointerEvent::Down(Some((x, y))) if (8..248).contains(x) && (70..90).contains(y));
-        if nav.left || nav.right || input.pointer.iter().any(on_box) {
+        // The caret only ever stands at the end, so moving it (arrows, the shoulders of a pad,
+        // a tap on the box) is all that is left of it: the selection goes.
+        if nav.left || nav.right || nav.prev_tab || nav.next_tab || input.pointer.iter().any(on_box) {
             self.field_all = false;
         }
         if input.backspace {
@@ -2125,12 +2138,12 @@ impl Ui {
         }
     }
 
-    fn draw_toasts(&self, c: &mut Canvas, f: &mut Font, base: i32) {
+    fn draw_toasts(&self, c: &mut Canvas, f: &mut Font, base: i32, solid: bool) {
         for (i, (msg, _)) in self.toasts.iter().rev().enumerate() {
             let line = trunc(msg, 30);
             let w = f.width(&line, 1);
             let y = base - i as i32 * 14;
-            c.fill_rect((256 - w) / 2 - 4, y - 3, w + 8, 14, SHADE);
+            c.fill_rect((256 - w) / 2 - 4, y - 3, w + 8, 14, if solid { TOAST_BG } else { SHADE });
             f.draw_centered(c, y, &line, WHITE, 1);
         }
     }
@@ -3407,6 +3420,15 @@ mod tests {
         assert_eq!(ui.update(&nav(|n| n.confirm = true), &mut c, DT), None);
         assert_eq!(ui.stack.last(), Some(&Screen::Picker(Purpose::Solo)));
         assert_eq!(ui.shelf.name(key), Some("Mine"));
+        // A shoulder press of a pad keeps the name too (the built-in keyboard has the d-pad).
+        open_menu(&mut ui, &mut c);
+        ui.update(&nav(|n| n.down = true), &mut c, DT);
+        ui.update(&pad(|n| n.confirm = true), &mut c, DT);
+        assert!(ui.osk.is_some(), "opened by a pad: the built-in keyboard shows");
+        ui.update(&pad(|n| n.next_tab = true), &mut c, DT);
+        ui.update(&InputFrame { text: "!".into(), ..InputFrame::default() }, &mut c, DT);
+        assert_eq!(ui.field, "Mine!");
+        ui.update(&nav(|n| n.back = true), &mut c, DT);
         // A tap on the box keeps the name to add to; one delete then takes one character.
         rename(&mut ui, &mut c);
         ui.update(&pointer(&[PointerEvent::Down(Some((100, 80))), PointerEvent::Up(Some((100, 80)))]), &mut c, DT);

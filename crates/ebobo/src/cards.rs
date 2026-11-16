@@ -131,7 +131,8 @@ const TITLE_Y: i32 = 4;
 const CHIP_Y: i32 = 16;
 const CHIP_H: i32 = 12;
 const NAME_Y: i32 = 196;
-const INFO_Y: i32 = 208;
+/// The second detail line; the caller's toasts lie on it.
+pub(crate) const INFO_Y: i32 = 208;
 /// A row change scrolls over this long (ease-out).
 const SCROLL_TIME: f32 = 0.1;
 /// A picture fades in over this many milliseconds.
