@@ -2129,7 +2129,8 @@ impl Ui {
             let y = 50 + i as i32 * 18;
             let on = selected == Some(RoomRow::Seat(i));
             c.fill_rect(8, y - 4, 240, 16, if on { ACCENT } else { PANEL });
-            f.draw(c, 12, y, &(i + 1).to_string(), SLOT[i], 1);
+            // On the accent bar the controller colour would vanish (red on red): white there.
+            f.draw(c, 12, y, &(i + 1).to_string(), if on { WHITE } else { SLOT[i] }, 1);
             let Some(&peer) = lobby.order.get(i) else {
                 if i == lobby.order.len() {
                     f.draw(c, 28, y, self.t(S::Waiting), DIS, 1);
@@ -2144,7 +2145,7 @@ impl Ui {
                 tri(c, 228, y, WHITE, true);
             }
             if peer == EMPTY_SEAT {
-                f.draw(c, 28, y, self.t(S::SeatFree), DIS, 1);
+                f.draw(c, 28, y, self.t(S::SeatFree), if on { SEC } else { DIS }, 1);
                 continue;
             }
             let Some(p) = lobby.players.iter().find(|p| p.id == peer) else { continue };
@@ -2195,7 +2196,8 @@ impl Ui {
             f.draw_centered(c, 150, &format!("{}...", self.t(S::Starting)), WHITE, 1);
             return;
         }
-        let y0 = 138;
+        // Rows 14 px apart: under four rows the reason line still ends above the toast line.
+        let (y0, step) = (138, 14);
         let block = self.lobby_block(lobby);
         let options: Vec<RoomRow> = rows.iter().copied().filter(|r| !matches!(r, RoomRow::Seat(_))).collect();
         let items: Vec<Item> = options
@@ -2214,13 +2216,13 @@ impl Ui {
         // `draw_rows` numbers its hits by position; they carry the row ids instead.
         let first = h.len();
         let sel = selected.and_then(|s| options.iter().position(|r| *r == s)).unwrap_or(usize::MAX);
-        Self::draw_rows(c, f, &items, sel, y0, 16, h);
+        Self::draw_rows(c, f, &items, sel, y0, step, h);
         for (_, hit) in &mut h[first..] {
             if let Hit::Row { i, .. } = hit {
                 *i = options[*i].id();
             }
         }
-        let below = y0 + items.len() as i32 * 16 + 4;
+        let below = y0 + items.len() as i32 * step + 4;
         if lobby.is_host {
             if let Some(reason) = block {
                 f.draw_centered(c, below, self.t(reason), WARN, 1);
@@ -2231,12 +2233,14 @@ impl Ui {
             } else {
                 lobby.resume.map(|r| format!("{} ({})", self.t(resume_label(r.kind)), self.unix_age(r.saved_at)))
             };
+            let mut y = below;
             if let Some(line) = resume {
-                f.draw_centered(c, below, &trunc(&line, 30), WHITE, 1);
+                f.draw_centered(c, y, &trunc(&line, 30), WHITE, 1);
+                y += 12;
             }
             let saves = format!("{}: {}", self.t(S::NetSaves), self.t(saves_label(lobby.saves)));
-            f.draw_centered(c, below + 12, &saves, SEC, 1);
-            f.draw_centered(c, below + 24, self.t(S::WaitHost), SEC, 1);
+            f.draw_centered(c, y, &saves, SEC, 1);
+            f.draw_centered(c, y + 12, self.t(S::WaitHost), SEC, 1);
         }
     }
 
@@ -4352,6 +4356,9 @@ mod tests {
             guest_view.saves = SavePolicy::Host;
             guest_view.players[0].is_self = false;
             guest_view.players[1].is_self = true;
+            // A guest sees its own device without a route and the host's with one.
+            (guest_view.players[0].route, guest_view.players[0].rtt_ms) = (Some(RouteKind::Direct), Some(34));
+            (guest_view.players[1].route, guest_view.players[1].rtt_ms) = (None, None);
             let mut regroup = lobby(3, true, true);
             regroup.regrouped = true;
             regroup.order = vec![PeerId(0), EMPTY_SEAT, PeerId(2)];
