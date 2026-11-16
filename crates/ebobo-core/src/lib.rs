@@ -19,6 +19,8 @@ mod cpu;
 mod mapper;
 mod palette;
 mod ppu;
+#[cfg(test)]
+mod tilt_tests;
 
 use bincode::Options;
 use std::hash::{Hash, Hasher};
@@ -161,7 +163,9 @@ impl Nes {
     /// [`Nes::frame_tilted`] needs to move one under the other. Like the sprite limit it is
     /// not emulated state: no snapshot, hash or saved state holds it, and loading one leaves
     /// it as it was.
-    pub fn set_tilt(&mut self, _on: bool) {}
+    pub fn set_tilt(&mut self, on: bool) {
+        self.bus.set_tilt(on);
+    }
 
     /// The last completed picture with its background moved `shift` pixels (right, down;
     /// each taken within ±[`TILT_REACH`]) under the sprites, which stay where they are. The
@@ -170,14 +174,31 @@ impl Nes {
     /// [`Nes::frame_layers`] gives them (both resized). With no shift, and until a picture
     /// was completed with [`Nes::set_tilt`] on, it is the middle of the plain picture, byte
     /// for byte.
-    pub fn frame_tilted(&self, _shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
+    pub fn frame_tilted(&self, shift: (i32, i32), rgba: &mut Vec<u8>, layers: &mut Vec<u8>) -> (usize, usize) {
         let (rx, ry) = TILT_REACH;
         let (w, h) = (WIDTH - 2 * rx, HEIGHT - 2 * ry);
         rgba.resize(w * h * 4, 0);
         layers.resize(w * h, 0);
+        let planes = self.bus.tilt_planes();
+        // Where the background of output pixel (0, 0) is read: never outside the picture.
+        let bx = (rx as i32 - shift.0.clamp(-(rx as i32), rx as i32)) as usize;
+        let by = (ry as i32 - shift.1.clamp(-(ry as i32), ry as i32)) as usize;
         let frame = self.bus.frame();
+        let mut line = [0u16; WIDTH];
         for y in 0..h {
-            let row = &frame[(y + ry) * WIDTH + rx..][..w];
+            let row = match planes {
+                Some((background, sprites)) => {
+                    let sp = &sprites[(y + ry) * WIDTH + rx..][..w];
+                    let bg = &background[(y + by) * WIDTH + bx..][..w];
+                    for ((o, &s), &b) in line.iter_mut().zip(sp).zip(bg) {
+                        let sprite_wins = s & ppu::PLANE_OPAQUE != 0
+                            && (s & ppu::PLANE_FRONT != 0 || b & ppu::PLANE_OPAQUE == 0);
+                        *o = if sprite_wins { s } else { b };
+                    }
+                    &line[..w]
+                }
+                None => &frame[(y + ry) * WIDTH + rx..][..w],
+            };
             palette::write_rgba(row, self.info.region, &mut rgba[y * w * 4..][..w * 4]);
             for (o, px) in layers[y * w..][..w].iter_mut().zip(row) {
                 *o = (px >> ppu::FRAME_LAYER_SHIFT) as u8;

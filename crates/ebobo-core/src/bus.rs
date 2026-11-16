@@ -54,6 +54,15 @@ pub struct Bus {
     has_ext: bool,
     /// Host setting: hardware 8-sprites-per-line limit (render-only, not in the snapshot).
     sprite_limit: bool,
+    /// Host setting: keep the background and the sprites of each picture apart in `planes`
+    /// (display-only, not in the snapshot).
+    tilt: bool,
+    /// Background plane then sprite plane, `WIDTH * HEIGHT` words each (`Ppu::tick_planes`).
+    planes: Box<[u16]>,
+    /// The picture being drawn has had its planes written from its first line.
+    planes_whole: bool,
+    /// `planes` hold a whole picture, the one in `fb`.
+    planes_valid: bool,
 }
 
 impl Bus {
@@ -92,6 +101,10 @@ impl Bus {
             fast_forward: false,
             has_ext,
             sprite_limit: true,
+            tilt: false,
+            planes: vec![0u16; 2 * WIDTH * HEIGHT].into_boxed_slice(),
+            planes_whole: false,
+            planes_valid: false,
         })
     }
 
@@ -138,8 +151,29 @@ impl Bus {
     }
 
     pub fn set_fast_forward(&mut self, on: bool) {
+        if on != self.fast_forward {
+            // A picture drawn partly leaves the planes mixed.
+            self.planes_whole = false;
+        }
         self.fast_forward = on;
         self.audio.set_muted(on);
+    }
+
+    /// Turns the tilt planes on or off. Off forgets them; on, they become readable once a
+    /// whole picture was drawn. Restores and state loads leave the setting alone.
+    pub fn set_tilt(&mut self, on: bool) {
+        if on == self.tilt {
+            return;
+        }
+        self.tilt = on;
+        self.planes_whole = false;
+        self.planes_valid = false;
+    }
+
+    /// Background and sprite plane of the picture in [`Bus::frame`], once tilt is on and a
+    /// whole picture was drawn with it.
+    pub fn tilt_planes(&self) -> Option<(&[u16], &[u16])> {
+        self.planes_valid.then(|| self.planes.split_at(WIDTH * HEIGHT))
     }
 
     pub fn state(&self) -> &BusState {
@@ -222,17 +256,19 @@ impl Bus {
         {
             let s = &mut self.s;
             // An empty slice tells the PPU to skip pixel composition.
-            let fb: &mut [u16] = if self.fast_forward { &mut [] } else { &mut self.fb };
+            let draw = !self.fast_forward;
+            let fb: &mut [u16] = if draw { &mut self.fb } else { &mut [] };
+            let planes: &mut [u16] = if draw && self.tilt { &mut self.planes } else { &mut [] };
             if s.cpu_clocks == 12 {
                 // NTSC: exactly 3 dots per CPU cycle; `master_acc` stays 0.
-                s.ppu.tick(&mut s.cart, fb);
-                s.ppu.tick(&mut s.cart, fb);
-                s.ppu.tick(&mut s.cart, fb);
+                s.ppu.tick_planes(&mut s.cart, fb, planes);
+                s.ppu.tick_planes(&mut s.cart, fb, planes);
+                s.ppu.tick_planes(&mut s.cart, fb, planes);
             } else {
                 s.master_acc += s.cpu_clocks;
                 while s.master_acc >= s.dot_clocks {
                     s.master_acc -= s.dot_clocks;
-                    s.ppu.tick(&mut s.cart, fb);
+                    s.ppu.tick_planes(&mut s.cart, fb, planes);
                 }
             }
             // NMI-edge and frame-done latching once per CPU cycle: inside `tick` the NMI line
@@ -245,6 +281,12 @@ impl Bus {
             s.nmi_prev = line;
             if s.ppu.take_frame_done() {
                 s.frame_done = true;
+                // The picture ended; the next one starts with the settings as they are now.
+                let on = draw && self.tilt;
+                if on && self.planes_whole {
+                    self.planes_valid = true;
+                }
+                self.planes_whole = on;
             }
         }
         let s = &mut self.s;

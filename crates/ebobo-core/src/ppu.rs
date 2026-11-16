@@ -16,6 +16,12 @@ pub const FRAME_SPRITE_BEHIND: u16 = 1 << FRAME_LAYER_SHIFT;
 pub const FRAME_BG: u16 = 2 << FRAME_LAYER_SHIFT;
 /// A sprite pixel in front of the background (overlay and ESX sprites included).
 pub const FRAME_SPRITE: u16 = 3 << FRAME_LAYER_SHIFT;
+/// Flags of a tilt plane word (see [`Ppu::tick_planes`]), in bits the picture word leaves 0:
+/// the plane has a pixel here; the sprite is in front of the background.
+pub const PLANE_OPAQUE: u16 = 1 << 9;
+pub const PLANE_FRONT: u16 = 1 << 10;
+/// Words in one tilt plane.
+const PLANE_WORDS: usize = 256 * 240;
 
 /// All PPU state: registers, 2 KiB CIRAM (4 KiB for four-screen), OAM, palette RAM, render
 /// pipeline. Part of the rollback snapshot, so `Clone + Hash`, and the frame buffer is NOT
@@ -706,6 +712,17 @@ impl Ppu {
     /// `cart.ppu_read(addr, dot_counter)`.
     #[inline]
     pub fn tick(&mut self, cart: &mut Cartridge, fb: &mut [u16]) {
+        self.tick_planes(cart, fb, &mut []);
+    }
+
+    /// [`Ppu::tick`] that also keeps the background and the sprites of every visible pixel
+    /// apart in `planes`, unless it is empty: `WIDTH * HEIGHT` background words, then as many
+    /// sprite words. Each is a picture word (colour, emphasis, layer) of what that plane
+    /// alone shows there, plus [`PLANE_OPAQUE`] and, for sprites, [`PLANE_FRONT`]; a
+    /// transparent background word carries the backdrop colour, a transparent sprite word
+    /// is 0. Nothing is written when `fb` is empty.
+    #[inline]
+    pub fn tick_planes(&mut self, cart: &mut Cartridge, fb: &mut [u16], planes: &mut [u16]) {
         let line = self.scanline;
         let dot = self.dot;
 
@@ -737,7 +754,7 @@ impl Ppu {
             self.render_dot(cart, dot);
         }
         if line >= 0 && dot.wrapping_sub(1) < 256 {
-            self.output_pixel(fb, line as usize, (dot - 1) as usize);
+            self.output_pixel(fb, planes, line as usize, (dot - 1) as usize);
         }
         self.dot_counter += 1;
         // Below dot 338 neither the line wrap nor the odd-frame skip (sampled at 339) applies.
@@ -827,7 +844,7 @@ impl Ppu {
     }
 
     #[inline]
-    fn output_pixel(&mut self, fb: &mut [u16], y: usize, x: usize) {
+    fn output_pixel(&mut self, fb: &mut [u16], planes: &mut [u16], y: usize, x: usize) {
         // An empty `fb` means fast-forward: keep every state side effect, skip composition.
         let skip = fb.is_empty();
         if skip && !self.rendering() {
@@ -835,11 +852,12 @@ impl Ppu {
         }
         let (index, layer) = if !self.rendering() {
             // Rendering off: the backdrop, or whatever palette entry `v` points at.
-            if self.v & 0x3F00 == 0x3F00 {
-                (palette_index(self.v), 0)
-            } else {
-                (0, 0)
+            let index = if self.v & 0x3F00 == 0x3F00 { palette_index(self.v) } else { 0 };
+            if !planes.is_empty() {
+                planes[y * 256 + x] = self.shade(self.palette[index]);
+                planes[PLANE_WORDS + y * 256 + x] = 0;
             }
+            (index, 0)
         } else {
             let (mut bg_pixel, mut bg_pal) = (0u8, 0u8);
             if self.mask & 0x08 != 0 && (x >= 8 || self.mask & 0x02 != 0) {
@@ -881,6 +899,34 @@ impl Ppu {
 
             let sprite_wins = sp_pixel != 0 && (bg_pixel == 0 || sp_front);
             let sprite_layer = if sp_front { FRAME_SPRITE } else { FRAME_SPRITE_BEHIND };
+            if !planes.is_empty() {
+                let bg_color = if bg_pixel == 0 {
+                    self.palette[0]
+                } else {
+                    self.palette[((bg_pal << 2) | bg_pixel) as usize & 0x1F]
+                };
+                let mut bg = self.shade(bg_color);
+                if bg_pixel != 0 {
+                    bg |= PLANE_OPAQUE;
+                    if bg_color & 0x3F != self.palette[0] & 0x3F {
+                        bg |= FRAME_BG;
+                    }
+                }
+                let mut sp = 0;
+                if sp_pixel != 0 {
+                    let color = if sp_esx {
+                        self.esx_pal[((sp_pal << 2) | sp_pixel) as usize]
+                    } else {
+                        self.palette[((sp_pal << 2) | sp_pixel) as usize & 0x1F]
+                    };
+                    sp = self.shade(color) | sprite_layer | PLANE_OPAQUE;
+                    if sp_front {
+                        sp |= PLANE_FRONT;
+                    }
+                }
+                planes[y * 256 + x] = bg;
+                planes[PLANE_WORDS + y * 256 + x] = sp;
+            }
             if sprite_wins && sp_esx {
                 let color = self.esx_pal[((sp_pal << 2) | sp_pixel) as usize];
                 self.write_color(fb, y, x, color, sprite_layer);
@@ -917,11 +963,18 @@ impl Ppu {
     /// the backdrop, or [`FRAME_SPRITE_BEHIND`], [`FRAME_BG`], [`FRAME_SPRITE`].
     #[inline]
     fn write_color(&self, fb: &mut [u16], y: usize, x: usize, color: u8, layer: u16) {
+        fb[y * 256 + x] = self.shade(color) | layer;
+    }
+
+    /// NES colour `color` as a picture word without its layer: greyscale applied, emphasis
+    /// bits added.
+    #[inline]
+    fn shade(&self, color: u8) -> u16 {
         let mut color = color & 0x3F;
         if self.mask & 1 != 0 {
             color &= 0x30;
         }
-        fb[y * 256 + x] = color as u16 | ((self.mask as u16 & 0xE0) << 1) | layer;
+        color as u16 | ((self.mask as u16 & 0xE0) << 1)
     }
 
     /// Rasterises the 8 sprite slots into `sp_buf`; lower slots win, as in hardware.
