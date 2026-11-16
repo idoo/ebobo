@@ -34,6 +34,7 @@ use crate::enhance::{Enhancer, Mode};
 use crate::i18n::Lang;
 use crate::input::{Input, InputFrame, PadEvent, PadInfo, PointerEvent};
 use crate::library::{self, Library, RomEntry};
+use crate::tilt::Tilt;
 use crate::ui::{GameView, OpenFailure, Text, Ui, UiAction, UiCtx};
 use crate::video::{Frame, GameFrame, PictureRef, Pictures, Video};
 
@@ -172,6 +173,14 @@ struct App {
     layers: Vec<u8>,
     /// Magnifies and shades `frame` for display when `Config::enhance` is not `Off`.
     enhancer: Enhancer,
+    /// Where the far planes sit as the device tilts (`Config::tilt`, or pinned by `--tilt-at`).
+    tilt: Tilt,
+    /// `--tilt-at`: the tilt is pinned and the effect is on for this run, sensor or not.
+    tilt_pinned: bool,
+    /// The gamepad gyroscope as last polled (`Input::gyro`).
+    gyro: Option<[f32; 3]>,
+    /// When the tilt was last updated (its `dt`).
+    tilt_at: Instant,
     title_rom: Option<String>,
     quit: bool,
     /// The window is not the front one: a solo game stands still until it is again.
@@ -227,6 +236,9 @@ pub fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
+    if let Some(secs) = cli.tilt_probe {
+        return crate::tilt::probe(secs);
+    }
     let mut app = match App::new(&cli) {
         Ok(app) => app,
         Err(err) => {
@@ -383,6 +395,10 @@ impl App {
             frame_size: None,
             layers: Vec::new(),
             enhancer: Enhancer::new(),
+            tilt: Tilt::new(cli.tilt_at),
+            tilt_pinned: cli.tilt_at.is_some(),
+            gyro: None,
+            tilt_at: Instant::now(),
             title_rom: None,
             quit: false,
             away: false,
@@ -472,6 +488,7 @@ impl App {
     fn tick(&mut self, dt: Duration) {
         let video = &self.video;
         let frame = self.input.poll(&mut self.pump, dt, |pos| video.to_canvas(pos));
+        self.gyro = self.input.gyro();
         // Finished box art: every tick draws the whole frame, so a new picture shows by itself.
         self.ui.art_mut().set_online(self.config.online_art);
         self.ui.art_mut().poll();
@@ -845,9 +862,14 @@ impl App {
                             s.slot_times[slot] = slots::saved_at(&path);
                             // The picture now on screen goes next to the state. Without it the
                             // save still counts, and the slot must not keep its old picture.
-                            let mut frame = Vec::new();
-                            let (w, h) = s.console.frame_rgba(&mut frame);
-                            let thumb = slots::shrink(&frame, w, h);
+                            let thumb = match self.frame_size {
+                                Some((w, h)) => slots::shrink(&self.frame, w as usize, h as usize),
+                                None => {
+                                    let mut frame = Vec::new();
+                                    let (w, h) = s.console.frame_rgba(&mut frame);
+                                    slots::shrink(&frame, w, h)
+                                }
+                            };
                             let thumb_path = slots::thumb_path(&path);
                             s.slot_thumbs[slot] = match slots::save_thumb(&thumb_path, &thumb) {
                                 Ok(()) => Some(thumb),
@@ -1543,22 +1565,45 @@ impl App {
     }
 
     fn compose(&mut self, frame: &InputFrame) {
+        let wanted = self.config.tilt || self.tilt_pinned;
+        let now = Instant::now();
+        let dt = now.duration_since(self.tilt_at).as_secs_f32().min(0.1);
+        self.tilt_at = now;
+        // Read in the menus too, so switching Tilt on can tell whether anything measures motion.
+        let tilt = if wanted || self.ui.is_visible() { self.tilt.update(self.gyro, dt) } else { None };
+        if wanted || self.ui.is_visible() {
+            self.ui.set_motion_sensor(tilt.is_some());
+        }
+        let tilt = tilt.filter(|_| wanted);
+        let console = match &mut self.state {
+            State::Solo(s) => Some(&mut s.console),
+            State::Net(n) => Some(&mut n.console),
+            State::Menu | State::Lobby(_) => None,
+        };
+        self.frame_size = console
+            .map(|console| {
+                // Display only: the flag lives outside the snapshot, so it is set on whichever
+                // console runs now (new games, state loads and netplay regroups included).
+                console.set_tilt(tilt.is_some());
+                match tilt {
+                    // Fills the layers too.
+                    Some(t) => {
+                        let shift = self.tilt.shift(t, console.tilt_reach());
+                        console.frame_tilted(shift, &mut self.frame, &mut self.layers)
+                    }
+                    None => {
+                        let size = console.frame_rgba(&mut self.frame);
+                        // Layers only for the frame that is shown, and only when an enhancement uses them.
+                        if self.config.enhance != Mode::Off {
+                            console.frame_layers(&mut self.layers);
+                        }
+                        size
+                    }
+                }
+            })
+            .map(|(w, h)| (w as u32, h as u32));
         // With a game the canvas starts transparent (the game layer shows through where the
         // interface draws nothing); the menus have their backdrop.
-        self.frame_size = match &self.state {
-            State::Solo(s) => Some(s.console.frame_rgba(&mut self.frame)),
-            State::Net(n) => Some(n.console.frame_rgba(&mut self.frame)),
-            State::Menu | State::Lobby(_) => None,
-        }
-        .map(|(w, h)| (w as u32, h as u32));
-        // Layers only for the frame that is shown, and only when an enhancement uses them.
-        if self.config.enhance != Mode::Off {
-            match &self.state {
-                State::Solo(s) => _ = s.console.frame_layers(&mut self.layers),
-                State::Net(n) => _ = n.console.frame_layers(&mut self.layers),
-                State::Menu | State::Lobby(_) => {}
-            }
-        }
         match self.frame_size {
             Some(_) => self.canvas.clear_transparent(),
             None => self.canvas.clear(BACKDROP),
@@ -1577,19 +1622,18 @@ impl App {
         self.ui.draw(&mut self.canvas, &mut self.font, &ctx, frame);
     }
 
-    /// F12 / Back+North: the running game's frame ×3 (nearest) as PNG into the pictures folder,
-    /// solo and online alike.
+    /// F12 / Back+North: the game's picture as composed for the screen (tilt included) ×3
+    /// (nearest) as PNG into the pictures folder, solo and online alike.
     fn screenshot(&mut self) {
-        let (console, name) = match &self.state {
-            State::Solo(s) => (&s.console, &s.name),
-            State::Net(n) => (&n.console, &n.rom_name),
+        let name = match &self.state {
+            State::Solo(s) => &s.name,
+            State::Net(n) => &n.rom_name,
             State::Menu | State::Lobby(_) => return,
         };
+        let Some((w, h)) = self.frame_size.map(|(w, h)| (w as usize, h as usize)) else { return };
         let k = 3;
-        let mut rgba = Vec::new();
-        let (w, h) = console.frame_rgba(&mut rgba);
         let mut big = Vec::new();
-        logic::scale_nearest(&rgba, w, h, k, &mut big);
+        logic::scale_nearest(&self.frame, w, h, k, &mut big);
         let png = png::encode_rgba((w * k) as u32, (h * k) as u32, &big);
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -46,6 +46,8 @@ pub struct Config {
     pub enhance: crate::enhance::Mode,
     /// Ambient light: the bars around a game's picture glow softly in its colours.
     pub ambient: bool,
+    /// Tilt: the planes behind the sprites move as the device is tilted (needs a motion sensor).
+    pub tilt: bool,
     /// Who may save and load in an online game this device hosts: "all", "host" or "off".
     pub online_saves: String,
 }
@@ -109,6 +111,7 @@ impl Default for Config {
             online_art: true,
             enhance: crate::enhance::Mode::Off,
             ambient: true,
+            tilt: false,
             online_saves: "all".to_string(),
         }
     }
@@ -345,6 +348,15 @@ mod tests {
             let back: Config = toml::from_str(&text).unwrap();
             assert_eq!((back.enhance, back.ambient), (mode, false));
         }
+    }
+
+    #[test]
+    fn tilt_default_for_old_files_and_round_trip() {
+        let old: Config = toml::from_str("fullscreen = true\nscale = 2\nambient = false\n").unwrap();
+        assert!(!old.tilt);
+        let text = toml::to_string_pretty(&Config { tilt: true, ..Config::default() }).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(back.tilt);
     }
 
     #[test]
