@@ -2,8 +2,8 @@
 //!
 //! Self-contained: its own state, input handling (buttons, keys, pointer), layout and
 //! drawing. `ui.rs` hands it the frame's input and the list of games and acts on what it
-//! returns; the pictures come from `ebobo_art::Art`, favourites and history from
-//! `ebobo_art::shelf::Shelf`.
+//! returns; the pictures come from `ebobo_art::Art`, favourites, history, hidden marks and
+//! the user's own names from `ebobo_art::shelf::Shelf`.
 //!
 //! # How `ui.rs` uses it
 //!
@@ -14,6 +14,7 @@
 //!     Some(Action::Rescan) => rescan the folders,
 //!     Some(Action::Back) => leave the screen,
 //!     Some(Action::EditSearch) => open the text field with `cards.search()`, later `cards.set_search(text)`,
+//!     Some(Action::Menu(i)) => open the menu of games[i] (favourite, rename, hide, delete),
 //!     None => {}
 //! }
 //! art.poll();
@@ -37,8 +38,16 @@
 //! - Keys: `input.text` letters, digits and spaces go into the search (24 characters at
 //!   most), `input.backspace` deletes one (with an empty search Backspace is `nav.back` as in
 //!   every menu). A space is a search character only after the first one: on an empty search
-//!   it is left to `nav.fav`. Text input has to be on for typing to arrive
+//!   it is left to `nav.options`. Text input has to be on for typing to arrive
 //!   (`Input::set_text_input(true)` while this screen shows).
+//! - A game's menu (`Action::Menu`) opens three ways: `nav.options` on the selected game (pad
+//!   Start, Space, the Menu key), a right click on its tile, or a press held on its tile for
+//!   half a second without scrolling. The pointer ways select the tile first, and the release
+//!   after a long press starts nothing. The favourite key is `nav.fav` (the pad's North).
+//! - Chips: All, the two systems (when both have games), Recent (with history), the
+//!   favourites star and, only while a game is hidden, a crossed-out eye for `Filter::Hidden`.
+//!   Under that filter the title line says "Hidden" instead of the screen's title. A sorted
+//!   and searched name is the user's own (`Shelf::name`) when there is one.
 //! - Chips are hit-tested as last drawn, so the language never has to be passed to `update`.
 
 use std::collections::HashMap;
@@ -129,6 +138,8 @@ const SCROLL_TIME: f32 = 0.1;
 const FADE_MS: u128 = 150;
 /// A press that moves this far vertically becomes a scroll drag.
 const DRAG_PX: i32 = 6;
+/// A press held this long on a game's tile opens its menu.
+const HOLD: Duration = Duration::from_millis(500);
 const SEARCH_MAX: usize = 24;
 /// Characters of the name line; a longer name scrolls.
 const NAME_CHARS: usize = 30;
@@ -138,6 +149,8 @@ const NAME_REST: usize = 5;
 
 /// 7x7 star, bit 6 = leftmost pixel.
 pub(crate) const STAR: [u16; 7] = [0b0001000, 0b0001000, 0b1111111, 0b0111110, 0b0011100, 0b0110110, 0b0100010];
+/// 9x7 crossed-out eye (the chip of the hidden games), bit 8 = leftmost pixel.
+const HIDDEN: [u16; 7] = [0b000000010, 0b001111100, 0b010001010, 0b100010001, 0b010100010, 0b001111100, 0b010000000];
 /// 11x11 refresh arrow, bit 10 = leftmost pixel.
 const REFRESH: [u16; 11] = [
     0b00001111000,
@@ -162,6 +175,10 @@ struct Press {
     /// The scroll target when it began.
     scroll: i32,
     drag: bool,
+    /// How long it has been held still.
+    held: Duration,
+    /// It was held long enough to open the menu: its release is not a tap.
+    menu: bool,
 }
 
 /// What the detail lines were formatted for: selected game, on the Rescan tile, view epoch,
@@ -192,6 +209,8 @@ pub struct Cards {
     systems: [bool; 2],
     /// The shelf has play history.
     history: bool,
+    /// A game of the list is hidden: the Hidden chip exists.
+    hidden: bool,
     /// Grid scroll in pixels: shown now, where the animation began, where it goes, its age.
     scroll: f32,
     scroll_from: f32,
@@ -203,7 +222,7 @@ pub struct Cards {
     /// Picture id → `clock` of the first frame it existed.
     fades: HashMap<u64, Duration>,
     /// Chips as last drawn: filter, x, width.
-    chip_hit: [(Filter, i32, i32); 5],
+    chip_hit: [(Filter, i32, i32); 6],
     chip_n: usize,
     /// The search line and the language it was made in.
     search_line: String,
@@ -239,10 +258,11 @@ impl Cards {
             scroll_from: 0.0,
             scroll_to: 0,
             scroll_t: Duration::ZERO,
+            hidden: false,
             press: None,
             clock: Duration::ZERO,
             fades: HashMap::new(),
-            chip_hit: [(Filter::All, 0, 0); 5],
+            chip_hit: [(Filter::All, 0, 0); 6],
             chip_n: 0,
             search_line: String::new(),
             search_lang: None,
@@ -283,7 +303,7 @@ impl Cards {
         self.sync(games, shelf);
         let mut action = None;
 
-        // Search text. A space only continues a search; on an empty one it is the favourite key.
+        // Search text. A space only continues a search; on an empty one it is the options key.
         let mut typed_space = false;
         for ch in input.text.chars() {
             let space = ch == ' ' && !self.search.is_empty();
@@ -354,6 +374,7 @@ impl Cards {
         }
 
         // Pointer.
+        let pressed_before = self.press.is_some();
         for event in &input.pointer {
             match *event {
                 PointerEvent::Down(Some((x, y))) => {
@@ -366,13 +387,13 @@ impl Cards {
                         if let Some(pos) = tile {
                             self.sel = pos;
                         }
-                        self.press = Some(Press { y, tile, scroll: self.scroll_to, drag: false });
+                        self.press = Some(Press { y, tile, scroll: self.scroll_to, drag: false, held: Duration::ZERO, menu: false });
                     }
                 }
                 PointerEvent::Move(Some((_, y))) => {
                     let max = self.max_scroll();
                     if let Some(press) = &mut self.press {
-                        press.drag |= (y - press.y).abs() >= DRAG_PX;
+                        press.drag |= !press.menu && (y - press.y).abs() >= DRAG_PX;
                         if press.drag {
                             // The grid follows the finger: no animation.
                             let to = (press.scroll - (y - press.y)).clamp(0, max);
@@ -382,7 +403,7 @@ impl Cards {
                     }
                 }
                 PointerEvent::Up(at) => {
-                    if let Some(press) = self.press.take().filter(|p| !p.drag) {
+                    if let Some(press) = self.press.take().filter(|p| !p.drag && !p.menu) {
                         let same = at.is_some_and(|(x, y)| press.tile.is_some() && self.tile_at(x, y) == press.tile);
                         if same {
                             action = self.activate(games).or(action);
@@ -396,7 +417,28 @@ impl Cards {
                     let to = self.scroll_to.saturating_sub(notches.saturating_mul(ROW_STEP)).clamp(0, self.max_scroll());
                     self.scroll_target(to);
                 }
-                PointerEvent::Down(None) | PointerEvent::Move(None) | PointerEvent::Secondary(_) => {}
+                PointerEvent::Secondary(Some((x, y))) => {
+                    if let Some((pos, &i)) = self.tile_at(x, y).and_then(|pos| Some((pos, self.view.get(pos)?))) {
+                        self.press = None;
+                        self.sel = pos;
+                        self.ensure_visible();
+                        action = Some(Action::Menu(i));
+                    }
+                }
+                PointerEvent::Down(None) | PointerEvent::Move(None) | PointerEvent::Secondary(None) => {}
+            }
+        }
+        // A press that stays down and still becomes the menu of its game. One that began this
+        // frame starts counting with the next, so a long frame cannot turn a tap into a hold.
+        if let Some(press) = self.press.as_mut().filter(|p| pressed_before && !p.drag && !p.menu) {
+            press.held += dt;
+            if press.held >= HOLD {
+                if let Some((pos, &i)) = press.tile.and_then(|pos| Some((pos, self.view.get(pos)?))) {
+                    press.menu = true;
+                    self.sel = pos;
+                    self.ensure_visible();
+                    action = Some(Action::Menu(i));
+                }
             }
         }
         self.sel_key = self.view.get(self.sel).map(|&i| games[i].key);
@@ -432,6 +474,8 @@ impl Cards {
 
         // Title or search line, the count at the right.
         if self.search.is_empty() {
+            // Under the Hidden filter the line names it: its chip is only an icon.
+            let title = if self.filter == Filter::Hidden { lang.tr(S::FilterHidden) } else { title };
             f.draw(c, 8, TITLE_Y, title, WHITE, 1);
         } else {
             if self.search_lang != Some(lang) {
@@ -458,15 +502,19 @@ impl Cards {
                 Filter::System(System::Nes) => lang.tr(S::SystemNes),
                 Filter::System(System::MegaDrive) => lang.tr(S::SystemMd),
                 Filter::Recent => lang.tr(S::FilterRecent),
-                Filter::Favourites => "",
-                Filter::Hidden => lang.tr(S::FilterHidden),
+                Filter::Favourites | Filter::Hidden => "",
             };
-            let w = if filter == Filter::Favourites { 7 + 8 } else { f.width(label, 1) + 8 };
+            let sign: Option<(&[u16], i32)> = match filter {
+                Filter::Favourites => Some((&STAR, 7)),
+                Filter::Hidden => Some((&HIDDEN, 9)),
+                _ => None,
+            };
+            let w = sign.map_or_else(|| f.width(label, 1), |(_, w)| w) + 8;
             let active = filter == self.filter;
             c.fill_rect(x, CHIP_Y, w, CHIP_H, if active { ACCENT } else { PANEL });
             let ink = if active { WHITE } else { SEC };
-            if filter == Filter::Favourites {
-                icon(c, x + 4, CHIP_Y + 2, &STAR, 7, (0, CHIP_Y + CHIP_H), ink);
+            if let Some((rows, iw)) = sign {
+                icon(c, x + 4, CHIP_Y + 2, rows, iw, (0, CHIP_Y + CHIP_H), ink);
             } else {
                 f.draw(c, x + 4, CHIP_Y + 2, label, ink, 1);
             }
@@ -519,8 +567,8 @@ impl Cards {
     }
 
     /// The chips in order and how many.
-    fn chips(&self) -> ([Filter; 5], usize) {
-        let mut out = [Filter::All; 5];
+    fn chips(&self) -> ([Filter; 6], usize) {
+        let mut out = [Filter::All; 6];
         let mut n = 1;
         if self.systems[0] && self.systems[1] {
             out[n] = Filter::System(System::Nes);
@@ -532,7 +580,12 @@ impl Cards {
             n += 1;
         }
         out[n] = Filter::Favourites;
-        (out, n + 1)
+        n += 1;
+        if self.hidden {
+            out[n] = Filter::Hidden;
+            n += 1;
+        }
+        (out, n)
     }
 
     fn set_filter(&mut self, filter: Filter) {
@@ -565,12 +618,13 @@ impl Cards {
             self.systems[system_slot(game.key.system)] = true;
         }
         self.history = history;
+        self.hidden = games.iter().any(|g| shelf.is_hidden(g.key));
         // A chip that is gone (one system left, history cleared) falls back to All.
         let (chips, n) = self.chips();
         if !chips[..n].contains(&self.filter) {
             self.filter = Filter::All;
         }
-        let items: Vec<Item> = games.iter().map(|g| Item { key: g.key, name: g.name, file: g.file }).collect();
+        let items: Vec<Item> = games.iter().map(|g| Item { key: g.key, name: shelf.name(g.key).unwrap_or(g.name), file: g.file }).collect();
         shelf.view(&items, self.filter, &self.search, &mut self.view);
         self.rescan = self.filter == Filter::All && self.search.is_empty();
         let total = self.entries();
@@ -797,19 +851,26 @@ fn system_slot(system: System) -> usize {
 }
 
 /// A hash of everything the view depends on: the games in order (key, name, runnable) and
-/// each one's favourite mark and last play. No allocation.
+/// each one's favourite mark, hidden mark, last play and own name. No allocation.
 fn fingerprint(games: &[Game], shelf: &Shelf) -> u64 {
     let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
     let mut mix = |value: u64| hash = (hash ^ value).wrapping_mul(0x0100_0000_01B3);
     for game in games {
         let key = game.key;
-        let flags = u64::from(game.runnable) << 40 | u64::from(shelf.is_favourite(key)) << 41 | (system_slot(key.system) as u64) << 32;
+        let flags = u64::from(game.runnable) << 40
+            | u64::from(shelf.is_favourite(key)) << 41
+            | u64::from(shelf.is_hidden(key)) << 42
+            | (system_slot(key.system) as u64) << 32;
         mix(flags | u64::from(key.crc32));
         mix(shelf.last_played(key).map_or(0, |t| t.wrapping_add(1)));
         for byte in game.name.bytes() {
             mix(u64::from(byte));
         }
         mix(0xFF);
+        for byte in shelf.name(key).unwrap_or("").bytes() {
+            mix(u64::from(byte));
+        }
+        mix(0xFE);
     }
     mix(games.len() as u64);
     hash
@@ -1240,6 +1301,132 @@ mod tests {
     }
 
     #[test]
+    fn right_click_opens_the_menu_of_a_game_tile() {
+        let roms = library(6, 2);
+        let games = games(&roms);
+        let mut shelf = Shelf::in_memory();
+        let mut cards = Cards::new();
+        idle(&mut cards, &games, &mut shelf, 1);
+        let (x, y) = tile_mid(6);
+        assert_eq!(step(&mut cards, &games, &mut shelf, |i| i.pointer.push(PointerEvent::Secondary(Some((x, y))))), Some(Action::Menu(6)));
+        assert_eq!(cards.selected(), Some(6));
+        // The Rescan tile, the gap between tiles, outside the canvas: nothing, the selection stays.
+        let (rx, ry) = tile_mid(8);
+        for at in [Some((rx, ry)), Some((GRID_X + TILE_W + 2, y)), Some((x, CHIP_Y + 4)), None] {
+            assert_eq!(step(&mut cards, &games, &mut shelf, |i| i.pointer.push(PointerEvent::Secondary(at))), None, "{at:?}");
+            assert_eq!(cards.selected(), Some(6));
+        }
+    }
+
+    #[test]
+    fn long_press_opens_the_menu_once_and_its_release_starts_nothing() {
+        let roms = library(24, 0);
+        let games = games(&roms);
+        let mut shelf = Shelf::in_memory();
+        let (x, y) = tile_mid(6);
+        let down = |cards: &mut Cards, shelf: &mut Shelf, x: i32, y: i32| {
+            idle(cards, &games, shelf, 1);
+            assert_eq!(step(cards, &games, shelf, |i| i.pointer.push(PointerEvent::Down(Some((x, y))))), None);
+        };
+
+        // Held still: 31 frames are 496 ms, the 32nd passes half a second.
+        let mut cards = Cards::new();
+        down(&mut cards, &mut shelf, x, y);
+        idle(&mut cards, &games, &mut shelf, 31);
+        assert_eq!(step(&mut cards, &games, &mut shelf, |_| {}), Some(Action::Menu(6)));
+        assert_eq!(cards.selected(), Some(6));
+        idle(&mut cards, &games, &mut shelf, 60);
+        // The finger sliding afterwards does not scroll, lifting it does not start the game.
+        assert_eq!(step(&mut cards, &games, &mut shelf, |i| i.pointer.push(PointerEvent::Move(Some((x, y - 40))))), None);
+        assert_eq!(cards.scroll_to, 0);
+        assert_eq!(step(&mut cards, &games, &mut shelf, |i| i.pointer.push(PointerEvent::Up(Some((x, y))))), None);
+        // The next tap is an ordinary one.
+        assert_eq!(step(&mut cards, &games, &mut shelf, |i| tap(i, x, y)), Some(Action::Start(6)));
+
+        // A hold that became a drag scrolls and opens nothing.
+        let mut cards = Cards::new();
+        down(&mut cards, &mut shelf, x, y);
+        step(&mut cards, &games, &mut shelf, |i| i.pointer.push(PointerEvent::Move(Some((x, y - 40)))));
+        idle(&mut cards, &games, &mut shelf, 60);
+        assert_eq!(cards.scroll_to, 40);
+        assert_eq!(step(&mut cards, &games, &mut shelf, |i| i.pointer.push(PointerEvent::Up(Some((x, y - 40))))), None);
+
+        // A short press is still a tap.
+        let mut cards = Cards::new();
+        down(&mut cards, &mut shelf, x, y);
+        idle(&mut cards, &games, &mut shelf, 20);
+        assert_eq!(step(&mut cards, &games, &mut shelf, |i| i.pointer.push(PointerEvent::Up(Some((x, y))))), Some(Action::Start(6)));
+
+        // The Rescan tile has no menu: held or not, its release rescans.
+        let few = &games[..3];
+        let (rx, ry) = tile_mid(3);
+        let mut cards = Cards::new();
+        idle(&mut cards, few, &mut shelf, 1);
+        assert_eq!(step(&mut cards, few, &mut shelf, |i| i.pointer.push(PointerEvent::Down(Some((rx, ry))))), None);
+        idle(&mut cards, few, &mut shelf, 60);
+        assert_eq!(step(&mut cards, few, &mut shelf, |i| i.pointer.push(PointerEvent::Up(Some((rx, ry))))), Some(Action::Rescan));
+    }
+
+    #[test]
+    fn hidden_games_leave_the_list_and_get_their_own_chip() {
+        let roms = library(3, 2);
+        let games = games(&roms);
+        let mut shelf = Shelf::in_memory();
+        shelf.played(roms[0].key, NOW - DAY);
+        let mut art = Art::new(folder("hidden"), false);
+        let (mut canvas, mut font) = (Canvas::new(), Font::new());
+        let mut cards = Cards::new();
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.chips().1, 5);
+        shelf.set_hidden(roms[1].key, true);
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.view, [0, 2, 3, 4], "a hidden game is not in All");
+        let (chips, n) = cards.chips();
+        assert_eq!((n, chips[5]), (6, Filter::Hidden));
+        // All six chips fit the line in both languages.
+        for lang in [Lang::Ru, Lang::En] {
+            cards.draw(&mut canvas, &mut font, &games, &shelf, &mut art, lang, "Games", false, NOW);
+            let (filter, cx, w) = cards.chip_hit[5];
+            assert_eq!((cards.chip_n, filter), (6, Filter::Hidden));
+            assert!(cx + w <= 248, "{lang:?}: the chip row ends at {}", cx + w);
+        }
+        // Its chip shows the hidden game alone, without the Rescan tile.
+        let (_, cx, w) = cards.chip_hit[5];
+        step(&mut cards, &games, &mut shelf, |i| tap(i, cx + w / 2, CHIP_Y + 6));
+        assert_eq!((cards.filter, cards.view.as_slice(), cards.entries()), (Filter::Hidden, &[1][..], 1));
+        assert_eq!(cards.selected(), Some(1));
+        // Put back: the chip goes and the filter with it.
+        shelf.set_hidden(roms[1].key, false);
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!((cards.filter, cards.chips().1, cards.view.len()), (Filter::All, 5, 5));
+    }
+
+    #[test]
+    fn a_renamed_game_is_sorted_and_found_by_its_new_name() {
+        let roms = library(3, 0);
+        let games = games(&roms);
+        let mut shelf = Shelf::in_memory();
+        let mut cards = Cards::new();
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.view, [0, 1, 2]);
+        shelf.set_name(roms[0].key, "Zebra");
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.view, [1, 2, 0], "the new name sorts it last");
+        cards.set_search("zeb");
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.view, [0]);
+        // The file's name still finds it.
+        cards.set_search("game 00");
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.view, [0]);
+        // The name taken back: the old order.
+        cards.set_search("");
+        shelf.set_name(roms[0].key, "");
+        idle(&mut cards, &games, &mut shelf, 1);
+        assert_eq!(cards.view, [0, 1, 2]);
+    }
+
+    #[test]
     fn wheel_scrolls_a_row_per_notch() {
         // 24 games and Rescan: 5 rows, the furthest scroll shows rows 4 and 5.
         let roms = library(24, 0);
@@ -1525,6 +1712,12 @@ mod tests {
             for _ in 0..2 {
                 step(cards, games, shelf, |i| i.nav.right = true);
             }
+        });
+        // One game hidden: the crossed-out eye closes the chip row; then its own list.
+        shelf.set_hidden(roms[4].key, true);
+        shoot("hidden-chip", &roms, &mut shelf, &mut art, &mut font, 30, |_, _, _| {});
+        shoot("hidden-filter", &roms, &mut shelf, &mut art, &mut font, 30, |cards, games, shelf| {
+            step(cards, games, shelf, |i| i.nav.prev_tab = true);
         });
         let _ = fs::remove_dir_all(dir);
     }
