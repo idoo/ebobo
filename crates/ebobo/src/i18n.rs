@@ -321,6 +321,10 @@ pub(crate) enum S {
     PlayedWeeks,
     PlayedMonths,
     PlayedYears,
+    FilterHidden,
+    MovedToTrash,
+    FileDeleted,
+    CantDelete,
 }
 
 impl S {
@@ -531,6 +535,10 @@ impl S {
             PlayedWeeks => ("{n} нед. назад", "{n} wk ago"),
             PlayedMonths => ("{n} мес. назад", "{n} mo ago"),
             PlayedYears => ("{n} г. назад", "{n} y ago"),
+            FilterHidden => ("Скрытые", "Hidden"),
+            MovedToTrash => ("Файл в корзине", "Moved to the Trash"),
+            FileDeleted => ("Файл удалён", "File deleted"),
+            CantDelete => ("Не удалось удалить файл", "Could not delete the file"),
         }
     }
 }

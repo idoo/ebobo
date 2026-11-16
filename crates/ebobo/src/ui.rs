@@ -1,7 +1,7 @@
 //! Menus, lobby screen, pause menu, on-screen display and toasts, drawn on the 256x240 canvas.
 //! Gamepad-first (Steam Deck), keyboard works everywhere. Owner: ui slice (also owns i18n.rs).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use ebobo_art::shelf::Shelf;
@@ -49,6 +49,9 @@ pub enum UiAction {
     /// `UiCtx::config` was edited; the app saves it and applies scale/volume/fullscreen.
     ConfigChanged,
     Rescan,
+    /// Get rid of a game's file (`crate::trash::dispose`); asked for and confirmed in the
+    /// game's menu.
+    DeleteRom(PathBuf),
     /// Run `ebobo_net::diagnose` in the background and hand the result to `Ui::set_net_diag`.
     RunNetCheck,
     Quit,
@@ -121,6 +124,10 @@ pub enum Text {
     /// A netplay game started from the last moment / from the save.
     ResumedLast,
     ResumedSave,
+    /// A game's file went to the system Trash / was deleted for good / could not be removed.
+    MovedToTrash,
+    FileDeleted,
+    CantDelete,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -611,6 +618,9 @@ impl Ui {
             Text::NetLoaded => S::NetLoaded,
             Text::ResumedLast => S::ResumedLast,
             Text::ResumedSave => S::ResumedSave,
+            Text::MovedToTrash => S::MovedToTrash,
+            Text::FileDeleted => S::FileDeleted,
+            Text::CantDelete => S::CantDelete,
         })
     }
 
@@ -649,6 +659,7 @@ impl Ui {
                 search: n.search || tapped.search,
                 prev_tab: n.prev_tab || tapped.prev_tab,
                 next_tab: n.next_tab || tapped.next_tab,
+                options: n.options || tapped.options,
             };
             synth = InputFrame { nav, ..input.clone() };
             &synth
@@ -895,7 +906,7 @@ impl Ui {
                     self.press = None;
                     self.release_osk();
                 }
-                PointerEvent::Move(_) | PointerEvent::Wheel(_) => {}
+                PointerEvent::Move(_) | PointerEvent::Wheel(_) | PointerEvent::Secondary(_) => {}
                 PointerEvent::Up(pos) => {
                     self.release_osk();
                     let Some(p) = self.press.take() else { continue };
@@ -1120,6 +1131,8 @@ impl Ui {
                 self.open_field(Field::Search, text);
                 None
             }
+            // The game's menu: owned by the game menu slice.
+            cards::Action::Menu(_) => None,
         }
     }
 

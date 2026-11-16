@@ -11,6 +11,7 @@ mod i18n;
 mod input;
 mod library;
 mod osk;
+mod trash;
 mod ui;
 mod video;
 

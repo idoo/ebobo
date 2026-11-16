@@ -489,6 +489,18 @@ impl Library {
         }
         Ok(entry)
     }
+
+    /// Drops the entry of a file that is gone (deleted from the game's menu) without waiting
+    /// for a rescan.
+    pub fn forget(&self, path: &Path) {
+        lock(&self.shared.extra).retain(|e| e.path != path);
+        let mut entries = lock(&self.shared.entries);
+        let before = entries.len();
+        entries.retain(|e| e.path != path);
+        if entries.len() != before {
+            self.shared.bump();
+        }
+    }
 }
 
 /// Locks `m`, recovering the data if a scan thread panicked while holding it: the guarded

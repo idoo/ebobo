@@ -22,8 +22,9 @@ use sdl2::{GameControllerSubsystem, JoystickSubsystem};
 /// every 80 ms). Keyboard: arrows, Enter = confirm, Esc/Backspace = back. Gamepad: D-pad or
 /// left stick, South (A on Xbox/Deck, Cross on PlayStation) = confirm, East (B / Circle) = back.
 /// Tabs (no repeat): left / right shoulder or Shift+Tab / Tab = previous / next. North (Y /
-/// Triangle; not while Back is held, that is the screenshot combo) or Space = `fav`, West (X /
-/// Square) = `search`. Face buttons count by position on every pad, Nintendo ones too.
+/// Triangle; not while Back is held, that is the screenshot combo) = `fav`, West (X / Square)
+/// = `search`, Start (Options, +) or Space or the keyboard's Menu key = `options`. Face
+/// buttons count by position on every pad, Nintendo ones too.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Nav {
     pub up: bool,
@@ -36,6 +37,8 @@ pub struct Nav {
     pub next_tab: bool,
     pub fav: bool,
     pub search: bool,
+    /// The menu of what is selected (a game's own menu in the library).
+    pub options: bool,
 }
 
 /// A spot in the window, before mapping to the UI canvas (`Video::to_canvas`).
@@ -48,7 +51,8 @@ pub enum WindowPos {
 }
 
 /// Mouse (left button) or first finger, in 256x240 canvas pixels; `None` = outside the
-/// picture (letterbox bars).
+/// picture (letterbox bars). `Secondary` is the right mouse button going down (Ctrl+click on
+/// a Mac).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerEvent {
     Down(Option<(i32, i32)>),
@@ -57,6 +61,7 @@ pub enum PointerEvent {
     Up(Option<(i32, i32)>),
     /// Mouse wheel, positive = away from the user (scroll up).
     Wheel(i32),
+    Secondary(Option<(i32, i32)>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -412,17 +417,19 @@ fn nav_button(nav: &mut Nav, button: Button, back_held: bool) {
         Button::X => nav.search = true,
         Button::LeftShoulder => nav.prev_tab = true,
         Button::RightShoulder => nav.next_tab = true,
+        // Back+Start is the menu hold.
+        Button::Start if !back_held => nav.options = true,
         _ => {}
     }
 }
 
-/// A key going down (not an auto-repeat) → the tab and favourite presses: Tab = next tab,
-/// Shift+Tab = previous tab, Space = `fav`.
+/// A key going down (not an auto-repeat) → the tab and options presses: Tab = next tab,
+/// Shift+Tab = previous tab, Space or the Menu key = `options`.
 fn nav_key(nav: &mut Nav, sc: Scancode, shift: bool) {
     match sc {
         Scancode::Tab if shift => nav.prev_tab = true,
         Scancode::Tab => nav.next_tab = true,
-        Scancode::Space => nav.fav = true,
+        Scancode::Space | Scancode::Application => nav.options = true,
         _ => {}
     }
 }
@@ -847,14 +854,17 @@ impl Input {
             ("SDL_JOYSTICK_HIDAPI_PS4_RUMBLE", "0"),
             ("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1"),
             ("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0"),
+            ("SDL_MAC_CTRL_CLICK_EMULATE_RIGHT_CLICK", "1"),
         ] {
             sdl2::hint::set(k, v);
         }
-        // On the Deck SDL_StartTextInput would open Steam's keyboard, whose keys never reach
-        // us; the built-in keyboard (osk.rs) takes its place. Physical keyboards still type.
-        if crate::config::is_steam_deck() {
-            sdl2::hint::set("SDL_ENABLE_SCREEN_KEYBOARD", "0");
-        }
+        // With `SteamDeck` in the environment (Steam sets it on a Deck) SDL opens Steam's
+        // keyboard on every SDL_StartTextInput, so it popped up over the library, which keeps
+        // text input on for typing a search. Its keys never reach us in Game Mode anyway; the
+        // built-in keyboard (osk.rs) takes its place and physical keyboards still type. The
+        // bundled SDL 2.26 has no SDL_HINT_ENABLE_SCREEN_KEYBOARD; the X11 driver reads this
+        // hint once, when video starts, and nothing else in SDL reads it.
+        sdl2::hint::set_with_priority("SteamDeck", "0", &sdl2::hint::Hint::Override);
         let video = sdl.video()?;
         let joy = sdl.joystick()?;
         let gc = sdl.game_controller()?;
@@ -1098,7 +1108,7 @@ impl Input {
                             }
                         }
                         Scancode::Return | Scancode::KpEnter if !repeat => f.nav.confirm = true,
-                        Scancode::Tab | Scancode::Space if !repeat => nav_key(&mut f.nav, sc, shift),
+                        Scancode::Tab | Scancode::Space | Scancode::Application if !repeat => nav_key(&mut f.nav, sc, shift),
                         _ => {}
                     }
                 }
@@ -1113,6 +1123,10 @@ impl Input {
                 Event::MouseButtonUp { mouse_btn: MouseButton::Left, x, y, .. } => {
                     f.mouse_moved = true;
                     f.pointer.push(PointerEvent::Up(to_canvas(WindowPos::Point(x as f32, y as f32))));
+                }
+                Event::MouseButtonDown { mouse_btn: MouseButton::Right, x, y, .. } => {
+                    f.mouse_moved = true;
+                    f.pointer.push(PointerEvent::Secondary(to_canvas(WindowPos::Point(x as f32, y as f32))));
                 }
                 Event::MouseMotion { mousestate, x, y, .. } => {
                     f.mouse_moved = true;
@@ -1590,7 +1604,9 @@ mod tests {
         assert_eq!(button(Button::RightShoulder, true), Nav { next_tab: true, ..Default::default() });
         // Back+North is the screenshot, not a favourite.
         assert_eq!(button(Button::Y, true), Nav::default());
-        assert_eq!(button(Button::Start, false), Nav::default());
+        assert_eq!(button(Button::Start, false), Nav { options: true, ..Default::default() });
+        // Back+Start is the menu hold, not the options press.
+        assert_eq!(button(Button::Start, true), Nav::default());
         assert_eq!(button(Button::DPadUp, false), Nav::default());
 
         let key = |sc: Scancode, shift: bool| {
@@ -1600,8 +1616,9 @@ mod tests {
         };
         assert_eq!(key(Scancode::Tab, false), Nav { next_tab: true, ..Default::default() });
         assert_eq!(key(Scancode::Tab, true), Nav { prev_tab: true, ..Default::default() });
-        assert_eq!(key(Scancode::Space, false), Nav { fav: true, ..Default::default() });
-        assert_eq!(key(Scancode::Space, true), Nav { fav: true, ..Default::default() });
+        assert_eq!(key(Scancode::Space, false), Nav { options: true, ..Default::default() });
+        assert_eq!(key(Scancode::Space, true), Nav { options: true, ..Default::default() });
+        assert_eq!(key(Scancode::Application, false), Nav { options: true, ..Default::default() });
         assert_eq!(key(Scancode::F, false), Nav::default());
     }
 

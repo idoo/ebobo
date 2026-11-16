@@ -33,6 +33,7 @@ use crate::enhance::{Enhancer, Mode};
 use crate::i18n::Lang;
 use crate::input::{Input, InputFrame, PadEvent, PadInfo, PointerEvent};
 use crate::library::{self, Library, RomEntry};
+use crate::trash::{self, Disposal};
 use crate::ui::{GameView, Text, Ui, UiAction, UiCtx};
 use crate::video::{Frame, GameFrame, PictureRef, Pictures, Video};
 
@@ -772,6 +773,23 @@ impl App {
             },
             UiAction::ConfigChanged => self.apply_config(),
             UiAction::Rescan => self.library.rescan(),
+            UiAction::DeleteRom(path) => match trash::dispose(&path) {
+                Ok(how) => {
+                    // Off the list at once; the rescan then finds another copy of the game, if
+                    // there is one.
+                    self.library.forget(&path);
+                    self.library.rescan();
+                    self.ui.toast(self.ui.text(match how {
+                        Disposal::Trash => Text::MovedToTrash,
+                        Disposal::Permanent => Text::FileDeleted,
+                    }));
+                }
+                Err(err) => {
+                    eprintln!("ebobo: cannot delete {}: {err}", path.display());
+                    let text = format!("{}: {err}", self.ui.text(Text::CantDelete));
+                    self.ui.error(&text);
+                }
+            },
             UiAction::RunNetCheck => self.start_net_check(),
             UiAction::Quit => self.quit = true,
         }

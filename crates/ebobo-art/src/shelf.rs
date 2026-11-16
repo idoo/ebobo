@@ -1,5 +1,6 @@
-//! The library's shelf: which games are favourites, when each was last played, and the list
-//! a filter and a search text leave, in the order the cards are shown. Owner: shelf slice.
+//! The library's shelf: which games are favourites, hidden or renamed, when each was last
+//! played, and the list a filter and a search text leave, in the order the cards are shown.
+//! Owner: shelf slice.
 //!
 //! Pure logic plus one small text file. Nothing here knows about pictures or the interface.
 
@@ -13,6 +14,9 @@ use crate::{Key, System, slot, system_name};
 /// The first line of the shelf file.
 const HEADER: &str = "ebobo shelf 1";
 
+/// The longest name `Shelf::set_name` keeps, in characters.
+pub const NAME_MAX: usize = 40;
+
 /// Which cards the library shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Filter {
@@ -21,6 +25,8 @@ pub enum Filter {
     /// Games played at least once, the latest first.
     Recent,
     Favourites,
+    /// Games the user hid: they show in no other list.
+    Hidden,
 }
 
 /// One game of the library as the shelf sees it.
@@ -34,16 +40,20 @@ pub struct Item<'a> {
 }
 
 /// What the shelf knows about one game. The default (nothing known) is never stored.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Entry {
     favourite: bool,
     /// Unix seconds of the last start; meaningful only when `plays` is not zero.
     last_played: u64,
     /// How many times the game was started.
     plays: u32,
+    /// Left out of every list but `Filter::Hidden`.
+    hidden: bool,
+    /// The user's own name for the game; empty = none.
+    name: String,
 }
 
-/// Favourites and play history, kept in a text file.
+/// Favourites, hidden marks, own names and play history, kept in a text file.
 #[derive(Clone, Debug, Default)]
 pub struct Shelf {
     /// Never iterated for anything whose order shows: the file is written sorted.
@@ -82,22 +92,18 @@ impl Shelf {
 
     /// Flips the favourite mark, saves, and returns the new state.
     pub fn toggle_favourite(&mut self, key: Key) -> bool {
-        let entry = self.entries.entry(key).or_default();
-        entry.favourite = !entry.favourite;
-        let now = entry.favourite;
-        if *entry == Entry::default() {
-            self.entries.remove(&key);
-        }
-        self.save();
-        now
+        self.change(key, |entry| {
+            entry.favourite = !entry.favourite;
+            entry.favourite
+        })
     }
 
     /// Notes that the game was started at `now` (Unix seconds) and saves.
     pub fn played(&mut self, key: Key, now: u64) {
-        let entry = self.entries.entry(key).or_default();
-        entry.last_played = now;
-        entry.plays = entry.plays.saturating_add(1);
-        self.save();
+        self.change(key, |entry| {
+            entry.last_played = now;
+            entry.plays = entry.plays.saturating_add(1);
+        });
     }
 
     /// When the game was last started (Unix seconds).
@@ -105,15 +111,47 @@ impl Shelf {
         self.entries.get(&key).filter(|e| e.plays > 0).map(|e| e.last_played)
     }
 
-    /// Any game was ever played (the "recent" filter has something to show).
+    /// A game that is not hidden was ever played (the "recent" filter has something to show).
     pub fn has_history(&self) -> bool {
-        self.entries.values().any(|e| e.plays > 0)
+        self.entries.values().any(|e| e.plays > 0 && !e.hidden)
+    }
+
+    pub fn is_hidden(&self, key: Key) -> bool {
+        self.entries.get(&key).is_some_and(|e| e.hidden)
+    }
+
+    /// Takes the game out of every list but `Filter::Hidden` (`false` puts it back) and saves.
+    pub fn set_hidden(&mut self, key: Key, hidden: bool) {
+        self.change(key, |entry| entry.hidden = hidden);
+    }
+
+    /// The user's own name for the game.
+    pub fn name(&self, key: Key) -> Option<&str> {
+        self.entries.get(&key).map(|e| e.name.as_str()).filter(|name| !name.is_empty())
+    }
+
+    /// Gives the game the user's own name and saves: control characters are dropped, the ends
+    /// trimmed, `NAME_MAX` characters kept. An empty name takes the user's name away.
+    pub fn set_name(&mut self, key: Key, name: &str) {
+        self.change(key, |entry| entry.name = clean_name(name));
+    }
+
+    /// Changes what is known about `key`, forgets an entry that says nothing, and saves.
+    fn change<T>(&mut self, key: Key, edit: impl FnOnce(&mut Entry) -> T) -> T {
+        let entry = self.entries.entry(key).or_default();
+        let out = edit(entry);
+        if *entry == Entry::default() {
+            self.entries.remove(&key);
+        }
+        self.save();
+        out
     }
 
     /// Fills `out` with the indices into `items` of the games that pass `filter` and `search`,
     /// in display order: by name without regard to case (ties by index), except `Recent`,
-    /// which is latest first. `search` is matched without regard to case as a substring of
-    /// the name or the file name; every word of it must match somewhere; empty = everything.
+    /// which is latest first. A hidden game passes `Filter::Hidden` alone. `search` is matched
+    /// without regard to case as a substring of the name or the file name; every word of it
+    /// must match somewhere; empty = everything.
     pub fn view(&self, items: &[Item], filter: Filter, search: &str, out: &mut Vec<usize>) {
         out.clear();
         let search = search.to_lowercase();
@@ -123,7 +161,10 @@ impl Shelf {
         let mut by_name: Vec<(String, usize)> = Vec::new();
         let mut by_time: Vec<(u64, usize)> = Vec::new();
         for (index, item) in items.iter().enumerate() {
+            let hidden = self.is_hidden(item.key);
             let passes = match filter {
+                Filter::Hidden => hidden,
+                _ if hidden => false,
                 Filter::All => true,
                 Filter::System(system) => item.key.system == system,
                 Filter::Recent => self.last_played(item.key).is_some(),
@@ -156,10 +197,12 @@ impl Shelf {
 
     /// Writes the shelf to its file, if it has one: a temporary file in the same folder, then
     /// a rename, so a crash leaves the old file or the new one. A failure is reported once on
-    /// standard error and otherwise ignored (the shelf stays right in memory).
+    /// standard error and otherwise ignored (the shelf stays right in memory). A row is
+    /// system, CRC-32, favourite, last start, starts; a hidden or renamed game's row has two
+    /// more fields, hidden and the name (builds before 0.4.1 skip such a row).
     fn save(&self) {
         let Some(path) = &self.path else { return };
-        let mut rows: Vec<(Key, Entry)> = self.entries.iter().filter(|(_, e)| **e != Entry::default()).map(|(k, e)| (*k, *e)).collect();
+        let mut rows: Vec<(&Key, &Entry)> = self.entries.iter().filter(|(_, e)| **e != Entry::default()).collect();
         rows.sort_unstable_by_key(|(key, _)| (slot(key.system), key.crc32));
         let mut text = String::with_capacity(HEADER.len() + 1 + rows.len() * 32);
         text.push_str(HEADER);
@@ -167,7 +210,11 @@ impl Shelf {
         for (key, entry) in rows {
             let system = system_name(key.system);
             let favourite = u8::from(entry.favourite);
-            text.push_str(&format!("{system}\t{:08x}\t{favourite}\t{}\t{}\n", key.crc32, entry.last_played, entry.plays));
+            text.push_str(&format!("{system}\t{:08x}\t{favourite}\t{}\t{}", key.crc32, entry.last_played, entry.plays));
+            if entry.hidden || !entry.name.is_empty() {
+                text.push_str(&format!("\t{}\t{}", u8::from(entry.hidden), entry.name));
+            }
+            text.push('\n');
         }
         if let Err(error) = write_atomically(path, &text) {
             eprintln!("ebobo: cannot save the shelf to {}: {error}", path.display());
@@ -190,6 +237,13 @@ fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
     result
 }
 
+/// A name as the shelf keeps it: no control characters, trimmed, `NAME_MAX` characters at most.
+fn clean_name(name: &str) -> String {
+    let kept: String = name.chars().filter(|c| !c.is_control()).collect();
+    let cut: String = kept.trim().chars().take(NAME_MAX).collect();
+    cut.trim_end().to_string()
+}
+
 /// One line of the shelf file after the header, or `None` if it is not one.
 fn parse_line(line: &str) -> Option<(Key, Entry)> {
     let mut fields = line.split('\t');
@@ -203,17 +257,22 @@ fn parse_line(line: &str) -> Option<(Key, Entry)> {
         return None;
     }
     let crc32 = u32::from_str_radix(crc, 16).ok()?;
-    let favourite = match fields.next()? {
-        "0" => false,
-        "1" => true,
-        _ => return None,
+    let flag = |field: &str| match field {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
     };
+    let favourite = flag(fields.next()?)?;
     let last_played = fields.next()?.parse().ok()?;
     let plays = fields.next()?.parse().ok()?;
+    let (hidden, name) = match fields.next() {
+        None => (false, String::new()),
+        Some(hidden) => (flag(hidden)?, clean_name(fields.next()?)),
+    };
     if fields.next().is_some() {
         return None;
     }
-    Some((Key { system, crc32 }, Entry { favourite, last_played, plays }))
+    Some((Key { system, crc32 }, Entry { favourite, last_played, plays, hidden, name }))
 }
 
 /// The systems that have games in `items`, in a fixed order (NES first).
@@ -464,5 +523,57 @@ mod tests {
         assert_eq!(at(730 * DAY - 1), Ago::Years(1));
         assert_eq!(at(730 * DAY), Ago::Years(2));
         assert_eq!(ago(u64::MAX, 0), Ago::Years(u32::MAX));
+    }
+
+    #[test]
+    fn a_hidden_game_shows_only_under_hidden() {
+        let mut shelf = Shelf::in_memory();
+        shelf.toggle_favourite(ITEMS[2].key);
+        shelf.played(ITEMS[2].key, 10);
+        shelf.set_hidden(ITEMS[2].key, true);
+        assert!(shelf.is_hidden(ITEMS[2].key));
+        assert_eq!(shown(&shelf, &ITEMS, Filter::All, ""), [3, 5, 1, 0, 4]);
+        assert_eq!(shown(&shelf, &ITEMS, Filter::All, "contra"), [3, 5]);
+        assert_eq!(shown(&shelf, &ITEMS, Filter::System(System::Nes), ""), [5, 0, 4]);
+        assert_eq!(shown(&shelf, &ITEMS, Filter::Favourites, ""), []);
+        assert_eq!(shown(&shelf, &ITEMS, Filter::Recent, ""), []);
+        assert!(!shelf.has_history(), "its history shows nowhere");
+        assert_eq!(shown(&shelf, &ITEMS, Filter::Hidden, ""), [2]);
+        assert_eq!(shown(&shelf, &ITEMS, Filter::Hidden, "zelda"), []);
+        // Back in the lists with its star and its history.
+        shelf.set_hidden(ITEMS[2].key, false);
+        assert_eq!(shown(&shelf, &ITEMS, Filter::Hidden, ""), []);
+        assert_eq!(shown(&shelf, &ITEMS, Filter::Favourites, ""), [2]);
+        assert_eq!(shown(&shelf, &ITEMS, Filter::Recent, ""), [2]);
+    }
+
+    #[test]
+    fn names_and_hidden_marks_survive_a_round_trip() {
+        let dir = folder("names");
+        let path = dir.join("shelf.txt");
+        let mut shelf = Shelf::load(path.clone());
+        shelf.toggle_favourite(nes(1));
+        shelf.set_name(nes(2), "  Чип и Дейл\t2\n ");
+        shelf.set_hidden(md(3), true);
+        shelf.set_name(md(3), &"x".repeat(NAME_MAX + 5));
+        assert_eq!(shelf.name(nes(1)), None);
+        assert_eq!(shelf.name(nes(2)), Some("Чип и Дейл2"));
+        let long = "x".repeat(NAME_MAX);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("ebobo shelf 1\nnes\t00000001\t1\t0\t0\nnes\t00000002\t0\t0\t0\t0\tЧип и Дейл2\nmd\t00000003\t0\t0\t0\t1\t{long}\n")
+        );
+
+        let mut again = Shelf::load(path.clone());
+        assert!(again.is_favourite(nes(1)) && !again.is_hidden(nes(2)) && again.is_hidden(md(3)));
+        assert_eq!((again.name(nes(2)), again.name(md(3))), (Some("Чип и Дейл2"), Some(long.as_str())));
+        // An empty name gives the game its own name back; nothing left to say drops the row.
+        again.set_name(nes(2), "   ");
+        again.set_name(md(3), "");
+        assert_eq!((again.name(nes(2)), again.name(md(3))), (None, None));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "ebobo shelf 1\nnes\t00000001\t1\t0\t0\nmd\t00000003\t0\t0\t0\t1\t\n");
+        again.set_hidden(md(3), false);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "ebobo shelf 1\nnes\t00000001\t1\t0\t0\n");
+        let _ = fs::remove_dir_all(dir);
     }
 }

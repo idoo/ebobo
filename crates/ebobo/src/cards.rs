@@ -80,6 +80,18 @@ pub enum Action {
     Back,
     /// Open the text field with `Cards::search()`; give the result to `Cards::set_search`.
     EditSearch,
+    /// Open the game's own menu (favourite, rename, hide, delete).
+    Menu(usize),
+}
+
+/// The name a game goes by: the user's own (`Shelf::set_name`), else the proper name the art
+/// database has for it, else `file_name` (the name its file gave it).
+pub fn shown_name(key: Key, file_name: &str, shelf: &Shelf, art: &Art) -> String {
+    match (shelf.name(key), art.name(key)) {
+        (Some(own), _) => own.to_string(),
+        (None, Some(proper)) => ebobo_art::names::display_name(proper),
+        (None, None) => file_name.to_string(),
+    }
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -305,10 +317,15 @@ impl Cards {
         }
         self.sync(games, shelf);
 
-        if nav.fav && !typed_space {
+        if nav.fav {
             if let Some(&i) = self.view.get(self.sel) {
                 shelf.toggle_favourite(games[i].key);
                 self.sync(games, shelf);
+            }
+        }
+        if nav.options && !typed_space {
+            if let Some(&i) = self.view.get(self.sel) {
+                action = Some(Action::Menu(i));
             }
         }
 
@@ -379,7 +396,7 @@ impl Cards {
                     let to = self.scroll_to.saturating_sub(notches.saturating_mul(ROW_STEP)).clamp(0, self.max_scroll());
                     self.scroll_target(to);
                 }
-                PointerEvent::Down(None) | PointerEvent::Move(None) => {}
+                PointerEvent::Down(None) | PointerEvent::Move(None) | PointerEvent::Secondary(_) => {}
             }
         }
         self.sel_key = self.view.get(self.sel).map(|&i| games[i].key);
@@ -442,6 +459,7 @@ impl Cards {
                 Filter::System(System::MegaDrive) => lang.tr(S::SystemMd),
                 Filter::Recent => lang.tr(S::FilterRecent),
                 Filter::Favourites => "",
+                Filter::Hidden => lang.tr(S::FilterHidden),
             };
             let w = if filter == Filter::Favourites { 7 + 8 } else { f.width(label, 1) + 8 };
             let active = filter == self.filter;
@@ -717,10 +735,7 @@ impl Cards {
         self.info_warn = false;
         if let Some(i) = pick {
             let game = &games[i];
-            match proper {
-                Some(name) => self.name_line.push_str(&ebobo_art::names::display_name(name)),
-                None => self.name_line.push_str(game.name),
-            }
+            self.name_line.push_str(&shown_name(game.key, game.name, shelf, art));
             if let Some(note) = game.note {
                 self.info_line.push_str(note);
                 self.info_warn = true;
@@ -1091,13 +1106,12 @@ mod tests {
             i.nav.back = true;
         });
         assert_eq!(cards.search(), "1");
-        // A space inside a search is text, not the favourite key.
-        step(&mut cards, &games, &mut shelf, |i| {
+        // A space inside a search is text, not the options key.
+        let spaced = step(&mut cards, &games, &mut shelf, |i| {
             i.text = " ".into();
-            i.nav.fav = true;
+            i.nav.options = true;
         });
-        assert_eq!(cards.search(), "1 ");
-        assert!(roms.iter().all(|r| !shelf.is_favourite(r.key)));
+        assert_eq!((spaced, cards.search()), (None, "1 "));
         step(&mut cards, &games, &mut shelf, |i| i.text = "x".repeat(40));
         assert_eq!(cards.search().chars().count(), SEARCH_MAX);
         assert_eq!(cards.entries(), 0);
