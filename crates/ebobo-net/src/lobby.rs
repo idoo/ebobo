@@ -624,6 +624,10 @@ struct Worker {
     want_seats: u8,
     /// Who may save in the game: the host's choice, or what it announced.
     saves: SavePolicy,
+    /// This room came back from a running game (`regroup`): Start continues that game.
+    regrouped: bool,
+    /// The devices that played the interrupted game and are still here; their seats stay put.
+    veterans: Vec<PeerId>,
 }
 
 /// One-way latency, in frames, that the input delay hides outright: 3 frames (50 ms at 60 fps)
@@ -829,6 +833,8 @@ impl Worker {
             order: if is_host { vec![PeerId(0)] } else { Vec::new() },
             want_seats: 1,
             saves: SavePolicy::Everyone,
+            regrouped: false,
+            veterans: Vec::new(),
         }
     }
 
@@ -960,12 +966,7 @@ impl Worker {
             }
             MeshEvent::RouteUp { id, kind } => {
                 self.peers.entry(id).or_insert_with(Peer::new).route = Some(kind);
-                if self.is_host {
-                    self.admit(id);
-                    if !self.peers.get(&id).is_some_and(|p| p.full) {
-                        self.send_game(id);
-                    }
-                }
+                self.welcome(id);
             }
             MeshEvent::RouteChanged { id, kind } => {
                 if let Some(p) = self.peers.get_mut(&id) {
@@ -980,6 +981,17 @@ impl Worker {
             }
             MeshEvent::Packet { from, data } => self.on_packet(from, &data),
             MeshEvent::Failed(e) => self.fail(e),
+        }
+    }
+
+    /// Host: a guest whose route is up gets a seat and, unless the room is full, the game.
+    fn welcome(&mut self, id: PeerId) {
+        if !self.is_host {
+            return;
+        }
+        self.admit(id);
+        if !self.peers.get(&id).is_some_and(|p| p.full) {
+            self.send_game(id);
         }
     }
 
@@ -1165,6 +1177,9 @@ impl Worker {
                 }
                 self.saves = SavePolicy::parse(v["saves"].as_str());
             }
+            // The host calls the players of a running game back to the room. The game's link
+            // acts on it; a copy that reaches this lobby means the lobby is already back.
+            "regroup" => {}
             "start" => {
                 if self.stage != Stage::Lobby {
                     return;
@@ -1661,19 +1676,74 @@ impl Worker {
         self.stage = Stage::Starting;
     }
 
-    /// Back from the game: the mesh is this room's again.
+    /// Back from the game: the mesh is this room's again and everyone still here keeps the
+    /// seat it played on. `gone` are the devices that left during the game. The host continues
+    /// from `resume` (the game's state) and calls the other players back with `regroup`.
     fn regroup(&mut self, link: Link, gone: Vec<PeerId>, resume: Option<Resume>) {
         if self.mesh.is_some() {
             return;
         }
-        self.mesh = Some(link.into_mesh());
-        for id in gone {
-            self.peer_left(id);
+        let mut veterans = vec![PeerId(0)];
+        for id in &self.order {
+            if *id != EMPTY_SEAT && !veterans.contains(id) {
+                veterans.push(*id);
+            }
+        }
+        veterans.retain(|id| !gone.contains(id));
+        self.veterans = veterans;
+        let mesh = link.into_mesh();
+        let routes = mesh.routed();
+        self.mesh = Some(mesh);
+        self.regrouped = true;
+        self.stage = Stage::Lobby;
+        self.error = None;
+        self.pending_start = None;
+        self.offer = None;
+        self.state_rx = None;
+        for id in &gone {
+            // Forgotten completely: a new process may come back under the same id, and its
+            // CTRL sequence numbers start again from zero.
+            self.peers.remove(id);
+            if let Some(list) = &mut self.host_list {
+                list.retain(|e| e.id != *id);
+            }
+            if self.is_host {
+                for seat in self.order.iter_mut().filter(|s| *s == id) {
+                    *seat = EMPTY_SEAT;
+                }
+            }
+        }
+        for (id, kind) in routes {
+            self.peers.entry(id).or_insert_with(Peer::new).route = Some(kind);
+            // A device that is not a veteran knocked during the game: it joins like any guest.
+            if self.is_host && !self.veterans.contains(&id) {
+                self.welcome(id);
+            }
         }
         if self.is_host {
             self.resume = resume;
+            let guests: Vec<PeerId> =
+                self.veterans.iter().copied().filter(|id| self.peers.contains_key(id)).collect();
+            for id in guests {
+                if let Some(p) = self.peers.get_mut(&id) {
+                    // Ready again only after its fresh `ready`: its lobby is back then. The
+                    // room's list goes out again too, it may have changed during the game.
+                    p.ready = false;
+                    p.sent_players = None;
+                }
+                // Not acked while that guest is in the game, so the CTRL retransmit repeats
+                // it until its lobby is back.
+                self.send_ctrl(id, json!({"t": "regroup"}));
+            }
+        } else {
+            // The links are announced again (they now include any newcomer), and what the
+            // host said about the last start no longer holds.
+            self.sent_links = None;
+            self.announced = None;
+            if gone.contains(&PeerId(0)) {
+                self.fail(NetError::HostLeft);
+            }
         }
-        self.stage = Stage::Lobby;
     }
 
     fn leave(&mut self) {
@@ -1753,7 +1823,7 @@ impl Worker {
             resume: self.resume_info(),
             order: self.order.clone(),
             saves: self.saves,
-            regrouped: false,
+            regrouped: self.regrouped,
         }
     }
 
