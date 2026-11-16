@@ -23,6 +23,7 @@ use ebobo_art::{Art, Key, Kind};
 use ebobo_console::{Console, Snapshot, System};
 use ebobo_net::{
     GameStart, Lobby, LobbyConfig, LobbyMode, LobbyStatus, NetDiag, NetError, NetEvent, NetSession, NetStats, PeerId,
+    SavePolicy,
     Resume, ResumeInfo, ResumeKind, Stage,
     INPUT_LOAD, INPUT_RESET, INPUT_SAVE,
 };
@@ -1090,7 +1091,7 @@ impl App {
                 }
             },
         };
-        let session = match NetSession::new(start.link, &start.slots, start.input_delay, start.delay_auto, fps, shared_save) {
+        let session = match NetSession::new(start.link, &start.slots, start.input_delay, start.delay_auto, fps, shared_save, SavePolicy::Everyone) {
             Ok(session) => session,
             Err(err) => {
                 self.ui.show_main();
@@ -1314,7 +1315,7 @@ impl App {
                 if std::mem::take(&mut n.load_pending) {
                     local |= INPUT_LOAD;
                 }
-                match n.session.advance(&mut n.console, local) {
+                match n.session.advance(&mut n.console, &[local]) {
                     Ok(outcome) => {
                         if outcome.advanced {
                             n.advanced += 1;

@@ -11,7 +11,7 @@ use ggrs::{DesyncDetection, GgrsError, GgrsEvent, GgrsRequest, InputStatus, P2PS
 use crate::lobby::{auto_input_delay, RttEstimator};
 use crate::mesh::Link;
 use crate::transport::{PeerId, RouteKind};
-use crate::{NetError, INPUT_LOAD, INPUT_PAD, INPUT_RESET, INPUT_SAVE, INPUT_TURBO_A, INPUT_TURBO_B};
+use crate::{NetError, SavePolicy, INPUT_LOAD, INPUT_PAD, INPUT_RESET, INPUT_SAVE, INPUT_TURBO_A, INPUT_TURBO_B};
 
 /// ggrs configuration: `Input = u32` (pad bits 0-15 `INPUT_PAD`, `INPUT_RESET` bit 16,
 /// `INPUT_TURBO_A` bit 17, `INPUT_TURBO_B` bit 18, `INPUT_SAVE` bit 19, `INPUT_LOAD` bit 20),
@@ -64,7 +64,7 @@ pub enum NetEvent {
     /// No packets from `peer` for a while; disconnect after `disconnect_in_ms`.
     Interrupted { peer: PeerId, disconnect_in_ms: u64 },
     Resumed { peer: PeerId },
-    /// Peer timed out or said BYE; its controller reads as released from now on.
+    /// Peer timed out or said BYE; its controllers read as released from now on.
     Disconnected { peer: PeerId },
     /// States diverged at `frame` (should never happen; shown as a warning).
     Desync { frame: i32 },
@@ -233,11 +233,16 @@ impl DelayControl {
 
 pub struct NetSession {
     ggrs: P2PSession<EboboConfig>,
+    /// This device's peer id.
+    me: PeerId,
+    /// Controller indexes (GGRS handles) this device plays, ascending.
+    locals: Vec<usize>,
+    /// Whose save and load bits count.
+    save_policy: SavePolicy,
     link: Rc<RefCell<Option<Link>>>,
     sent: Rc<RefCell<[u64; 4]>>,
     started: Instant,
     slots: Vec<PeerId>,
-    local: usize,
     pending: Vec<NetEvent>,
     last_rollback: u32,
     /// GGRS frame the next `AdvanceFrame` simulates (turbo phase).
@@ -294,12 +299,13 @@ fn io(e: GgrsError) -> NetError {
 }
 
 impl NetSession {
-    /// Builds the GGRS P2P session: `slots.len()` players, local handle = index of
-    /// `link.me()` in `slots`, others remote. `fps` = 60 NTSC / 50 PAL. `delay_auto`: the local
+    /// Builds the GGRS P2P session: `slots.len()` players, `slots[i]` the peer on controller
+    /// `i + 1`; a peer listed several times brings that many local players. Every handle of
+    /// `link.me()` is local, the others remote. `fps` = 60 NTSC / 50 PAL. `delay_auto`: the local
     /// delay adapts to the worst link during the game, starting at `input_delay`.
     /// `shared_save`: the state every peer loaded before the first frame (a game continued
     /// from a save), `None` for a game from power-on; it is what `INPUT_LOAD` loads until
-    /// somebody saves.
+    /// somebody saves. `saves`: whose save and load bits count.
     pub fn new(
         link: Link,
         slots: &[PeerId],
@@ -307,8 +313,10 @@ impl NetSession {
         delay_auto: bool,
         fps: usize,
         shared_save: Option<Snapshot>,
+        saves: SavePolicy,
     ) -> Result<NetSession, NetError> {
-        let mut session = NetSession::with_tuning(link, slots, input_delay, delay_auto, fps, max_prediction(slots.len()), DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)?;
+        let mut session =
+            NetSession::with_tuning(link, slots, input_delay, delay_auto, fps, saves, max_prediction(slots.len()), DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)?;
         session.saves.extend(shared_save.map(|state| SaveRecord { frame: START_FRAME, slot: 0, state }));
         Ok(session)
     }
@@ -320,15 +328,16 @@ impl NetSession {
         input_delay: usize,
         delay_auto: bool,
         fps: usize,
+        saves: SavePolicy,
         max_prediction: usize,
         disconnect_timeout: Duration,
         notify_delay: Duration,
     ) -> Result<NetSession, NetError> {
         let me = link.me();
-        let local = slots
-            .iter()
-            .position(|&p| p == me)
-            .ok_or_else(|| NetError::Io(format!("local peer {me:?} has no slot")))?;
+        let locals: Vec<usize> = (0..slots.len()).filter(|&h| slots[h] == me).collect();
+        if locals.is_empty() {
+            return Err(NetError::Io(format!("local peer {me:?} has no slot")));
+        }
         if slots.len() > crate::MAX_PLAYERS {
             return Err(NetError::Io(format!("{} players, at most {}", slots.len(), crate::MAX_PLAYERS)));
         }
@@ -343,7 +352,8 @@ impl NetSession {
             .with_disconnect_timeout(disconnect_timeout)
             .with_disconnect_notify_delay(notify_delay);
         for (handle, &peer) in slots.iter().enumerate() {
-            let kind = if handle == local { PlayerType::Local } else { PlayerType::Remote(peer) };
+            // GGRS groups the remote handles with one address into one endpoint.
+            let kind = if peer == me { PlayerType::Local } else { PlayerType::Remote(peer) };
             builder = builder.add_player(kind, handle).map_err(io)?;
         }
         let link = Rc::new(RefCell::new(Some(link)));
@@ -356,7 +366,9 @@ impl NetSession {
             sent,
             started: Instant::now(),
             slots: slots.to_vec(),
-            local,
+            me,
+            locals,
+            save_policy: saves,
             pending: Vec::new(),
             last_rollback: 0,
             sim_frame: 0,
@@ -383,9 +395,22 @@ impl NetSession {
         })
     }
 
-    /// Controller index this machine plays.
-    pub fn local_slot(&self) -> usize {
-        self.local
+    /// Controller indexes this device plays, ascending.
+    pub fn local_slots(&self) -> &[usize] {
+        &self.locals
+    }
+
+    /// The first handle of every remote peer, in controller order. A peer's handles share one
+    /// GGRS endpoint, so its link is measured once, through this handle.
+    fn remote_peers(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.slots.len()).filter(|&h| self.slots[h] != self.me && !self.slots[..h].contains(&self.slots[h]))
+    }
+
+    /// Marks every handle of `peer` as gone.
+    fn mark_gone(&mut self, peer: PeerId) {
+        for (handle, gone) in self.gone.iter_mut().enumerate() {
+            *gone |= self.slots[handle] == peer;
+        }
     }
 
     /// An `INPUT_LOAD` sent now would find a save: the game started from one, or somebody saved.
@@ -400,7 +425,8 @@ impl NetSession {
     }
 
     /// The newest confirmed periodic checkpoint not yet taken (identical on every peer at the
-    /// same frame), for the "last moment" file. Older untaken ones are gone.
+    /// same frame), for the "last moment" file. Older untaken ones are gone. Always `None`
+    /// with `SavePolicy::Off`: no checkpoint is recorded then.
     pub fn take_checkpoint(&mut self) -> Option<Snapshot> {
         self.checkpoint_ready.take()
     }
@@ -456,27 +482,25 @@ impl NetSession {
         self.ggrs.poll_remote_clients();
         let departed = self.link.borrow_mut().as_mut().map(Link::take_departed).unwrap_or_default();
         for peer in departed {
-            if let Some(handle) = self.slots.iter().position(|&p| p == peer) {
-                if handle != self.local {
-                    let _ = self.ggrs.disconnect_player(handle);
-                    self.gone[handle] = true;
-                    self.pending.push(NetEvent::Disconnected { peer });
-                }
+            // GGRS drops every handle of the peer's endpoint with its first one. A peer that
+            // is gone already was reported then.
+            let first = self.slots.iter().position(|&p| p == peer).filter(|&h| peer != self.me && !self.gone[h]);
+            if let Some(handle) = first {
+                let _ = self.ggrs.disconnect_player(handle);
+                self.mark_gone(peer);
+                self.pending.push(NetEvent::Disconnected { peer });
             }
         }
         self.sample_rtt(Instant::now());
     }
 
-    /// One RTT sample per remote player still in the game, every `RTT_SAMPLE_EVERY`.
+    /// One RTT sample per remote peer still in the game, every `RTT_SAMPLE_EVERY`.
     fn sample_rtt(&mut self, now: Instant) {
         if self.rtt_sampled.is_some_and(|t| now.saturating_duration_since(t) < RTT_SAMPLE_EVERY) {
             return;
         }
         self.rtt_sampled = Some(now);
-        for handle in 0..self.slots.len() {
-            if handle == self.local || self.gone[handle] {
-                continue;
-            }
+        for handle in self.remote_peers().filter(|&h| !self.gone[h]).collect::<Vec<_>>() {
             // `NotEnoughData` during the first second.
             if let Ok(n) = self.ggrs.network_stats(handle) {
                 self.rtt[handle].add_sample(n.ping as f64);
@@ -487,22 +511,28 @@ impl NetSession {
     /// In-game delay target: `auto_input_delay` of the worst warm remote link; `None` while no
     /// link is warm.
     fn delay_target(&self) -> Option<usize> {
-        let worst = (0..self.slots.len())
-            .filter(|&h| h != self.local && !self.gone[h] && self.rtt[h].is_warm())
+        let worst = self
+            .remote_peers()
+            .filter(|&h| !self.gone[h] && self.rtt[h].is_warm())
             .filter_map(|h| self.rtt[h].delay_rtt())
             .reduce(f64::max)?;
         Some(auto_input_delay(worst, self.frame_ms))
     }
 
-    /// Adds the local input and advances one frame, handling GGRS save/load/advance requests on
+    /// Adds the local inputs and advances one frame, handling GGRS save/load/advance requests on
     /// `console`. Audio of re-simulated frames is dropped, only the newest frame's samples remain
     /// buffered in `console`.
     ///
-    /// One-frame bits (`INPUT_RESET`, `INPUT_SAVE`, `INPUT_LOAD`) are never lost: when GGRS
-    /// does not take this call's input, they are kept for the next one it takes. So pass each
-    /// request once, whatever the outcome.
-    pub fn advance(&mut self, console: &mut Console, local_input: u32) -> Result<FrameOutcome, NetError> {
-        self.carry |= local_input & ONE_FRAME_BITS;
+    /// `local_inputs`: one word per local player, in `local_slots()` order; a missing word is
+    /// 0, extra words are ignored.
+    ///
+    /// One-frame bits (`INPUT_RESET`, `INPUT_SAVE`, `INPUT_LOAD`) of any local player travel on
+    /// the first local player's word only, so one request never acts twice. They are never
+    /// lost: when GGRS does not take this call's input, they are kept for the next one it
+    /// takes. So pass each request once, whatever the outcome.
+    pub fn advance(&mut self, console: &mut Console, local_inputs: &[u32]) -> Result<FrameOutcome, NetError> {
+        let seat = |i: usize| local_inputs.get(i).copied().unwrap_or(0);
+        self.carry |= (0..self.locals.len()).fold(0, |all, i| all | seat(i)) & ONE_FRAME_BITS;
         if !self.is_running() {
             self.poll();
             return Ok(FrameOutcome::default());
@@ -515,11 +545,15 @@ impl NetSession {
         if fresh {
             self.drops = self.drops.saturating_sub(1);
         }
-        let mut word = local_input & !ONE_FRAME_BITS;
+        // The first local player's word, the one that may carry one-frame bits.
+        let mut word = seat(0) & !ONE_FRAME_BITS;
         if taken {
             word |= std::mem::take(&mut self.carry);
         }
-        self.ggrs.add_local_input(self.local, word).map_err(io)?;
+        for (i, &handle) in self.locals.iter().enumerate() {
+            let input = if i == 0 { word } else { seat(i) & !ONE_FRAME_BITS };
+            self.ggrs.add_local_input(handle, input).map_err(io)?;
+        }
         // GGRS 0.13 P2P never returns `PredictionThreshold`: at the window it returns no new
         // `AdvanceFrame`, but it still carries out a rollback the received inputs caused, so
         // the requests can re-simulate frames without adding one. After a delay decrease GGRS
@@ -566,10 +600,13 @@ impl NetSession {
                         }
                         pads[slot] = if turbo { expand_turbo(input, frame) } else { (input & INPUT_PAD) as u16 };
                         reset |= input & INPUT_RESET != 0;
-                        if input & INPUT_SAVE != 0 {
+                        // A save or load from a player the room's setting does not let save
+                        // is ignored, the same on every peer.
+                        let may_save = self.save_policy.allows(self.slots[slot]);
+                        if may_save && input & INPUT_SAVE != 0 {
                             saver.get_or_insert(slot);
                         }
-                        if input & INPUT_LOAD != 0 {
+                        if may_save && input & INPUT_LOAD != 0 {
                             loader.get_or_insert(slot);
                         }
                         #[cfg(test)]
@@ -587,7 +624,7 @@ impl NetSession {
                     if let Some(slot) = saver {
                         self.saves.push(SaveRecord { frame, slot, state: console.snapshot() });
                     }
-                    if frame > 0 && frame % CHECKPOINT_EVERY == 0 {
+                    if self.save_policy != SavePolicy::Off && frame > 0 && frame % CHECKPOINT_EVERY == 0 {
                         self.checkpoint_pending = Some((frame, console.snapshot()));
                     }
                     if let Some(slot) = loader {
@@ -632,12 +669,16 @@ impl NetSession {
         let target = self.delay_target();
         let Some(delay) = forced.or_else(|| self.delay.update(target, now)) else { return Ok(()) };
         self.drops += old.saturating_sub(delay) as u32;
-        self.ggrs.set_input_delay(self.local, delay).map_err(io)
+        // Every local player plays with the same delay.
+        for &handle in &self.locals {
+            self.ggrs.set_input_delay(handle, delay).map_err(io)?;
+        }
+        Ok(())
     }
 
     pub fn events(&mut self) -> Vec<NetEvent> {
         let mut out = std::mem::take(&mut self.pending);
-        for event in self.ggrs.events() {
+        for event in self.ggrs.events().collect::<Vec<_>>() {
             out.push(match event {
                 GgrsEvent::Synchronizing { addr, total, count } => NetEvent::Synchronizing { peer: addr, done: count, total },
                 GgrsEvent::Synchronized { addr } => NetEvent::Synchronized { peer: addr },
@@ -646,9 +687,7 @@ impl NetSession {
                 }
                 GgrsEvent::NetworkResumed { addr } => NetEvent::Resumed { peer: addr },
                 GgrsEvent::Disconnected { addr } => {
-                    if let Some(handle) = self.slots.iter().position(|&p| p == addr) {
-                        self.gone[handle] = true;
-                    }
+                    self.mark_gone(addr);
                     NetEvent::Disconnected { peer: addr }
                 }
                 GgrsEvent::DesyncDetected { frame, .. } => NetEvent::Desync { frame },
@@ -664,11 +703,9 @@ impl NetSession {
         let sent = self.sent.borrow();
         let secs = self.started.elapsed().as_secs_f64().max(1.0);
         let peers = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|&(slot, _)| slot != self.local)
-            .map(|(slot, &peer)| {
+            .remote_peers()
+            .map(|slot| {
+                let peer = self.slots[slot];
                 let route = link.as_ref().and_then(|l| l.route_kind(peer));
                 let mut stats = PeerStats { peer: Some(peer), slot, route, ..PeerStats::default() };
                 let bytes = sent.get(peer.0 as usize).copied().unwrap_or(0);
@@ -689,11 +726,16 @@ impl NetSession {
         self.ggrs.frames_ahead()
     }
 
+    /// Ends the session and hands the link back without a word to the peers: they stay
+    /// connected, for going back to the room together.
+    pub fn into_link(self) -> Link {
+        let link = self.link.borrow_mut().take();
+        link.expect("the session holds its link until it ends")
+    }
+
     /// Says BYE to every peer.
     pub fn leave(self) {
-        if let Some(link) = self.link.borrow_mut().take() {
-            link.close();
-        }
+        self.into_link().close();
     }
 }
 

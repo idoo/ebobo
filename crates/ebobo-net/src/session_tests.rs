@@ -268,7 +268,7 @@ fn run_lossy(n: usize, seed: u64, probe: i32, timeout: Duration, shuffle_delay: 
     let mut sessions: Vec<NetSession> = transports
         .into_iter()
         .map(|t| {
-            let mut s = NetSession::new(t, &slots, 2, false, 60, None).expect("session");
+            let mut s = NetSession::new(t, &slots, 2, false, 60, None, SavePolicy::Everyone).expect("session");
             s.probe = (probe, None);
             s
         })
@@ -300,7 +300,7 @@ fn run_lossy(n: usize, seed: u64, probe: i32, timeout: Duration, shuffle_delay: 
             } else {
                 (rngs[i].next() & RANDOM_INPUT) as u32
             };
-            let out = s.advance(&mut emus[i], input).expect("advance");
+            let out = s.advance(&mut emus[i], &[input]).expect("advance");
             if out.advanced {
                 advanced[i] += 1;
                 if shuffle_delay && advanced[i] % DELAY_EVERY == 0 {
@@ -599,7 +599,7 @@ fn run_paced(profile: Profile, n: usize, delay: usize, max_prediction: usize, se
     let mut sessions: Vec<NetSession> = transports
         .into_iter()
         .map(|t| {
-            NetSession::with_tuning(t, &slots, delay, how.auto, 60, max_prediction, DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)
+            NetSession::with_tuning(t, &slots, delay, how.auto, 60, SavePolicy::Everyone, max_prediction, DISCONNECT_TIMEOUT, DISCONNECT_NOTIFY)
                 .expect("session")
         })
         .collect();
@@ -643,7 +643,7 @@ fn run_paced(profile: Profile, n: usize, delay: usize, max_prediction: usize, se
                     s.poll();
                 }
                 let running = s.is_running();
-                let out = s.advance(&mut emus[i], players[i].next(how.feed)).expect("advance");
+                let out = s.advance(&mut emus[i], &[players[i].next(how.feed)]).expect("advance");
                 if running {
                     st.ticks += 1;
                     if out.advanced {
@@ -869,8 +869,9 @@ fn direct_pair() -> (NetSession, NetSession) {
     let t = Duration::from_secs(1);
     let notify = Duration::from_millis(300);
     let p = MAX_PREDICTION;
-    let sa = NetSession::with_tuning(crate::Link::udp(a, PeerId(0), &[(PeerId(1), ba)]), &slots, 2, false, 60, p, t, notify).unwrap();
-    let sb = NetSession::with_tuning(crate::Link::udp(b, PeerId(1), &[(PeerId(0), aa)]), &slots, 2, false, 60, p, t, notify).unwrap();
+    let e = SavePolicy::Everyone;
+    let sa = NetSession::with_tuning(crate::Link::udp(a, PeerId(0), &[(PeerId(1), ba)]), &slots, 2, false, 60, e, p, t, notify).unwrap();
+    let sb = NetSession::with_tuning(crate::Link::udp(b, PeerId(1), &[(PeerId(0), aa)]), &slots, 2, false, 60, e, p, t, notify).unwrap();
     (sa, sb)
 }
 
@@ -882,8 +883,8 @@ fn warm_up(sa: &mut NetSession, sb: &mut NetSession, na: &mut Console, nb: &mut 
         assert!(Instant::now() < deadline, "warm-up timed out");
         sa.poll();
         sb.poll();
-        fa += sa.advance(na, 1).unwrap().advanced as u32;
-        fb += sb.advance(nb, 2).unwrap().advanced as u32;
+        fa += sa.advance(na, &[1]).unwrap().advanced as u32;
+        fb += sb.advance(nb, &[2]).unwrap().advanced as u32;
         let _ = (sa.events(), sb.events());
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -902,7 +903,7 @@ fn session_disconnect_on_timeout() {
     while after < 60 {
         assert!(Instant::now() < deadline, "interrupted {interrupted}, disconnected {disconnected}, after {after}");
         sa.poll();
-        let out = sa.advance(&mut na, 3).unwrap();
+        let out = sa.advance(&mut na, &[3]).unwrap();
         for e in sa.events() {
             match e {
                 NetEvent::Interrupted { peer, .. } if peer == PeerId(1) => interrupted = true,
@@ -932,7 +933,7 @@ fn session_bye_disconnects_quickly() {
     loop {
         assert!(start.elapsed() < Duration::from_secs(1), "no Disconnected within a second");
         sa.poll();
-        let _ = sa.advance(&mut na, 0).unwrap();
+        let _ = sa.advance(&mut na, &[0]).unwrap();
         if sa.events().contains(&NetEvent::Disconnected { peer: PeerId(1) }) {
             break;
         }
@@ -956,13 +957,13 @@ fn session_peer_leaving_caught_up_keeps_playing() {
     while sa.ggrs.confirmed_frame() <= sa.ggrs.current_frame() {
         assert!(Instant::now() < deadline, "sb never got ahead");
         sb.poll();
-        let _ = sb.advance(&mut nb, 2).unwrap();
+        let _ = sb.advance(&mut nb, &[2]).unwrap();
         sa.poll();
         std::thread::sleep(Duration::from_millis(1));
     }
     // `sa` catches up to exactly one frame past `sb`'s last input.
     while sa.ggrs.current_frame() <= sa.ggrs.confirmed_frame() {
-        assert!(sa.advance(&mut na, 1).unwrap().advanced);
+        assert!(sa.advance(&mut na, &[1]).unwrap().advanced);
     }
     assert_eq!(sa.ggrs.current_frame(), sa.ggrs.confirmed_frame() + 1);
     let _ = sa.events();
@@ -974,7 +975,7 @@ fn session_peer_leaving_caught_up_keeps_playing() {
         std::thread::sleep(Duration::from_millis(1));
     }
     for _ in 0..30 {
-        assert!(sa.advance(&mut na, 1).unwrap().advanced);
+        assert!(sa.advance(&mut na, &[1]).unwrap().advanced);
     }
 }
 
@@ -985,8 +986,8 @@ fn saved_events(sa: &mut NetSession, sb: &mut NetSession, na: &mut Console, nb: 
     let deadline = Instant::now() + Duration::from_secs(20);
     while fa < frames || fb < frames {
         assert!(Instant::now() < deadline, "timed out");
-        fa += sa.advance(na, 1).unwrap().advanced as u32;
-        fb += sb.advance(nb, 2).unwrap().advanced as u32;
+        fa += sa.advance(na, &[1]).unwrap().advanced as u32;
+        fb += sb.advance(nb, &[2]).unwrap().advanced as u32;
         for (s, out) in [&mut *sa, &mut *sb].into_iter().zip(&mut saved) {
             out.extend(s.events().into_iter().filter(|e| matches!(e, NetEvent::Saved { .. })));
         }
@@ -1007,11 +1008,11 @@ fn session_one_frame_bit_survives_a_delay_drop() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while sa.force_delay.is_some() {
         assert!(Instant::now() < deadline, "the delay never changed");
-        let _ = sa.advance(&mut na, 1).unwrap();
-        let _ = sb.advance(&mut nb, 2).unwrap();
+        let _ = sa.advance(&mut na, &[1]).unwrap();
+        let _ = sb.advance(&mut nb, &[2]).unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
-    let _ = sa.advance(&mut na, 1 | INPUT_SAVE).unwrap();
+    let _ = sa.advance(&mut na, &[1 | INPUT_SAVE]).unwrap();
     let saved = saved_events(&mut sa, &mut sb, &mut na, &mut nb, 120);
     assert_eq!(saved, [vec![NetEvent::Saved { slot: 0 }], vec![NetEvent::Saved { slot: 0 }]]);
 }
@@ -1026,10 +1027,10 @@ fn session_one_frame_bit_survives_a_stall() {
     warm_up(&mut sa, &mut sb, &mut na, &mut nb, 60);
     // `sb` goes quiet (well under the disconnect notice) until `sa` cannot advance.
     let deadline = Instant::now() + Duration::from_millis(250);
-    while sa.advance(&mut na, 1).unwrap().advanced {
+    while sa.advance(&mut na, &[1]).unwrap().advanced {
         assert!(Instant::now() < deadline, "sa never reached the prediction window");
     }
-    assert!(!sa.advance(&mut na, 1 | INPUT_SAVE).unwrap().advanced);
+    assert!(!sa.advance(&mut na, &[1 | INPUT_SAVE]).unwrap().advanced);
     let saved = saved_events(&mut sa, &mut sb, &mut na, &mut nb, 120);
     assert_eq!(saved, [vec![NetEvent::Saved { slot: 0 }], vec![NetEvent::Saved { slot: 0 }]]);
 }
@@ -1142,7 +1143,7 @@ fn run_saves(
     let mut sessions: Vec<NetSession> = transports
         .into_iter()
         .map(|t| {
-            let mut s = NetSession::new(t, &slots, SAVE_DELAY, false, 60, start.cloned()).expect("session");
+            let mut s = NetSession::new(t, &slots, SAVE_DELAY, false, 60, start.cloned(), SavePolicy::Everyone).expect("session");
             s.probe = (probe, None);
             s
         })
@@ -1189,7 +1190,7 @@ fn run_saves(
             while s.is_running() && queues[i].last().is_some_and(|p| s.ggrs.current_frame() >= p.after as i32) {
                 input |= queues[i].pop().unwrap().bits;
             }
-            let out = s.advance(&mut emus[i], input).expect("advance");
+            let out = s.advance(&mut emus[i], &[input]).expect("advance");
             advanced[i] += out.advanced as u32;
             rollback_frames += out.rollback_frames as u64;
             if let Some(snap) = s.take_saved() {
@@ -1389,7 +1390,7 @@ fn run_uneven_leaver(seed: u64, save_load: bool) -> Option<LeaverRun> {
         .into_iter()
         .enumerate()
         .map(|(i, t)| {
-            let mut s = NetSession::new(t, &slots, if i == 1 { 8 } else { 2 }, false, 60, None).expect("session");
+            let mut s = NetSession::new(t, &slots, if i == 1 { 8 } else { 2 }, false, 60, None, SavePolicy::Everyone).expect("session");
             s.probe = (260, None);
             s
         })
@@ -1428,7 +1429,7 @@ fn run_uneven_leaver(seed: u64, save_load: bool) -> Option<LeaverRun> {
             if save_load && s.is_running() && i == 0 && f == 240 && s.input_log.len() <= 242 {
                 input |= INPUT_LOAD;
             }
-            s.advance(&mut emus[i], input).expect("advance");
+            s.advance(&mut emus[i], &[input]).expect("advance");
             if i < 2 {
                 if let Some(snap) = s.take_saved() {
                     saves[i] = Some(state_hash_of(&snap));
@@ -1479,4 +1480,174 @@ fn session_leaver_with_uneven_input_keeps_shared_save_in_step() {
     use NetEvent::{Loaded, Saved};
     assert_eq!(run.events[0], [Saved { slot: 0 }, Loaded { slot: 0 }]);
     assert_eq!(run.events[1], run.events[0]);
+}
+
+/// Input delay of the several-seat runs: a word passed at GGRS frame `k` lands on `k + SEAT_DELAY`.
+const SEAT_DELAY: usize = 2;
+
+/// The word controller `slot` sends when its device calls `advance` at GGRS frame `frame`:
+/// random pad and turbo bits, different per controller.
+fn seat_word(slot: usize, frame: i32) -> u32 {
+    let seed = ((frame as u64 + 1) << 8) ^ (slot as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut rng = XorShift(seed | 1);
+    rng.next();
+    (rng.next() & RANDOM_INPUT) as u32
+}
+
+/// Every device's word for each of its controllers at its current frame (`seat_word`).
+fn seat_words(s: &NetSession) -> Vec<u32> {
+    let frame = s.ggrs.current_frame();
+    s.local_slots().iter().map(|&slot| seat_word(slot, frame)).collect()
+}
+
+/// Polls and advances every session with `input(device, session)` until `done`; collects each
+/// device's events.
+fn drive_until(
+    sessions: &mut [NetSession],
+    emus: &mut [Console],
+    mut input: impl FnMut(usize, &NetSession) -> Vec<u32>,
+    done: impl Fn(&[NetSession]) -> bool,
+) -> Vec<Vec<NetEvent>> {
+    let mut events = vec![Vec::new(); sessions.len()];
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !done(sessions) {
+        assert!(Instant::now() < deadline, "timed out: final {:?}", sessions.iter().map(|s| s.final_through).collect::<Vec<_>>());
+        for (i, s) in sessions.iter_mut().enumerate() {
+            s.poll();
+            let words = input(i, s);
+            s.advance(&mut emus[i], &words).expect("advance");
+            events[i].extend(s.events());
+        }
+        std::thread::sleep(Duration::from_micros(500));
+    }
+    events
+}
+
+/// The devices of `slots` (peer ids 0..n) directly connected over loopback UDP, with a 1 s
+/// disconnect timeout; one NES each.
+fn direct_mesh(slots: &[PeerId], saves: SavePolicy) -> Option<(Vec<NetSession>, Vec<Console>)> {
+    let first = nes()?;
+    let n = slots.iter().map(|p| p.0 as usize + 1).max().unwrap();
+    let socks: Vec<UdpSocket> = (0..n).map(|_| bind()).collect();
+    let addrs: Vec<SocketAddr> = socks.iter().map(|s| s.local_addr().unwrap()).collect();
+    let sessions = socks
+        .into_iter()
+        .enumerate()
+        .map(|(i, sock)| {
+            let peers: Vec<(PeerId, SocketAddr)> = (0..n).filter(|&j| j != i).map(|j| (PeerId(j as u8), addrs[j])).collect();
+            let link = crate::Link::udp(sock, PeerId(i as u8), &peers);
+            let (t, notify) = (Duration::from_secs(1), Duration::from_millis(300));
+            NetSession::with_tuning(link, slots, SEAT_DELAY, false, 60, saves, max_prediction(slots.len()), t, notify).unwrap()
+        })
+        .collect();
+    let emus = std::iter::once(first).chain((1..n).map(|_| nes().unwrap())).collect();
+    Some((sessions, emus))
+}
+
+/// Devices sharing controllers per `slots` over the lossy network, each feeding `seat_word` for
+/// its own controllers: every device simulates exactly the words each controller's player sent,
+/// on that controller, and reaches the state of one plain console fed the same pads.
+fn run_seats(slots: &[PeerId], seed: u64, probe: i32) {
+    let Some(first) = nes() else { return };
+    let n = slots.iter().map(|p| p.0 as usize + 1).max().unwrap();
+    let (transports, _proxy) = lossy_mesh(n, seed, Profile::Lossy);
+    let mut sessions: Vec<NetSession> = transports
+        .into_iter()
+        .map(|t| {
+            let mut s = NetSession::new(t, slots, SEAT_DELAY, false, 60, None, SavePolicy::Everyone).expect("session");
+            s.probe = (probe, None);
+            s
+        })
+        .collect();
+    let mut emus: Vec<Console> = std::iter::once(first).chain((1..n).map(|_| nes().unwrap())).collect();
+    let events = drive_until(&mut sessions, &mut emus, |_, s| seat_words(s), |ss| ss.iter().all(|s| s.final_through > probe));
+    let desyncs: Vec<&NetEvent> = events.iter().flatten().filter(|e| matches!(e, NetEvent::Desync { .. })).collect();
+    assert!(desyncs.is_empty(), "desync events: {desyncs:?}");
+    let log: Vec<[u32; 4]> = (0..=probe)
+        .map(|f| std::array::from_fn(|slot| if slot < slots.len() && f >= SEAT_DELAY as i32 { seat_word(slot, f - SEAT_DELAY as i32) } else { 0 }))
+        .collect();
+    let expected = reference(&log, None).at_start[probe as usize];
+    for (i, s) in sessions.iter().enumerate() {
+        let first_wrong = (0..log.len()).find(|&f| s.input_log[f] != log[f]);
+        assert_eq!(first_wrong, None, "device {i} simulated other words: {:x?}", first_wrong.map(|f| (s.input_log[f], log[f])));
+        assert_eq!(s.probe.1, Some(expected), "device {i} state at frame {probe}");
+    }
+}
+
+/// The host plays controllers 1 and 2, the guest controller 3: each local word reaches its own
+/// controller on both machines.
+#[test]
+fn session_two_seats_on_one_device_reach_their_controllers() {
+    run_seats(&[PeerId(0), PeerId(0), PeerId(1)], 0x5EA7_0001, 400);
+}
+
+/// Three devices, the middle one with two players, over the lossy network: equal states.
+#[test]
+fn session_two_seat_guest_among_three_devices_stays_in_sync() {
+    run_seats(&[PeerId(0), PeerId(1), PeerId(1), PeerId(2)], 0x5EA7_0002, 400);
+}
+
+/// A device with two players leaving with BYE: the others keep playing in step, both of its
+/// controllers read released, and each reports it gone once.
+#[test]
+fn session_two_seat_leaver_releases_both_controllers() {
+    let slots = [PeerId(0), PeerId(1), PeerId(1), PeerId(2)];
+    let Some((mut sessions, mut emus)) = direct_mesh(&slots, SavePolicy::Everyone) else { return };
+    for s in &mut sessions {
+        s.probe = (300, None);
+    }
+    drive_until(&mut sessions, &mut emus, |_, s| seat_words(s), |ss| ss.iter().all(|s| s.final_through >= 150));
+    sessions.remove(1).leave();
+    emus.remove(1);
+    let events = drive_until(&mut sessions, &mut emus, |_, s| seat_words(s), |ss| ss.iter().all(|s| s.final_through > 300));
+    for (i, e) in events.iter().enumerate() {
+        let gone: Vec<&NetEvent> = e.iter().filter(|e| matches!(e, NetEvent::Disconnected { .. } | NetEvent::Desync { .. })).collect();
+        assert_eq!(gone, [&NetEvent::Disconnected { peer: PeerId(1) }], "device {i} events");
+    }
+    let (a, b) = (&sessions[0], &sessions[1]);
+    assert!(a.probe.1.is_some() && a.probe.1 == b.probe.1, "states at 300 differ: {:x?} / {:x?}", a.probe.1, b.probe.1);
+    assert_eq!(a.input_log[..=300], b.input_log[..=300], "the remaining devices simulated other words");
+    assert!(a.input_log[..150].iter().any(|w| w[1] != 0) && a.input_log[..150].iter().any(|w| w[2] != 0));
+    for f in 250..=300 {
+        let w = a.input_log[f];
+        assert_eq!((w[1], w[2]), (0, 0), "the leaver's controllers still pressed on frame {f}");
+    }
+}
+
+/// Host and guest each press save once (the guest at frame 60, the host at 160); returns the
+/// `Saved` events of both devices once frame 330 is final, and the sessions.
+fn saves_under(policy: SavePolicy) -> Option<(Vec<Vec<NetEvent>>, Vec<NetSession>)> {
+    let (mut sessions, mut emus) = direct_mesh(&[PeerId(0), PeerId(1)], policy)?;
+    let mut pressed = [false; 2];
+    let input = |i: usize, s: &NetSession| {
+        let at = if i == 0 { 160 } else { 60 };
+        let mut words = seat_words(s);
+        if s.is_running() && s.ggrs.current_frame() >= at && !std::mem::replace(&mut pressed[i], true) {
+            words[0] |= INPUT_SAVE;
+        }
+        words
+    };
+    let events = drive_until(&mut sessions, &mut emus, input, |ss| ss.iter().all(|s| s.final_through >= 330));
+    let saved = events.into_iter().map(|e| e.into_iter().filter(|e| matches!(e, NetEvent::Saved { .. })).collect()).collect();
+    for s in &sessions {
+        assert!(s.input_log[..330].iter().any(|w| w[1] & INPUT_SAVE != 0), "the guest's save never travelled");
+    }
+    Some((saved, sessions))
+}
+
+/// Host only: the guest's save does nothing anywhere, the host's saves for both.
+#[test]
+fn session_host_only_saves_ignore_the_guest() {
+    let Some((saved, _)) = saves_under(SavePolicy::Host) else { return };
+    assert_eq!(saved, [vec![NetEvent::Saved { slot: 0 }], vec![NetEvent::Saved { slot: 0 }]]);
+}
+
+/// Saves off: no save from anybody and no "last moment" checkpoint past frame 300.
+#[test]
+fn session_saves_off_saves_nothing() {
+    let Some((saved, mut sessions)) = saves_under(SavePolicy::Off) else { return };
+    assert_eq!(saved, [vec![], vec![]]);
+    for s in &mut sessions {
+        assert!(s.take_saved().is_none() && s.take_checkpoint().is_none());
+    }
 }
